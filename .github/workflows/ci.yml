@@ -312,7 +312,7 @@ jobs:
       - name: Build wheel
         run: maturin build --release --out dist
         working-directory: st-clickhouse-py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
           path: st-clickhouse-py/dist/*.whl
