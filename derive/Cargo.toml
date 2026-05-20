@@ -1,0 +1,22 @@
+[package]
+name = "st-clickhouse-derive"
+version = "0.1.0"
+description = "Derive macros for st-clickhouse row decoding"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository = "https://github.com/Stellarrion/st-clickhouse-lib"
+readme = "../README.md"
+keywords = ["clickhouse", "database", "derive", "macro"]
+categories = ["database"]
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

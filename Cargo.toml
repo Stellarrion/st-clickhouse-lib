@@ -1,0 +1,190 @@
+[workspace]
+members = ["st-clickhouse-py", "derive"]
+resolver = "2"
+
+# Workspace-level package metadata — inherited by all crates
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Stellarrion"]
+
+[workspace.dependencies]
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+
+# Clippy workspace lints
+[workspace.lints.rust]
+# Per-crate: add missing_docs / missing_debug_implementations individually
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+unwrap_used = "deny"
+panic = "deny"
+cast_lossless = "allow"
+cast_sign_loss = "deny"
+type_complexity = "allow"
+large_enum_variant = "allow"
+exhaustive_enums = "allow"
+exhaustive_structs = "allow"
+large_digit_groups = "allow"
+fn_params_excessive_bools = "allow"
+wildcard_dependencies = "deny"
+multiple_crate_versions = "allow"
+
+# CI-specific profile — fast, no debug info
+[profile.ci]
+codegen-units = 1
+inherits = "release"
+debug = false
+debug-assertions = false
+incremental = false
+opt-level = 1
+overflow-checks = true
+lto = false
+strip = "none"
+
+[package]
+name = "st-clickhouse-lib"
+version = "0.1.0"
+description = "High-performance native protocol ClickHouse client for Rust"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository = "https://github.com/Stellarrion/st-clickhouse-lib"
+keywords = ["clickhouse", "database", "native-protocol", "client"]
+categories = ["database"]
+autobenches = false
+exclude = [
+    ".cargo/**",
+    ".github/**",
+    ".gitignore",
+    "Cargo.toml.orig",
+    "deny.toml",
+    "fuzz/**",
+    "st-clickhouse-py/**",
+]
+
+[lints]
+workspace = true
+
+[lib]
+name = "st_clickhouse"
+doctest = false
+
+[profile.release]
+codegen-units = 1
+overflow-checks = true
+
+[profile.benchmark]
+codegen-units = 1
+debug = false
+debug-assertions = false
+incremental = false
+inherits = "release"
+lto = true
+opt-level = 3
+overflow-checks = true
+panic = 'abort'
+rpath = false
+strip = "symbols"
+
+[dependencies]
+parking_lot = "0.12"
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros", "rt-multi-thread", "process"], optional = true }
+async-net = { version = "2", optional = true }
+futures-io = { version = "0.3", optional = true }
+smol = { version = "2", optional = true }
+tracing = "0.1"
+bytes = "1"
+
+# Compression (optional)
+lz4_flex = { version = "0.12", optional = true }
+zstd = { version = "0.13", optional = true }
+clickhouse-rs-cityhash-sys = "0.1"
+socket2 = "0.6"
+zeroize = "1"
+webpki-roots = { version = "1", optional = true }
+
+# TLS (optional)
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"], optional = true }
+
+# Derive macro (optional, build-time only)
+st-clickhouse-derive = { version = "0.1", path = "derive", optional = true }
+clickhouse = { version = "0.15", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = ["lz4", "derive", "tokio", "tokio-tls"]
+native = []
+lz4 = ["dep:lz4_flex"]
+zstd = ["dep:zstd"]
+tls = ["dep:rustls", "dep:webpki-roots"]
+tokio = ["dep:tokio"]
+smol = ["dep:async-net", "dep:futures-io", "dep:smol"]
+tokio-tls = [
+    "tokio",
+    "tls",
+    "dep:tokio-rustls",
+    "dep:rustls-native-certs",
+]
+derive = ["dep:st-clickhouse-derive"]
+bench-clickhouse-rs = ["tokio", "dep:clickhouse", "dep:serde"]
+
+[dev-dependencies]
+futures = "0.3"
+testcontainers = "0.27"
+
+[[bin]]
+name = "column_decode_bench"
+path = "benches/bench.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "profile"
+path = "benches/profile.rs"
+test = false
+bench = false
+required-features = ["tokio"]
+
+[[bin]]
+name = "profile_async_workload"
+path = "benches/profile_async_workload.rs"
+test = false
+bench = false
+required-features = ["tokio"]
+
+[[bin]]
+name = "bench_vs_ch"
+path = "benches/vs_clickhouse.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bench_vs_clickhouse_rs"
+path = "benches/sync_vs_clickhouse_rs.rs"
+test = false
+bench = false
+required-features = ["bench-clickhouse-rs"]
+
+[[bin]]
+name = "profile_core_workload"
+path = "benches/profile_core_workload.rs"
+test = false
+bench = false
+
+
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Required for docs.rs builds — ensures all feature gates are visible
+# in the generated documentation

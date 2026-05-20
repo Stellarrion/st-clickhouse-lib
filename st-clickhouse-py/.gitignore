@@ -1,0 +1,11 @@
+# Python build artifacts — MUST never be committed
+_native.abi3.so
+_native.abi3.so.d
+dist/
+*.whl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

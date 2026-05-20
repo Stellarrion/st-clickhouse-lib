@@ -1,0 +1,8 @@
+# Rust toolchain configuration
+# This file pins the toolchain for all contributors and CI.
+# Install Rust via https://rustup.rs — it respects this file automatically.
+
+[toolchain]
+channel = "stable"
+components = ["clippy", "rust-analyzer", "rust-src", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

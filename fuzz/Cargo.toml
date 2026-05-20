@@ -1,0 +1,61 @@
+[package]
+name = "st-clickhouse-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.st-clickhouse]
+path = ".."
+
+[[bin]]
+name = "varint"
+path = "fuzz_targets/varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block"
+path = "fuzz_targets/block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exception"
+path = "fuzz_targets/exception.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh"
+path = "fuzz_targets/ssh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked"
+path = "fuzz_targets/chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coordinator"
+path = "fuzz_targets/coordinator.rs"
+test = false
+doc = false
+bench = false
+
+# Prevent this from interfering with workspace
+[workspace]
+members = ["."]

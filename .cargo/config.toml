@@ -1,0 +1,10 @@
+# Strict rustc flags for the entire project.
+#
+# deny(warnings) — fail CI on any warning
+#
+# NOTE: deny(unsafe_code) is NOT here because dependencies (e.g.
+#       cityhash-sys) contain unsafe blocks.  Each crate forbids
+#       unsafe_code at its own crate root via #[forbid(unsafe_code)].
+#
+[target.'cfg(all())']
+rustflags = ["-D", "warnings"]

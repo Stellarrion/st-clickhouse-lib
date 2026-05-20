@@ -1,0 +1,339 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Format ──────────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # ── Lint ────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ── Build (release) ─────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+      - name: Check all features
+        run: cargo check --all-features
+
+      - name: Check runtime-free core
+        run: cargo check -p st-clickhouse-lib --no-default-features --features lz4,tls --lib --example sync_no_runtime
+
+      - name: Check smol runtime engine
+        run: cargo check -p st-clickhouse-lib --no-default-features --features smol --lib
+
+  # ── Test ────────────────────────────────────────────────────
+  test:
+    name: Tests (${{ matrix.clickhouse-image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        clickhouse-image:
+          - clickhouse/clickhouse-server:24.8
+          - clickhouse/clickhouse-server:25.8
+          - clickhouse/clickhouse-server:26.4
+          - clickhouse/clickhouse-server:latest
+    services:
+      clickhouse:
+        image: ${{ matrix.clickhouse-image }}
+        ports:
+          - 9000:9000
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        options: >-
+          --health-cmd "clickhouse client --host 127.0.0.1 --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start TLS ClickHouse
+        run: |
+          tests/tls/setup.sh "${{ github.workspace }}/tests/tls/.generated"
+          docker create --name clickhouse-tls \
+            -p 9440:9440 \
+            -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+            "${{ matrix.clickhouse-image }}"
+          docker cp "${{ github.workspace }}/tests/tls/.generated/server.crt" clickhouse-tls:/etc/clickhouse-server/server.crt
+          docker cp "${{ github.workspace }}/tests/tls/.generated/server.key" clickhouse-tls:/etc/clickhouse-server/server.key
+          docker cp "${{ github.workspace }}/tests/tls/.generated/tls.xml" clickhouse-tls:/etc/clickhouse-server/config.d/tls.xml
+          docker start clickhouse-tls
+          for i in $(seq 1 30); do
+            if timeout 1 bash -c '</dev/tcp/127.0.0.1/9440'; then
+              exit 0
+            fi
+            docker logs --tail 20 clickhouse-tls || true
+            sleep 2
+          done
+          docker logs clickhouse-tls || true
+          exit 1
+
+      - name: Start SSH-auth ClickHouse
+        run: |
+          tests/ssh/setup.sh "${{ github.workspace }}/tests/ssh/.generated"
+          docker create --name clickhouse-ssh \
+            -p 9001:9000 \
+            -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+            "${{ matrix.clickhouse-image }}"
+          docker cp "${{ github.workspace }}/tests/ssh/.generated/ssh_users.xml" clickhouse-ssh:/etc/clickhouse-server/users.d/ssh_users.xml
+          docker start clickhouse-ssh
+          for i in $(seq 1 30); do
+            if docker exec clickhouse-ssh clickhouse client --host 127.0.0.1 --query "SELECT 1" >/dev/null 2>&1; then
+              exit 0
+            fi
+            docker logs --tail 20 clickhouse-ssh || true
+            sleep 2
+          done
+          docker logs clickhouse-ssh || true
+          exit 1
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run Rust tests
+        run: cargo nextest run --workspace --exclude st-clickhouse-py --all-features --profile ci
+        env:
+          CLICKHOUSE_HOST: "127.0.0.1:9000"
+          CLICKHOUSE_USER: "default"
+          CLICKHOUSE_PASS: ""
+          CLICKHOUSE_TLS_HOST: "127.0.0.1:9440"
+          CLICKHOUSE_TLS_CA: "${{ github.workspace }}/tests/tls/.generated/ca.crt"
+          CLICKHOUSE_TLS_DOMAIN: "localhost"
+          CLICKHOUSE_SSH_HOST: "127.0.0.1:9001"
+          CLICKHOUSE_SSH_USER: "ssh_user"
+          CLICKHOUSE_SSH_KEY_PATH: "${{ github.workspace }}/tests/ssh/.generated/id_ed25519"
+
+      - name: Doc tests
+        run: cargo test --doc --all-features
+
+      - name: Spell check
+        uses: crate-ci/typos@v1
+
+      - name: Python bindings
+        working-directory: st-clickhouse-py
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install maturin
+          maturin build --release --out dist
+          python -m pip install dist/*.whl
+          python -m pip install pytest pytest-asyncio pytest-timeout
+          pytest tests/ -v --timeout=60
+        env:
+          CLICKHOUSE_HOST: "127.0.0.1:9000"
+          CLICKHOUSE_USER: "default"
+          CLICKHOUSE_PASS: ""
+          CLICKHOUSE_TLS_HOST: "127.0.0.1:9440"
+          CLICKHOUSE_TLS_CA: "${{ github.workspace }}/tests/tls/.generated/ca.crt"
+          CLICKHOUSE_TLS_DOMAIN: "localhost"
+          CLICKHOUSE_SSH_HOST: "127.0.0.1:9001"
+          CLICKHOUSE_SSH_USER: "ssh_user"
+          CLICKHOUSE_SSH_KEY_PATH: "${{ github.workspace }}/tests/ssh/.generated/id_ed25519"
+
+  # ── Python compatibility ─────────────────────────────────────
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14", "3.14t"]
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.4
+        ports:
+          - 9000:9000
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        options: >-
+          --health-cmd "clickhouse client --host 127.0.0.1 --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build and test Python bindings
+        working-directory: st-clickhouse-py
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest pytest-asyncio pytest-timeout
+          maturin build --release --out dist
+          python -m pip install --force-reinstall dist/*.whl
+          python -m pytest tests/ -v --timeout=60
+        env:
+          CLICKHOUSE_HOST: "127.0.0.1:9000"
+          CLICKHOUSE_USER: "default"
+          CLICKHOUSE_PASS: ""
+
+  # ── Security audit ───────────────────────────────────────────
+  audit:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo deny check advisories sources licenses
+      - run: cargo audit
+
+  # ── Release (crates.io) ──────────────────────────────────────
+  publish-crates:
+    name: Release (crates.io)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, clippy, build, test, python, audit]
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/st-clickhouse-lib
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Fetch crates.io token from Bitwarden
+        if: ${{ vars.BW_CRATES_IO_TOKEN_SECRET_ID != '' }}
+        uses: bitwarden/sm-action@v2
+        with:
+          access_token: ${{ secrets.BW_ACCESS_TOKEN }}
+          base_url: ${{ vars.BW_BASE_URL || 'https://vault.bitwarden.com' }}
+          secrets: |
+            ${{ vars.BW_CRATES_IO_TOKEN_SECRET_ID }} > CARGO_REGISTRY_TOKEN
+      - name: Use GitHub crates.io token fallback
+        if: ${{ vars.BW_CRATES_IO_TOKEN_SECRET_ID == '' }}
+        run: |
+          if [ -z "${FALLBACK_CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is missing. Configure Bitwarden vars or the CARGO_REGISTRY_TOKEN secret."
+            exit 1
+          fi
+          {
+            echo 'CARGO_REGISTRY_TOKEN<<__CARGO_TOKEN__'
+            printf '%s\n' "$FALLBACK_CARGO_REGISTRY_TOKEN"
+            echo '__CARGO_TOKEN__'
+          } >> "$GITHUB_ENV"
+        env:
+          FALLBACK_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish derive helper
+        run: cargo publish -p st-clickhouse-derive
+      - name: Wait for derive helper in crates.io index
+        run: |
+          for i in $(seq 1 30); do
+            if cargo search st-clickhouse-derive --limit 1 | grep -q '^st-clickhouse-derive = "0.1.0"'; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "st-clickhouse-derive 0.1.0 did not appear in crates.io index in time"
+          exit 1
+      - name: Publish user-facing crate
+        run: cargo publish -p st-clickhouse-lib
+
+  # ── Release (PyPI) ──────────────────────────────────────────
+  build-wheels:
+    name: Build wheels (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, clippy, build, test, python, audit]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build wheel
+        run: maturin build --release --out dist
+        working-directory: st-clickhouse-py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: st-clickhouse-py/dist/*.whl
+
+  publish-pypi:
+    name: Release (PyPI)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-wheels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/st-clickhouse-py
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

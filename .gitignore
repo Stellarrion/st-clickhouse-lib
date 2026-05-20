@@ -1,0 +1,68 @@
+# Rust build artifacts
+/target/
+target/
+**/target/
+*.d
+*.o
+*.rlib
+*.rmeta
+*.profraw
+*.profdata
+
+# Fuzzing output
+/fuzz/target/
+/fuzz/Cargo.lock
+/fuzz/artifacts/
+/fuzz/corpus/
+
+# Python build/test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+*.whl
+*.abi3.so
+*.so
+
+# Local benchmark/profiling output
+perf.data
+perf.data.old
+*.svg
+flamegraph.svg
+callgrind.out.*
+cachegrind.out.*
+*.trace
+*.log
+
+# Editor/agent backups
+*.bak
+.edit-pipeline-backups/
+**/.edit-pipeline-backups/
+
+# Local agent memory
+.agents/
+.codex/
+.pi/memory/
+
+# Local environment and OS files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Generated integration-test assets
+tests/tls/.generated/
+tests/ssh/.generated/
