@@ -1,0 +1,39 @@
+# Stellarrion — Git attributes
+# Applied to all repos. Copy to repo root as .gitattributes
+# -----------------------------------------------------------
+
+# ── Line endings ─────────────────────────────────────────────────
+# All text files: LF (Unix) line endings
+*.rs            text eol=lf
+*.toml          text eol=lf
+*.md            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.sh            text eol=lf
+*.lock          text eol=lf
+*.py            text eol=lf
+*.css           text eol=lf
+Makefile        text eol=lf
+
+# ── Binary files ─────────────────────────────────────────────────
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.woff          binary
+*.woff2         binary
+
+# ── Diff behavior ────────────────────────────────────────────────
+# Cargo.lock is regenerable — don't diff, use union merge
+Cargo.lock      merge=union -diff
+
+# Generated files — skip diff
+target/         export-ignore
+.pytest_cache/  export-ignore
+__pycache__/    export-ignore
+
+# ── Language detection ───────────────────────────────────────────
+*.rs            linguist-language=Rust

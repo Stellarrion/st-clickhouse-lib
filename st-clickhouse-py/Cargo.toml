@@ -42,4 +42,4 @@ webpki-roots = "1"
 bytes = "1"
 # PyO3 with abi3 (stable ABI) for Python 3.12+ GIL builds.
 # Python free-threaded builds use version-specific extension artifacts.
-pyo3 = { version = "0.28.3", features = ["abi3-py312"] }
+pyo3 = { version = "0.28.3", features = ["abi3-py312", "generate-import-lib"] }
