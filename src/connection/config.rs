@@ -63,6 +63,16 @@ impl Client {
         self
     }
 
+    /// Set the maximum time to wait for a free pool slot.
+    ///
+    /// When set, an acquisition that cannot get a free slot within `t` returns
+    /// [`Error::PoolTimeout`](crate::error::Error::PoolTimeout) (retryable).
+    /// `None` by default — unbounded wait, today's behaviour.
+    pub fn with_acquire_timeout(mut self, t: Duration) -> Self {
+        self.pool.set_acquire_timeout(Some(t));
+        self
+    }
+
     /// Set receive timeout.
     pub fn with_recv_timeout(mut self, t: Duration) -> Self {
         self.recv_timeout = t;

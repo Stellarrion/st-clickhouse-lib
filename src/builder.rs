@@ -37,6 +37,7 @@ struct BuilderOptions {
     send_timeout: Option<Duration>,
     retry_timeout: Option<Duration>,
     query_timeout: Option<Duration>,
+    acquire_timeout: Option<Duration>,
     send_retries: Option<u32>,
     ping_before_query: bool,
     validate_schema: bool,
@@ -75,6 +76,7 @@ impl Default for BuilderOptions {
             send_timeout: None,
             retry_timeout: None,
             query_timeout: None,
+            acquire_timeout: None,
             send_retries: None,
             ping_before_query: false,
             validate_schema: false,
@@ -187,6 +189,11 @@ impl<M> ClientBuilder<M> {
         self
     }
 
+    pub fn acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.opts.acquire_timeout = Some(timeout);
+        self
+    }
+
     pub fn send_retries(mut self, retries: u32) -> Self {
         self.opts.send_retries = Some(retries.max(1));
         self
@@ -275,6 +282,9 @@ impl ClientBuilder<Async> {
         }
         if let Some(timeout) = self.opts.send_timeout {
             pool.set_send_timeout(Some(timeout));
+        }
+        if let Some(timeout) = self.opts.acquire_timeout {
+            pool.set_acquire_timeout(Some(timeout));
         }
         #[cfg(feature = "tokio-tls")]
         if self.opts.secure {
@@ -515,6 +525,7 @@ fn parse_query(query: &str, opts: &mut BuilderOptions) -> std::result::Result<()
             "connect_timeout" => opts.connect_timeout = Some(parse_duration(&value)?),
             "recv_timeout" | "query_timeout" => opts.recv_timeout = Some(parse_duration(&value)?),
             "send_timeout" => opts.send_timeout = Some(parse_duration(&value)?),
+            "acquire_timeout" => opts.acquire_timeout = Some(parse_duration(&value)?),
             "retry_timeout" => opts.retry_timeout = Some(parse_duration(&value)?),
             "send_retries" => {
                 opts.send_retries = Some(
@@ -666,5 +677,32 @@ mod query_timeout_tests {
     fn builder_default_has_no_query_timeout() {
         let b = ClientBuilder::<Async>::new();
         assert_eq!(b.opts.query_timeout, None);
+    }
+}
+
+#[cfg(test)]
+mod acquire_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn builder_stores_acquire_timeout() {
+        let b = ClientBuilder::<Async>::new().acquire_timeout(Duration::from_millis(250));
+        assert_eq!(b.opts.acquire_timeout, Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn builder_default_has_no_acquire_timeout() {
+        let b = ClientBuilder::<Async>::new();
+        assert_eq!(b.opts.acquire_timeout, None);
+    }
+
+    #[test]
+    fn url_parses_acquire_timeout() {
+        let b = ClientBuilder::<Async>::from_url(
+            "clickhouse://honne:honne@127.0.0.1:9000?acquire_timeout=50ms",
+        )
+        .expect("url should parse");
+        assert_eq!(b.opts.acquire_timeout, Some(Duration::from_millis(50)));
     }
 }
