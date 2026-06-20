@@ -1,13 +1,14 @@
-//! Connection pool using `crate::runtime::sync::Semaphore` — no `std::sync::Mutex`, no manual wakers.
+//! Connection pool with per-slot async mutexes and round-robin selection.
 //!
 //! Architecture:
-//!   - `Semaphore` with N permits (one per slot) — controls slot acquisition
-//!   - Per-slot `crate::runtime::sync::Mutex` — protects the `Option<Connection>`
-//!   - Atomic round-robin index — assigns slots without a free-list mutex
+//!   - Per-slot `crate::runtime::sync::Mutex` — guards each `Option<Connection>`
+//!   - Atomic round-robin index (`next_idx`) — assigns slots without a free-list
+//!     lock
 //!
-//! No blocking mutex in any async path. Zero contention between concurrent users
-//! (each locks a different slot). `PoolGuard::drop` releases a semaphore permit,
-//! which wakes the next waiter — no manual waker management.
+//! No blocking mutex in any async path. Each concurrent user typically locks a
+//! different slot; when more callers contend than there are slots, the wait for
+//! a free slot is optionally bounded by `acquire_timeout` (default: unbounded).
+//! `PoolGuard::drop` drops the slot guard, waking the next waiter.
 
 use crate::error::Result;
 use crate::protocol::handshake;
@@ -478,7 +479,7 @@ fn choose_chunked_mode(
 // SimplePool
 // ---------------------------------------------------------------------------
 
-/// A semaphore-based pool of ClickHouse connections.
+/// A pool of ClickHouse connections with per-slot async mutexes.
 ///
 /// Slots are assigned round-robin via an atomic counter. Each slot holds
 /// `Option<Connection>` and is lazily connected on first use.
@@ -490,6 +491,8 @@ pub(crate) struct SimplePool {
     config_generation: AtomicU64,
     ttl: std::time::Duration,
     connect_timeout: Option<Duration>,
+    /// Max wait for a free slot in `get()` (None = unbounded, today's behaviour).
+    acquire_timeout: Option<Duration>,
     user: String,
     password: String,
     database: String,
@@ -527,6 +530,7 @@ impl SimplePool {
             config_generation: AtomicU64::new(0),
             ttl: std::time::Duration::ZERO,
             connect_timeout: None,
+            acquire_timeout: None,
             user: String::from("default"),
             password: String::new(),
             database: String::new(),
@@ -558,6 +562,11 @@ impl SimplePool {
     pub(crate) fn set_send_timeout(&mut self, t: Option<Duration>) {
         self.send_timeout = t;
         self.bump_config_generation();
+    }
+
+    /// Set the max wait for a free pool slot. `None` = unbounded (default).
+    pub(crate) fn set_acquire_timeout(&mut self, t: Option<Duration>) {
+        self.acquire_timeout = t;
     }
 
     /// Set the hostname for periodic DNS refresh. Pass `None` to disable.
@@ -934,6 +943,27 @@ mod tests {
         assert_eq!(pool.send_timeout, Some(Duration::from_secs(10)));
         pool.set_send_timeout(None);
         assert!(pool.send_timeout.is_none());
+    }
+
+    #[test]
+    fn test_acquire_timeout_defaults_none() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let pool = SimplePool::new(vec![addr], 2);
+        assert!(pool.acquire_timeout.is_none());
+    }
+
+    #[test]
+    fn test_set_acquire_timeout() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 2);
+        pool.set_acquire_timeout(Some(Duration::from_millis(50)));
+        assert_eq!(pool.acquire_timeout, Some(Duration::from_millis(50)));
+        pool.set_acquire_timeout(None);
+        assert!(pool.acquire_timeout.is_none());
     }
 
     #[test]
