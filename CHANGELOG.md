@@ -2,6 +2,15 @@
 
 All notable changes to st-clickhouse are documented here.
 
+## [Unreleased]
+
+### Added
+- **Query timeout**: opt-in hard wall-clock deadline via `Client::with_query_timeout(d)`
+  and per-query `QueryBuilder::timeout(d)`. On expiry the query is cancelled server-side
+  (`Cancel` packet) and the pooled connection is drained and reused. Default `None` —
+  no behaviour change for existing users. Async client only; sync core already
+  supported `query_timeout`.
+
 ## [0.1.0] — 2026-05-18
 
 ### Added
