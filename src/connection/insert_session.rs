@@ -15,6 +15,7 @@ pub struct InsertSession<'a> {
     block: Option<Block>,
     active: bool,
     recv_timeout: Duration,
+    deadline: Option<crate::runtime::time::Instant>,
     compression: Option<CompressionMethod>,
     table_name: String,
     schema: Option<TableSchema>,
@@ -51,14 +52,18 @@ impl Client {
         stream.write_packet(&pkt).await?;
         stream.flush().await?;
         let response_compressed = compression_flag(self.compression) == 1;
+        let deadline = self
+            .query_timeout
+            .map(|t| crate::runtime::time::Instant::now() + t);
         let block =
-            read_table_structure(stream, self.recv_timeout, response_compressed, None).await?;
+            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await?;
         metric_guard.succeed();
         Ok(InsertSession {
             guard,
             block: Some(block),
             active: true,
             recv_timeout: self.recv_timeout,
+            deadline,
             compression: self.compression,
             table_name: table.to_owned(),
             schema,
@@ -117,7 +122,7 @@ impl InsertSession<'_> {
             stream,
             self.recv_timeout,
             compression_flag(self.compression) == 1,
-            None,
+            self.deadline,
         )
         .await
     }
