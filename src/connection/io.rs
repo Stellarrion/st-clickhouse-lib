@@ -708,7 +708,7 @@ mod timeout_tests {
         let dl = Instant::now() + Duration::from_millis(10);
         let got = packet_read_timeout(Duration::from_secs(300), Some(dl));
         assert!(got.is_some());
-        assert!(got.unwrap() <= Duration::from_millis(10));
+        assert!(got.expect("checked is_some above") <= Duration::from_millis(10));
     }
 
     #[test]

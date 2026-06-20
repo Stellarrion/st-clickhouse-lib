@@ -4,10 +4,10 @@ use st_clickhouse::error::Error;
 use std::time::Duration;
 
 fn assert_timeout<T: std::fmt::Debug>(r: st_clickhouse::error::Result<T>) {
-    match r {
-        Err(Error::Timeout(_)) => {},
-        other => panic!("expected Error::Timeout, got {other:?}"),
-    }
+    assert!(
+        matches!(&r, Err(Error::Timeout(_))),
+        "expected Error::Timeout, got {r:?}"
+    );
 }
 
 #[tokio::test]
