@@ -26,6 +26,8 @@ pub enum Error {
     ConnectionClosed(String),
     /// Configuration error (invalid address, missing feature).
     Config(String),
+    /// A pool slot could not be acquired within `acquire_timeout`.
+    PoolTimeout(String),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +47,7 @@ impl fmt::Display for Error {
             Error::Timeout(msg) => write!(f, "timeout: {msg}"),
             Error::ConnectionClosed(msg) => write!(f, "connection closed: {msg}"),
             Error::Config(msg) => write!(f, "configuration error: {msg}"),
+            Error::PoolTimeout(msg) => write!(f, "pool acquire timeout: {msg}"),
         }
     }
 }
@@ -62,6 +65,11 @@ impl Error {
     /// Returns `true` if this is a timeout error.
     pub fn is_timeout(&self) -> bool {
         matches!(self, Error::Timeout(_))
+    }
+
+    /// Returns `true` if this is a pool-acquire timeout.
+    pub fn is_pool_timeout(&self) -> bool {
+        matches!(self, Error::PoolTimeout(_))
     }
 
     /// Returns `true` if this is a server exception.
@@ -86,7 +94,11 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Error::Io(_) | Error::Timeout(_) | Error::ConnectionClosed(_) | Error::Protocol(_)
+            Error::Io(_)
+                | Error::Timeout(_)
+                | Error::ConnectionClosed(_)
+                | Error::Protocol(_)
+                | Error::PoolTimeout(_)
         )
     }
 }
@@ -94,5 +106,32 @@ impl Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_timeout_is_pool_timeout_only() {
+        assert!(Error::PoolTimeout("no slot".into()).is_pool_timeout());
+        assert!(!Error::Timeout("query".into()).is_pool_timeout());
+        assert!(!Error::ConnectionClosed("x".into()).is_pool_timeout());
+    }
+
+    #[test]
+    fn pool_timeout_is_retryable_but_not_timeout() {
+        let e = Error::PoolTimeout("no slot".into());
+        assert!(e.is_retryable(), "PoolTimeout must stay retryable");
+        assert!(!e.is_timeout(), "PoolTimeout must NOT match is_timeout");
+    }
+
+    #[test]
+    fn pool_timeout_display() {
+        assert_eq!(
+            Error::PoolTimeout("no slot".to_owned()).to_string(),
+            "pool acquire timeout: no slot"
+        );
     }
 }
