@@ -75,6 +75,9 @@ impl Client {
     /// `EndOfStream`) within `t` is cancelled server-side and returns
     /// [`Error::Timeout`](crate::error::Error::Timeout). The connection is
     /// drained and returned to the pool alive. `None` by default.
+    ///
+    /// This bounds the *response-read* phase. INSERT data uploads (`send_data`)
+    /// are bounded separately by [`Client::with_send_timeout`].
     pub fn with_query_timeout(mut self, t: Duration) -> Self {
         self.query_timeout = Some(t);
         self
