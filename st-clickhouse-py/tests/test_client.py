@@ -911,3 +911,37 @@ class TestServerInfo:
                 "SELECT value FROM system.settings WHERE name = 'max_block_size'"
             )
             assert rows[0]["value"] == "100"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Query timeout (sync core already enforces `query_timeout` via the socket
+# read timeout; this verifies the constructor wiring surfaces it to Python).
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_query_timeout_aborts_slow_query():
+    """A tight `query_timeout` must abort a slow query rather than hang."""
+    client = Client(
+        CLICKHOUSE_HOST,
+        user=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASS,
+        query_timeout=0.5,
+    )
+    try:
+        # SELECT sleep(3) sends no data for 3s; the 0.5s read timeout fires.
+        with pytest.raises(Exception):
+            client.query("SELECT sleep(3)")
+    finally:
+        client.close()
+
+    # A fresh client must still work afterwards (server is healthy).
+    client2 = Client(
+        CLICKHOUSE_HOST,
+        user=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASS,
+        query_timeout=30.0,
+    )
+    try:
+        rows = client2.query("SELECT toUInt64(1) AS x")
+        assert rows[0]["x"] == 1
+    finally:
+        client2.close()
