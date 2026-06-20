@@ -10,6 +10,11 @@ All notable changes to st-clickhouse are documented here.
   (`Cancel` packet) and the pooled connection is drained and reused. Default `None` —
   no behaviour change for existing users. Async client only; sync core already
   supported `query_timeout`.
+- **Pool acquire timeout**: bound the wait for a free pool slot via
+  `Client::with_acquire_timeout(d)` / `ClientBuilder::acquire_timeout(d)` / URL
+  `acquire_timeout=`. Returns the retryable `Error::PoolTimeout` when no slot is
+  free in time. Default `None` (unbounded — unchanged). Async client only.
+  An acquire timeout also bumps the `connection_errors` metric.
 
 ## [0.1.0] — 2026-05-18
 
