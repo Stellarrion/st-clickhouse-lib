@@ -402,6 +402,7 @@ fn test_client() -> Client {
         retry_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(30),
         recv_timeout: Duration::from_secs(300),
+        query_timeout: None,
         schema_cache: Arc::new(RwLock::new(HashMap::new())),
         validate_schema: false,
     }

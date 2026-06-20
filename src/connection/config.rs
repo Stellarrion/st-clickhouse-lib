@@ -69,6 +69,17 @@ impl Client {
         self
     }
 
+    /// Set a whole-query wall-clock timeout.
+    ///
+    /// When set, a query that has not fully completed (read through
+    /// `EndOfStream`) within `t` is cancelled server-side and returns
+    /// [`Error::Timeout`](crate::error::Error::Timeout). The connection is
+    /// drained and returned to the pool alive. `None` by default.
+    pub fn with_query_timeout(mut self, t: Duration) -> Self {
+        self.query_timeout = Some(t);
+        self
+    }
+
     /// Attach a metrics sink shared with the connection pool.
     pub fn with_metrics(mut self, metrics: &'static crate::metrics::Metrics) -> Self {
         self.pool.with_metrics(metrics);

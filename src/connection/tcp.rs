@@ -30,6 +30,9 @@ pub struct Client {
     pub(crate) retry_timeout: Duration,
     pub(crate) connect_timeout: Duration,
     pub(crate) recv_timeout: Duration,
+    /// Wall-clock deadline for a whole query (None = no deadline, only the
+    /// per-packet `recv_timeout` floor applies). Set via `with_query_timeout`.
+    pub(crate) query_timeout: Option<Duration>,
     pub(crate) schema_cache: Arc<RwLock<HashMap<String, TableSchema>>>,
     pub(crate) validate_schema: bool,
 }

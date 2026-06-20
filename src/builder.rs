@@ -36,6 +36,7 @@ struct BuilderOptions {
     recv_timeout: Option<Duration>,
     send_timeout: Option<Duration>,
     retry_timeout: Option<Duration>,
+    query_timeout: Option<Duration>,
     send_retries: Option<u32>,
     ping_before_query: bool,
     validate_schema: bool,
@@ -73,6 +74,7 @@ impl Default for BuilderOptions {
             recv_timeout: None,
             send_timeout: None,
             retry_timeout: None,
+            query_timeout: None,
             send_retries: None,
             ping_before_query: false,
             validate_schema: false,
@@ -177,6 +179,11 @@ impl<M> ClientBuilder<M> {
 
     pub fn retry_timeout(mut self, timeout: Duration) -> Self {
         self.opts.retry_timeout = Some(timeout);
+        self
+    }
+
+    pub fn query_timeout(mut self, timeout: Duration) -> Self {
+        self.opts.query_timeout = Some(timeout);
         self
     }
 
@@ -291,6 +298,9 @@ impl ClientBuilder<Async> {
         }
         if let Some(timeout) = self.opts.retry_timeout {
             client.retry_timeout = timeout;
+        }
+        if let Some(timeout) = self.opts.query_timeout {
+            client.query_timeout = Some(timeout);
         }
         if let Some(retries) = self.opts.send_retries {
             client.send_retries = retries;
@@ -638,5 +648,23 @@ mod tests {
             Some("1000")
         );
         assert!(builder.opts.secure);
+    }
+}
+
+#[cfg(test)]
+mod query_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn builder_stores_query_timeout() {
+        let b = ClientBuilder::<Async>::new().query_timeout(Duration::from_secs(12));
+        assert_eq!(b.opts.query_timeout, Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn builder_default_has_no_query_timeout() {
+        let b = ClientBuilder::<Async>::new();
+        assert_eq!(b.opts.query_timeout, None);
     }
 }
