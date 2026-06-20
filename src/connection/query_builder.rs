@@ -19,7 +19,6 @@ use crate::protocol::parameters::QueryParameter;
 use crate::runtime::io::AsyncWriteExt;
 use crate::runtime::sync::mpsc;
 use std::collections::HashMap;
-use std::future::Future;
 
 impl Client {
     /// Start building a SELECT query.
@@ -35,6 +34,7 @@ impl Client {
             external_tables: Vec::new(),
             ignored_part_uuids: Vec::new(),
             tracing_context: None,
+            timeout: None,
         }
     }
 
@@ -55,6 +55,7 @@ pub struct QueryBuilder<'a> {
     external_tables: Vec<(String, Block)>,
     ignored_part_uuids: Vec<[u8; 16]>,
     tracing_context: Option<crate::client_info::TracingContext>,
+    timeout: Option<std::time::Duration>,
 }
 
 enum QuerySettingsMode {
@@ -128,6 +129,14 @@ impl<'a> QueryBuilder<'a> {
         self
     }
 
+    /// Set a per-query wall-clock timeout that overrides the client-level
+    /// [`Client::with_query_timeout`](crate::Client::with_query_timeout).
+    /// The deadline starts when the query is first sent.
+    pub fn timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = Some(t);
+        self
+    }
+
     /// Bind a server-side query parameter for `{name:Type}` placeholders.
     ///
     /// Values are sent through the native protocol parameter section instead
@@ -171,20 +180,35 @@ impl<'a> QueryBuilder<'a> {
         self
     }
 
-    async fn retry<T, F, Fut>(&self, mut op: F) -> Result<T>
+    /// Effective whole-query deadline: per-query override else client-level.
+    fn effective_deadline(&self) -> Option<crate::runtime::time::Instant> {
+        self.timeout
+            .or(self.client.query_timeout)
+            .map(|t| crate::runtime::time::Instant::now() + t)
+    }
+
+    async fn retry<T, F, Fut>(
+        &self, deadline: Option<crate::runtime::time::Instant>, mut op: F,
+    ) -> Result<T>
     where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        F: FnMut(Option<crate::runtime::time::Instant>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
     {
         let metric_guard = QueryMetricGuard::new(self.client.metrics(), 1);
         let retries = self.client.send_retries.max(1);
         for attempt in 0..retries {
-            match op().await {
+            match op(deadline).await {
                 Ok(value) => {
                     metric_guard.succeed();
                     return Ok(value);
                 },
                 Err(e) if e.is_retryable() && attempt + 1 < retries => {
+                    // A timed-out query under an explicit deadline must not be
+                    // re-run (it would just time out again, server-side). With
+                    // no deadline configured, behavior is unchanged.
+                    if deadline.is_some() && e.is_timeout() {
+                        return Err(e);
+                    }
                     metric_guard.retry();
                     let base_ms = self.client.retry_timeout.as_millis() as u64;
                     let delay = base_ms.saturating_mul(1u64 << attempt);
@@ -249,18 +273,19 @@ impl<'a> QueryBuilder<'a> {
     /// Fetch the first result block with retries on retryable errors.
     /// Reads until EoS on `stream_mut()` — connection stays clean.
     pub async fn block(self) -> Result<Block> {
-        self.retry(|| self._try_block()).await
+        let deadline = self.effective_deadline();
+        self.retry(deadline, |dl| self._try_block(dl)).await
     }
 
     /// Internal block read — called in retry loop.
-    async fn _try_block(&self) -> Result<Block> {
+    async fn _try_block(&self, deadline: Option<crate::runtime::time::Instant>) -> Result<Block> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
         read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
-            None,
+            deadline,
             response_compressed,
             &self.callbacks,
             FirstBlockHandler::default(),
@@ -313,7 +338,8 @@ impl<'a> QueryBuilder<'a> {
 
     /// Fetch all rows into a Vec with retries on retryable errors.
     pub async fn all<T: crate::row::Row>(self) -> Result<Vec<T>> {
-        self.retry(|| self._try_all::<T>()).await
+        let deadline = self.effective_deadline();
+        self.retry(deadline, |dl| self._try_all::<T>(dl)).await
     }
 
     /// Fetch exactly one row.
@@ -349,17 +375,20 @@ impl<'a> QueryBuilder<'a> {
 
     /// Count response rows without materializing result blocks.
     pub async fn row_count(self) -> Result<usize> {
-        self.retry(|| self._try_row_count()).await
+        let deadline = self.effective_deadline();
+        self.retry(deadline, |dl| self._try_row_count(dl)).await
     }
 
-    async fn _try_row_count(&self) -> Result<usize> {
+    async fn _try_row_count(
+        &self, deadline: Option<crate::runtime::time::Instant>,
+    ) -> Result<usize> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
         read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
-            None,
+            deadline,
             response_compressed,
             &self.callbacks,
             RowCountHandler::default(),
@@ -368,14 +397,16 @@ impl<'a> QueryBuilder<'a> {
     }
 
     /// Internal all-rows read — called in retry loop.
-    async fn _try_all<T: crate::row::Row>(&self) -> Result<Vec<T>> {
+    async fn _try_all<T: crate::row::Row>(
+        &self, deadline: Option<crate::runtime::time::Instant>,
+    ) -> Result<Vec<T>> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
         read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
-            None,
+            deadline,
             response_compressed,
             &self.callbacks,
             AllRowsHandler::<T>::default(),
@@ -386,13 +417,14 @@ impl<'a> QueryBuilder<'a> {
     /// Fetch raw native block bodies without materializing parsed [`Block`] values.
     pub async fn raw(self) -> Result<Vec<RawBlock>> {
         let metric_guard = QueryMetricGuard::new(self.client.metrics(), 1);
+        let deadline = self.effective_deadline();
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::RawCapture)
             .await?;
         let blocks = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
-            None,
+            deadline,
             response_compressed,
             &self.callbacks,
             RawBlocksHandler::default(),
