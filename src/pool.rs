@@ -766,7 +766,20 @@ impl SimplePool {
     pub(crate) async fn get(&self) -> Result<PoolGuard<'_>> {
         // Round-robin slot selection
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        let mut slot_guard = self.slots[idx].lock().await;
+        let mut slot_guard = match self.acquire_timeout {
+            Some(t) => match crate::runtime::time::timeout(t, self.slots[idx].lock()).await {
+                Ok(g) => g,
+                Err(_) => {
+                    if let Some(m) = self.metrics {
+                        m.connection_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(crate::error::Error::PoolTimeout(format!(
+                        "no connection slot available within {t:?}"
+                    )));
+                },
+            },
+            None => self.slots[idx].lock().await,
+        };
         if slot_guard.is_none() {
             *slot_guard = Some(self.connect_round_robin().await?);
         }
@@ -1042,7 +1055,7 @@ mod tests {
             .insert(addr, Instant::now() - Duration::from_secs(1));
         assert!(!pool.dead_addrs.lock().is_empty());
 
-        // After acquiring a semaphore permit, we can send a "ping" packet to
+        // After acquiring a slot, we can send a "ping" packet to
         // the server.  In this test we only verify that the dead_addrs map
         // can be cleaned.  The connect_round_robin loop itself calls
         // dead.retain(|_, expiry| *expiry > Instant::now()) which prunes
@@ -1061,5 +1074,25 @@ mod tests {
             .expect("test operation failed");
         let pool = SimplePool::new(vec![addr], 5);
         assert_eq!(pool.slot_count(), 5);
+    }
+
+    /// Server-free proof that `get()` honours `acquire_timeout`: hold the only
+    /// slot from the test, so `get()` cannot acquire it and must time out.
+    /// The outer probe bound makes RED fail fast instead of hanging.
+    #[tokio::test]
+    async fn test_acquire_timeout_returns_pool_timeout_when_slot_contended() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 1);
+        pool.set_acquire_timeout(Some(Duration::from_millis(20)));
+        // Occupy the single slot; `get()` (round-robin idx 0) cannot lock it.
+        let _held = pool.slots[0].lock().await;
+
+        let res = crate::runtime::time::timeout(Duration::from_secs(2), pool.get()).await;
+        match res {
+            Ok(Err(crate::error::Error::PoolTimeout(_))) => {},
+            Ok(Ok(_)) => panic!("expected PoolTimeout, got Ok(connection)"),
+            Ok(Err(e)) => panic!("expected PoolTimeout, got other error: {e:?}"),
+            Err(_) => panic!("expected PoolTimeout, get() hung past the 2 s probe"),
+        }
     }
 }
