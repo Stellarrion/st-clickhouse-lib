@@ -8,6 +8,7 @@ use crate::protocol::packet::ClientPacket;
 use crate::protocol::revision;
 use crate::protocol::wire;
 use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
+use crate::runtime::time::Instant;
 use std::collections::HashMap;
 
 const MAX_STRING_BYTES: usize = 0x00FF_FFFF;
@@ -17,6 +18,29 @@ pub(crate) fn compression_flag(compression: Option<CompressionMethod>) -> u64 {
     match compression {
         Some(CompressionMethod::Lz4 | CompressionMethod::Zstd) => 1,
         Some(CompressionMethod::None) | None => 0,
+    }
+}
+
+/// Per-read timeout for a packet loop: the smaller of `recv_timeout` and the
+/// time remaining until `deadline` (if set).
+///
+/// Returns `None` when the deadline has already elapsed — the caller must
+/// treat the query as timed out (cancel + drain + `Error::Timeout`).
+#[inline]
+#[allow(dead_code)] // wired up in Task 4 (deadline-aware reads)
+pub(crate) fn packet_read_timeout(
+    recv_timeout: std::time::Duration, deadline: Option<Instant>,
+) -> Option<std::time::Duration> {
+    match deadline {
+        None => Some(recv_timeout),
+        Some(d) => {
+            let remaining = d.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                None
+            } else {
+                Some(std::cmp::min(recv_timeout, remaining))
+            }
+        },
     }
 }
 
@@ -655,4 +679,45 @@ async fn discard_exact<
         len -= n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::packet_read_timeout;
+    use crate::runtime::time::Instant;
+    use std::time::Duration;
+
+    #[test]
+    fn no_deadline_returns_recv_timeout() {
+        assert_eq!(
+            packet_read_timeout(Duration::from_secs(300), None),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn deadline_far_returns_recv_timeout() {
+        let dl = Instant::now() + Duration::from_secs(600);
+        assert_eq!(
+            packet_read_timeout(Duration::from_secs(300), Some(dl)),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn deadline_near_returns_remaining() {
+        let dl = Instant::now() + Duration::from_millis(10);
+        let got = packet_read_timeout(Duration::from_secs(300), Some(dl));
+        assert!(got.is_some());
+        assert!(got.unwrap() <= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn deadline_expired_returns_none() {
+        let dl = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            packet_read_timeout(Duration::from_secs(300), Some(dl)),
+            None
+        );
+    }
 }
