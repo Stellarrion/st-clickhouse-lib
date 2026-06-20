@@ -1088,11 +1088,11 @@ mod tests {
         let _held = pool.slots[0].lock().await;
 
         let res = crate::runtime::time::timeout(Duration::from_secs(2), pool.get()).await;
-        match res {
-            Ok(Err(crate::error::Error::PoolTimeout(_))) => {},
-            Ok(Ok(_)) => panic!("expected PoolTimeout, got Ok(connection)"),
-            Ok(Err(e)) => panic!("expected PoolTimeout, got other error: {e:?}"),
-            Err(_) => panic!("expected PoolTimeout, get() hung past the 2 s probe"),
-        }
+        // `PoolGuard` isn't `Debug`, so the message is static. Use `assert!`
+        // rather than `panic!` (the crate denies `clippy::panic`).
+        assert!(
+            matches!(res, Ok(Err(crate::error::Error::PoolTimeout(_)))),
+            "expected PoolTimeout, got Ok(connection), other error, or probe elapsed"
+        );
     }
 }

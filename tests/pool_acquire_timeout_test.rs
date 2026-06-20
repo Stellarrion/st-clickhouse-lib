@@ -25,11 +25,12 @@ async fn acquire_timeout_fires_under_contention() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Concurrent acquire on the same single-slot pool must time out.
+    // (`assert!`, not `panic!` — the crate denies `clippy::panic`.)
     let probe = client.query("SELECT 1").fetch::<(u8,)>().await;
-    match probe {
-        Err(Error::PoolTimeout(_)) => {},
-        other => panic!("expected PoolTimeout, got {other:?}"),
-    }
+    assert!(
+        matches!(&probe, Err(Error::PoolTimeout(_))),
+        "expected PoolTimeout, got {probe:?}"
+    );
 
     // After the slow query releases the slot, a fresh query must succeed.
     let _ = slow.await.expect("slow task panicked");
