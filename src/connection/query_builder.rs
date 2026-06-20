@@ -310,6 +310,8 @@ impl<'a> QueryBuilder<'a> {
 
         // Cancel signal shared with the background task
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deadline = self.effective_deadline();
+        let recv_timeout = self.client.recv_timeout;
 
         // Spawn a short-lived task that owns the stream and reads all blocks
         let (block_tx, block_rx) = mpsc::channel(4);
@@ -317,16 +319,22 @@ impl<'a> QueryBuilder<'a> {
         crate::runtime::spawn(async move {
             let mut stream = stream;
             if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::runtime::io::AsyncWriteExt::write_all(
-                    &mut stream,
-                    &[ClientPacket::Cancel as u8],
-                )
-                .await
-                .ok();
+                stream
+                    .write_packet(&[ClientPacket::Cancel as u8])
+                    .await
+                    .ok();
+                stream.flush().await.ok();
                 return;
             }
-            if let Err(e) =
-                read_query_blocks(stream, &block_tx, &self.callbacks, Some(&cancel_clone)).await
+            if let Err(e) = read_query_blocks(
+                stream,
+                &block_tx,
+                &self.callbacks,
+                Some(&cancel_clone),
+                recv_timeout,
+                deadline,
+            )
+            .await
             {
                 let _ = block_tx.send(Err(e)).await;
             }

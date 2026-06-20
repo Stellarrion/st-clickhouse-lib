@@ -10,6 +10,7 @@ use crate::connection::server_packets::{
 use crate::error::Result;
 use crate::protocol::block::Block;
 use crate::protocol::packet::ClientPacket;
+use crate::runtime::io::AsyncWriteExt;
 use crate::runtime::sync::mpsc;
 
 /// Read packets from the stream, sending Data blocks via the channel.
@@ -17,20 +18,64 @@ use crate::runtime::sync::mpsc;
 pub(super) async fn read_query_blocks(
     mut stream: crate::pool::StreamWrapper, block_tx: &mpsc::Sender<Result<Option<Block>>>,
     callbacks: &QueryCallbacks, cancel: Option<&std::sync::atomic::AtomicBool>,
+    recv_timeout: std::time::Duration, deadline: Option<crate::runtime::time::Instant>,
 ) -> Result<()> {
+    use crate::connection::io::packet_read_timeout;
     loop {
         if let Some(c) = cancel {
             if c.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::runtime::io::AsyncWriteExt::write_all(
-                    &mut stream,
-                    &[ClientPacket::Cancel as u8],
-                )
-                .await
-                .ok();
+                stream
+                    .write_packet(&[ClientPacket::Cancel as u8])
+                    .await
+                    .ok();
+                stream.flush().await.ok();
                 return Ok(());
             }
         }
-        let packet_type = read_varint_async(&mut stream).await?;
+        let packet_type = match packet_read_timeout(recv_timeout, deadline) {
+            Some(per_read) => {
+                match crate::runtime::time::timeout(per_read, read_varint_async(&mut stream)).await
+                {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        let _ = block_tx.send(Err(e)).await;
+                        return Ok(());
+                    },
+                    Err(_) => {
+                        if deadline.is_some() {
+                            stream
+                                .write_packet(&[ClientPacket::Cancel as u8])
+                                .await
+                                .ok();
+                            stream.flush().await.ok();
+                            let _ = block_tx
+                                .send(Err(crate::error::Error::Timeout(
+                                    "query exceeded deadline".into(),
+                                )))
+                                .await;
+                            return Ok(());
+                        }
+                        let _ = block_tx
+                            .send(Err(crate::error::Error::Protocol("timeout".into())))
+                            .await;
+                        return Ok(());
+                    },
+                }
+            },
+            None => {
+                stream
+                    .write_packet(&[ClientPacket::Cancel as u8])
+                    .await
+                    .ok();
+                stream.flush().await.ok();
+                let _ = block_tx
+                    .send(Err(crate::error::Error::Timeout(
+                        "query exceeded deadline".into(),
+                    )))
+                    .await;
+                return Ok(());
+            },
+        };
         match packet_type {
             1 => {
                 let block = read_data_block(&mut stream).await?;

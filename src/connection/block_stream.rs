@@ -1,11 +1,12 @@
 use crate::connection::block_reader::read_data_block;
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::io::{
-    ping_stream, read_exception, read_profile_info_packet, read_progress_packet, read_varint_async,
+    packet_read_timeout, ping_stream, read_exception, read_profile_info_packet,
+    read_progress_packet, read_varint_async,
 };
 use crate::connection::query_packet::{build_query_packet_from_cached_or_revision, query_id_bytes};
 use crate::connection::server_packets::{
-    handle_coordinator_packet, read_part_uuids_update, read_timezone_update,
+    cancel_and_drain, handle_coordinator_packet, read_part_uuids_update, read_timezone_update,
     unsupported_server_packet, write_ignored_part_uuids_if_any,
 };
 use crate::connection::tcp::Client;
@@ -28,6 +29,7 @@ pub struct BlockStream<'a> {
     guard: crate::pool::PoolGuard<'a>,
     done: bool,
     recv_timeout: Duration,
+    deadline: Option<crate::runtime::time::Instant>,
     callbacks: QueryCallbacks,
 }
 
@@ -69,11 +71,15 @@ impl Client {
             stream.write_packet(&pkt).await?;
             stream.flush().await?;
         }
+        let deadline = self
+            .query_timeout
+            .map(|t| crate::runtime::time::Instant::now() + t);
         metric_guard.succeed();
         Ok(BlockStream {
             guard,
             done: false,
             recv_timeout: self.recv_timeout,
+            deadline,
             callbacks: QueryCallbacks::default(),
         })
     }
@@ -93,17 +99,34 @@ impl BlockStream<'_> {
         }
         let stream = self.guard.stream_mut();
         loop {
-            let packet_type =
-                match crate::runtime::time::timeout(self.recv_timeout, read_varint_async(stream))
-                    .await
-                {
-                    Ok(Ok(t)) => t,
-                    Ok(Err(e)) => {
-                        self.done = true;
-                        return Err(e);
-                    },
-                    Err(_) => return Ok(None),
-                };
+            let packet_type = match packet_read_timeout(self.recv_timeout, self.deadline) {
+                Some(per_read) => {
+                    match crate::runtime::time::timeout(per_read, read_varint_async(stream)).await {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(e)) => {
+                            self.done = true;
+                            return Err(e);
+                        },
+                        Err(_) => {
+                            if self.deadline.is_some() {
+                                self.done = true;
+                                cancel_and_drain(stream, self.recv_timeout, false).await?;
+                                return Err(crate::error::Error::Timeout(
+                                    "query exceeded deadline".into(),
+                                ));
+                            }
+                            return Ok(None); // recv_timeout floor: unchanged
+                        },
+                    }
+                },
+                None => {
+                    self.done = true;
+                    cancel_and_drain(stream, self.recv_timeout, false).await?;
+                    return Err(crate::error::Error::Timeout(
+                        "query exceeded deadline".into(),
+                    ));
+                },
+            };
             match packet_type {
                 1 => {
                     let block = read_data_block(stream).await?;
@@ -152,19 +175,17 @@ impl BlockStream<'_> {
         }
     }
 
-    /// Cancel the running query.
+    /// Cancel the running query and drain the response.
     ///
-    /// Sends a Cancel packet to the server. The stream is no longer usable
-    /// after cancellation.
+    /// Sends `Cancel`, drains to `EndOfStream`/`Exception`, and leaves the
+    /// connection usable for the next query.
     pub async fn cancel(&mut self) -> Result<()> {
         if self.done {
             return Ok(());
         }
         self.done = true;
         let stream = self.guard.stream_mut();
-        stream.write_packet(&[ClientPacket::Cancel as u8]).await?;
-        stream.flush().await?;
-        Ok(())
+        cancel_and_drain(stream, self.recv_timeout, false).await
     }
 }
 
