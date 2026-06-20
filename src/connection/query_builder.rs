@@ -14,6 +14,7 @@ use crate::connection::tcp::Client;
 use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::block::{Block, RawBlock};
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::parameters::QueryParameter;
 use crate::runtime::io::AsyncWriteExt;
 use crate::runtime::sync::mpsc;
@@ -290,9 +291,12 @@ impl<'a> QueryBuilder<'a> {
         crate::runtime::spawn(async move {
             let mut stream = stream;
             if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::runtime::io::AsyncWriteExt::write_all(&mut stream, &[3])
-                    .await
-                    .ok();
+                crate::runtime::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    &[ClientPacket::Cancel as u8],
+                )
+                .await
+                .ok();
                 return;
             }
             if let Err(e) =

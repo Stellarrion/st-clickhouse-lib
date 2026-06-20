@@ -95,3 +95,28 @@ pub(super) async fn write_ignored_part_uuids_if_any(
     stream.write_packet(&pkt).await?;
     Ok(())
 }
+
+use crate::connection::response_wait::drain_response;
+use crate::protocol::packet::ClientPacket;
+
+/// Send a `Cancel` packet and drain the response until `EndOfStream` /
+/// `Exception` (bounded by `recv_timeout`).
+///
+/// Used when a query deadline elapses. Best-effort: if the server ignores
+/// `Cancel` and the drain itself times out, this returns `Ok` and leaves the
+/// connection to be reaped by the pool's liveness ping on next acquire.
+///
+/// `drain_response` is called with `deadline = None` so it never recurses
+/// into cancel logic.
+#[allow(dead_code)]
+pub(crate) async fn cancel_and_drain<S>(
+    stream: &mut S, recv_timeout: std::time::Duration, response_compressed: bool,
+) -> Result<()>
+where
+    S: crate::runtime::io::AsyncRead + crate::runtime::io::AsyncWrite + Unpin,
+{
+    use crate::runtime::io::AsyncWriteExt;
+    stream.write_all(&[ClientPacket::Cancel as u8]).await.ok();
+    stream.flush().await.ok();
+    drain_response(stream, recv_timeout, response_compressed, None).await
+}

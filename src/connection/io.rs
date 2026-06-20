@@ -4,6 +4,7 @@ use crate::client_info::{
 use crate::compression::CompressionMethod;
 use crate::connection::callbacks::{Profile, Progress};
 use crate::error::Result;
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::revision;
 use crate::protocol::wire;
 use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
@@ -162,7 +163,7 @@ pub(crate) fn write_query_packet_common_from_template(
 }
 
 pub(crate) async fn ping_stream(stream: &mut crate::pool::StreamWrapper) -> Result<()> {
-    stream.write_packet(&[4]).await?;
+    stream.write_packet(&[ClientPacket::Ping as u8]).await?;
     stream.flush().await?;
     let mut pkt = [0u8; 1];
     stream.read_exact(&mut pkt).await?;

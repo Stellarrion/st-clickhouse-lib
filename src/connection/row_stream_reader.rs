@@ -9,6 +9,7 @@ use crate::connection::server_packets::{
 };
 use crate::error::Result;
 use crate::protocol::block::Block;
+use crate::protocol::packet::ClientPacket;
 use crate::runtime::sync::mpsc;
 
 /// Read packets from the stream, sending Data blocks via the channel.
@@ -20,9 +21,12 @@ pub(super) async fn read_query_blocks(
     loop {
         if let Some(c) = cancel {
             if c.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::runtime::io::AsyncWriteExt::write_all(&mut stream, &[3])
-                    .await
-                    .ok();
+                crate::runtime::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    &[ClientPacket::Cancel as u8],
+                )
+                .await
+                .ok();
                 return Ok(());
             }
         }

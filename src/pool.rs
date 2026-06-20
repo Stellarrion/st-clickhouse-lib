@@ -11,6 +11,7 @@
 
 use crate::error::Result;
 use crate::protocol::handshake;
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::revision;
 use crate::runtime::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::runtime::sync::{Mutex as AsyncMutex, MutexGuard};
@@ -373,7 +374,7 @@ async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
         stream.set_send_timeout(Some(timeout));
     }
     // Ping
-    stream.write_packet(&[4]).await?;
+    stream.write_packet(&[ClientPacket::Ping as u8]).await?;
     stream.flush().await?;
     let mut pkt = [0u8; 1];
     stream.read_exact(&mut pkt).await?;
@@ -814,7 +815,8 @@ impl Drop for SimplePool {
                 if let Some(ref conn) = *guard {
                     // Send Cancel packet to gracefully close server-side query
                     if let Some(tcp) = conn.stream.raw_tcp() {
-                        let _: std::io::Result<usize> = tcp.try_write(&[3u8]);
+                        let _: std::io::Result<usize> =
+                            tcp.try_write(&[ClientPacket::Cancel as u8]);
                     }
                 }
             }
@@ -825,7 +827,12 @@ impl Drop for SimplePool {
 }
 
 async fn is_connection_alive(conn: &mut Connection) -> bool {
-    if conn.stream.write_packet(&[4]).await.is_err() {
+    if conn
+        .stream
+        .write_packet(&[ClientPacket::Ping as u8])
+        .await
+        .is_err()
+    {
         return false;
     }
     if conn.stream.flush().await.is_err() {

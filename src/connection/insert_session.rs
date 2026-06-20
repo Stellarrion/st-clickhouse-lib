@@ -51,7 +51,8 @@ impl Client {
         stream.write_packet(&pkt).await?;
         stream.flush().await?;
         let response_compressed = compression_flag(self.compression) == 1;
-        let block = read_table_structure(stream, self.recv_timeout, response_compressed).await?;
+        let block =
+            read_table_structure(stream, self.recv_timeout, response_compressed, None).await?;
         metric_guard.succeed();
         Ok(InsertSession {
             guard,
@@ -116,6 +117,7 @@ impl InsertSession<'_> {
             stream,
             self.recv_timeout,
             compression_flag(self.compression) == 1,
+            None,
         )
         .await
     }

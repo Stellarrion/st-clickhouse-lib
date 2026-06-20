@@ -5,6 +5,7 @@ use crate::connection::server_packets::write_ignored_part_uuids_if_any;
 use crate::connection::tcp::Client;
 use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::parameters::QueryParameter;
 use crate::runtime::io::AsyncWriteExt;
 use crate::schema::query_may_change_schema;
@@ -108,6 +109,7 @@ impl Client {
             stream,
             self.recv_timeout,
             compression_flag(self.compression) == 1,
+            None,
         )
         .await?;
         if query_may_change_schema(query) {
@@ -120,7 +122,7 @@ impl Client {
     pub async fn cancel(&self) -> Result<()> {
         let mut guard = self.pool.get().await?;
         let stream = guard.stream_mut();
-        stream.write_packet(&[3]).await?;
+        stream.write_packet(&[ClientPacket::Cancel as u8]).await?;
         stream.flush().await?;
         Ok(())
     }

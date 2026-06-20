@@ -12,6 +12,7 @@ use crate::connection::tcp::Client;
 use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::block::Block;
+use crate::protocol::packet::ClientPacket;
 use crate::runtime::io::AsyncWriteExt;
 use std::time::Duration;
 
@@ -161,7 +162,7 @@ impl BlockStream<'_> {
         }
         self.done = true;
         let stream = self.guard.stream_mut();
-        stream.write_packet(&[3]).await?;
+        stream.write_packet(&[ClientPacket::Cancel as u8]).await?;
         stream.flush().await?;
         Ok(())
     }
@@ -170,7 +171,7 @@ impl BlockStream<'_> {
 impl Drop for BlockStream<'_> {
     fn drop(&mut self) {
         if let Some(tcp) = self.guard.stream_mut().raw_tcp() {
-            let _ = tcp.try_write(&[3u8]);
+            let _ = tcp.try_write(&[ClientPacket::Cancel as u8]);
         }
     }
 }

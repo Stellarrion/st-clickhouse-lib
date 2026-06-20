@@ -15,6 +15,7 @@ pub(super) async fn read_table_structure<
     S: crate::runtime::io::AsyncRead + crate::runtime::io::AsyncWrite + Unpin,
 >(
     stream: &mut S, timeout: Duration, response_compressed: bool,
+    _deadline: Option<crate::runtime::time::Instant>,
 ) -> Result<Block> {
     loop {
         let typ = match crate::runtime::time::timeout(timeout, read_varint_async(stream)).await {
@@ -65,6 +66,7 @@ pub(super) async fn drain_response<
     S: crate::runtime::io::AsyncRead + crate::runtime::io::AsyncWrite + Unpin,
 >(
     stream: &mut S, timeout: Duration, response_compressed: bool,
+    _deadline: Option<crate::runtime::time::Instant>,
 ) -> Result<()> {
     loop {
         let pkt = match crate::runtime::time::timeout(timeout, read_varint_async(stream)).await {
