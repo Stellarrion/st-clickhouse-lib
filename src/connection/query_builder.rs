@@ -260,6 +260,7 @@ impl<'a> QueryBuilder<'a> {
         read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            None,
             response_compressed,
             &self.callbacks,
             FirstBlockHandler::default(),
@@ -358,6 +359,7 @@ impl<'a> QueryBuilder<'a> {
         read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            None,
             response_compressed,
             &self.callbacks,
             RowCountHandler::default(),
@@ -373,6 +375,7 @@ impl<'a> QueryBuilder<'a> {
         read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            None,
             response_compressed,
             &self.callbacks,
             AllRowsHandler::<T>::default(),
@@ -389,6 +392,7 @@ impl<'a> QueryBuilder<'a> {
         let blocks = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            None,
             response_compressed,
             &self.callbacks,
             RawBlocksHandler::default(),

@@ -27,7 +27,6 @@ pub(crate) fn compression_flag(compression: Option<CompressionMethod>) -> u64 {
 /// Returns `None` when the deadline has already elapsed — the caller must
 /// treat the query as timed out (cancel + drain + `Error::Timeout`).
 #[inline]
-#[allow(dead_code)] // wired up in Task 4 (deadline-aware reads)
 pub(crate) fn packet_read_timeout(
     recv_timeout: std::time::Duration, deadline: Option<Instant>,
 ) -> Option<std::time::Duration> {
