@@ -365,10 +365,13 @@ Add to the existing `mod tests` in `src/pool.rs`:
         let _held = pool.slots[0].lock().await;
 
         let res = crate::runtime::time::timeout(Duration::from_secs(2), pool.get()).await;
-        match res {
-            Ok(Err(crate::error::Error::PoolTimeout(_))) => {},
-            other => panic!("expected PoolTimeout, got {other:?}"),
-        }
+        // `PoolGuard` isn't `Debug`, so the message is static. Use `assert!`
+        // rather than `panic!` — the crate denies `clippy::panic` (Cargo.toml),
+        // and `assert!`/`matches!` are not flagged by it.
+        assert!(
+            matches!(res, Ok(Err(crate::error::Error::PoolTimeout(_)))),
+            "expected PoolTimeout, got Ok(connection), other error, or probe elapsed"
+        );
     }
 ```
 
@@ -465,11 +468,12 @@ async fn acquire_timeout_fires_under_contention() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Concurrent acquire on the same single-slot pool must time out.
+    // (`assert!`, not `panic!` — the crate denies `clippy::panic`.)
     let probe = client.query("SELECT 1").fetch::<(u8,)>().await;
-    match probe {
-        Err(Error::PoolTimeout(_)) => {},
-        other => panic!("expected PoolTimeout, got {other:?}"),
-    }
+    assert!(
+        matches!(&probe, Err(Error::PoolTimeout(_))),
+        "expected PoolTimeout, got {probe:?}"
+    );
 
     // After the slow query releases the slot, a fresh query must succeed.
     let _ = slow.await.expect("slow task panicked");
@@ -584,3 +588,5 @@ git commit -m "docs(changelog): pool acquire timeout"
 **Placeholder scan:** none — all steps contain real code and exact commands.
 
 **Type/name consistency:** field `acquire_timeout` (Task 2), setter `set_acquire_timeout(Option<Duration>)` (Task 2), builder method `acquire_timeout(Duration)` (Task 3), Client `with_acquire_timeout(Duration)` (Task 3), URL key `acquire_timeout` (Task 3), error `PoolTimeout(String)` + `is_pool_timeout()` (Task 1) — all referenced consistently across tasks. `crate::runtime::time::timeout(Duration, F)` returns `Result<F::Output, Elapsed>` (verified at `src/runtime/tokio_runtime.rs:26`).
+
+**clippy::panic adaptation (learned in execution):** the crate denies `clippy::panic` and `clippy::unwrap_used` (`Cargo.toml [workspace.lints.clippy]`), and CI runs `cargo clippy --all-targets --all-features -- -D warnings`. So test assertions must use `assert!(matches!(...))`, NOT `match { … => panic!(…) }` — `assert!` is not flagged by `clippy::panic`. Where the matched value isn't `Debug` (e.g. `PoolGuard`), the `assert!` message must be a static literal. Same rule retroactively fixed two pre-existing lints in the query-timeout test code (`io.rs:711` `unwrap`→`expect`; `query_timeout_test.rs:9` `panic!`→`assert!(matches!)`) that were making `main` red.
