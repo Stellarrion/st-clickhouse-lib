@@ -382,6 +382,8 @@ git commit -m "feat(connection): add packet_read_timeout deadline helper"
 
 > Goal of this task: when the deadline elapses inside these loops, call `cancel_and_drain` and return `Error::Timeout`. When there is no deadline, behavior is byte-for-byte identical to today.
 
+> **REVIEW AMENDMENT (Task 2 code-quality review):** `cancel_and_drain` must send `Cancel` via `StreamWrapper::write_packet` (chunked-send aware), NOT bare `write_all(&[Cancel])` — a bare byte corrupts the frame when `use_chunked_send` is negotiated (server reads it as a chunk length and desyncs). Because `write_packet` is a `StreamWrapper` method, take this opportunity to **make `drain_response`, `read_table_structure`, and `cancel_and_drain` take `&mut crate::pool::StreamWrapper` concretely** (drop the generic `<S>`). Precondition: verify with `grep -rn 'drain_response\|read_table_structure' src/` that NO caller passes a non-`StreamWrapper` (all current callers use `guard.stream_mut()` → `&mut StreamWrapper`, so this is safe). Also **remove the `#[allow(dead_code)]`** from `cancel_and_drain` (it is now called). `read_select_response` already takes `&mut StreamWrapper`, so its `cancel_and_drain(stream, …)` call works unchanged. Keep `cancel_and_drain`'s `drain_response(stream, …, None)` call (still `deadline = None` → no recursion).
+
 - [ ] **Step 1: Wire the deadline into `drain_response`**
 
 In `src/connection/response_wait.rs`, replace the read-head of `drain_response` (the `let pkt = match … timeout …` block, lines 69-74) and add imports. Final function:
@@ -806,6 +808,8 @@ git commit -m "feat(connection): client-level query deadline on execute + INSERT
 - Modify: `src/connection/query_builder.rs` (`rows`)
 
 > The `rows()`/`RowCursor` path takes the stream out of the pool (`take_stream`) by design, so the connection is not reused there regardless — the deadline's job is to fire and return `Error::Timeout` through the channel (plus send `Cancel` to be polite). `BlockStream` keeps the guard, so its cancel drains for reuse.
+
+> **REVIEW AMENDMENT (Task 2 code-quality review):** The pre-existing cursor-cancel writes a bare `write_all(&[Cancel])` at `row_stream_reader.rs:23` and `query_builder.rs:294` (the `rows()` spawn). These have the **same chunked-send framing bug** as Task 2's `cancel_and_drain`. Since `read_query_blocks` owns `stream: StreamWrapper` by value, fix both to use `stream.write_packet(&[ClientPacket::Cancel as u8])` + `stream.flush()` (NOT `write_all`). This is in-scope for Task 7 because Task 7 rewrites those exact cancel sites.
 
 - [ ] **Step 1: Add deadline to `BlockStream`**
 
