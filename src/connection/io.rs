@@ -596,6 +596,30 @@ pub(crate) fn checked_usize(value: u64, name: &str) -> Result<usize> {
         .map_err(|_| crate::error::Error::Protocol(format!("{name} count too large")))
 }
 
+/// Validate a LowCardinality header and derive the per-row index width.
+///
+/// The 24-byte header carries a `version` (must be 1) and a `serial_type`
+/// whose low 2 bits are the index width shift and whose bits 8/9 carry the
+/// "global dictionaries" (unsupported) and "additional keys" (required) flags.
+pub(crate) fn lc_idx_width(version: u64, serial_type: u64) -> Result<usize> {
+    if version != 1 {
+        return Err(crate::error::Error::Protocol(format!(
+            "unsupported LowCardinality key serialization version {version}"
+        )));
+    }
+    if (serial_type & (1u64 << 8)) != 0 {
+        return Err(crate::error::Error::Protocol(
+            "LowCardinality global dictionaries are not supported".into(),
+        ));
+    }
+    if (serial_type & (1u64 << 9)) == 0 {
+        return Err(crate::error::Error::Protocol(
+            "LowCardinality additional keys flag is missing".into(),
+        ));
+    }
+    Ok(1usize << (serial_type & 0x3))
+}
+
 pub(crate) fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     loop {
         buf.push((value & 0x7F) as u8 | if value > 0x7F { 0x80 } else { 0 });

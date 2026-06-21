@@ -1035,31 +1035,16 @@ fn read_low_cardinality_into<R: Read>(
     let version = u64::from_le_bytes(meta[0..8].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality version length mismatch".into())
     })?);
-    if version != 1 {
-        return Err(crate::sync::error::Error::Protocol(format!(
-            "unsupported LowCardinality key serialization version {version}"
-        )));
-    }
     let serial_type = u64::from_le_bytes(meta[8..16].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
-    if (serial_type & (1u64 << 8)) != 0 {
-        return Err(crate::sync::error::Error::Protocol(
-            "LowCardinality global dictionaries are not supported".into(),
-        ));
-    }
-    if (serial_type & (1u64 << 9)) == 0 {
-        return Err(crate::sync::error::Error::Protocol(
-            "LowCardinality additional keys flag is missing".into(),
-        ));
-    }
+    let idx_width = lc_idx_width(version, serial_type)?;
     let num_keys = checked_usize(
         u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
             crate::sync::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
         "LowCardinality keys",
     )?;
-    let idx_width = 1usize << (serial_type & 0x3);
     let mut dict_data = Vec::new();
     read_column_data_into(reader, inner, num_keys, &mut dict_data)?;
     let mut count = [0u8; 8];
@@ -1085,31 +1070,16 @@ fn read_low_cardinality_from_buffer(
     let version = u64::from_le_bytes(meta[0..8].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality version length mismatch".into())
     })?);
-    if version != 1 {
-        return Err(crate::sync::error::Error::Protocol(format!(
-            "unsupported LowCardinality key serialization version {version}"
-        )));
-    }
     let serial_type = u64::from_le_bytes(meta[8..16].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
-    if (serial_type & (1u64 << 8)) != 0 {
-        return Err(crate::sync::error::Error::Protocol(
-            "LowCardinality global dictionaries are not supported".into(),
-        ));
-    }
-    if (serial_type & (1u64 << 9)) == 0 {
-        return Err(crate::sync::error::Error::Protocol(
-            "LowCardinality additional keys flag is missing".into(),
-        ));
-    }
+    let idx_width = lc_idx_width(version, serial_type)?;
     let num_keys = checked_usize(
         u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
             crate::sync::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
         "LowCardinality keys",
     )?;
-    let idx_width = 1usize << (serial_type & 0x3);
     let dict_start = *pos;
     skip_column_data(buf, pos, inner, num_keys)?;
     let dict_data = &buf[dict_start..*pos];
@@ -1246,31 +1216,16 @@ fn discard_low_cardinality<R: Read>(reader: &mut R, inner: &ColumnType, rows: us
     let version = u64::from_le_bytes(meta[0..8].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality version length mismatch".into())
     })?);
-    if version != 1 {
-        return Err(crate::sync::error::Error::Protocol(format!(
-            "unsupported LowCardinality key serialization version {version}"
-        )));
-    }
     let serial_type = u64::from_le_bytes(meta[8..16].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
-    if (serial_type & (1u64 << 8)) != 0 {
-        return Err(crate::sync::error::Error::Protocol(
-            "LowCardinality global dictionaries are not supported".into(),
-        ));
-    }
-    if (serial_type & (1u64 << 9)) == 0 {
-        return Err(crate::sync::error::Error::Protocol(
-            "LowCardinality additional keys flag is missing".into(),
-        ));
-    }
+    let idx_width = lc_idx_width(version, serial_type)?;
     let num_keys = checked_usize(
         u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
             crate::sync::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
         "LowCardinality keys",
     )?;
-    let idx_width = 1usize << (serial_type & 0x3);
     discard_column_data(reader, inner, num_keys)?;
     let mut count = [0u8; 8];
     reader.read_exact(&mut count)?;
@@ -1460,6 +1415,30 @@ fn checked_usize(value: u64, name: &str) -> Result<usize> {
         .map_err(|_| crate::sync::error::Error::Protocol(format!("{name} count too large")))
 }
 
+/// Validate a LowCardinality header and derive the per-row index width.
+///
+/// `version` must be 1; `serial_type` low 2 bits are the index width shift,
+/// bit 8 the unsupported "global dictionaries" flag, bit 9 the required
+/// "additional keys" flag.
+fn lc_idx_width(version: u64, serial_type: u64) -> Result<usize> {
+    if version != 1 {
+        return Err(crate::sync::error::Error::Protocol(format!(
+            "unsupported LowCardinality key serialization version {version}"
+        )));
+    }
+    if (serial_type & (1u64 << 8)) != 0 {
+        return Err(crate::sync::error::Error::Protocol(
+            "LowCardinality global dictionaries are not supported".into(),
+        ));
+    }
+    if (serial_type & (1u64 << 9)) == 0 {
+        return Err(crate::sync::error::Error::Protocol(
+            "LowCardinality additional keys flag is missing".into(),
+        ));
+    }
+    Ok(1usize << (serial_type & 0x3))
+}
+
 fn read_varint_into<R: Read>(reader: &mut R, data: &mut Vec<u8>) -> Result<u64> {
     let mut r = 0u64;
     let mut shift = 0;
@@ -1619,27 +1598,12 @@ fn skip_column_data(buf: &[u8], pos: &mut usize, ct: &ColumnType, rows: usize) -
             let version = u64::from_le_bytes(meta[0..8].try_into().map_err(|_| {
                 crate::sync::error::Error::Protocol("LowCardinality version length mismatch".into())
             })?);
-            if version != 1 {
-                return Err(crate::sync::error::Error::Protocol(format!(
-                    "unsupported LowCardinality key serialization version {version}"
-                )));
-            }
             let serial_type = u64::from_le_bytes(meta[8..16].try_into().map_err(|_| {
                 crate::sync::error::Error::Protocol(
                     "LowCardinality metadata length mismatch".into(),
                 )
             })?);
-            if (serial_type & (1u64 << 8)) != 0 {
-                return Err(crate::sync::error::Error::Protocol(
-                    "LowCardinality global dictionaries are not supported".into(),
-                ));
-            }
-            if (serial_type & (1u64 << 9)) == 0 {
-                return Err(crate::sync::error::Error::Protocol(
-                    "LowCardinality additional keys flag is missing".into(),
-                ));
-            }
-            let idx_width = 1usize << (serial_type & 0x3);
+            let idx_width = lc_idx_width(version, serial_type)?;
             let num_keys = checked_usize(
                 u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
                     crate::sync::error::Error::Protocol(
