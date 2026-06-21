@@ -65,6 +65,10 @@ All notable changes to st-clickhouse are documented here.
 - Dedup async/sync columns via `shared/` + `include!`.
 - Extract LowCardinality header validation.
 
+### Python
+- `st-clickhouse-py` version-aligned to `0.2.0`; rebuilt against the 0.2.0 Rust core.
+  No Python binding API change.
+
 ## [0.1.0] — 2026-05-18
 
 ### Added

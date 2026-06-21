@@ -35,7 +35,7 @@
 
 ```toml
 [dependencies]
-st-clickhouse-lib = { version = "0.1", features = ["derive"] }
+st-clickhouse-lib = { version = "0.2", features = ["derive"] }
 ```
 
 ```rust
@@ -350,7 +350,7 @@ TLS is provided by `rustls` (no OpenSSL dependency). Enable with the `tls` featu
 
 ```toml
 [dependencies]
-st-clickhouse-lib = { version = "0.1", features = ["tls"] }
+st-clickhouse-lib = { version = "0.2", features = ["tls"] }
 ```
 
 ```rust
@@ -521,6 +521,8 @@ The **UInt64 owned-materialization row** is where st-clickhouse's 0.2.0 PlainCol
 | 1M rows as blocks | 2.391ms | 2.141ms | 467.1M |
 | 32 concurrent `SELECT 1` | N/A | 5.027ms | — |
 
+Throughput is **stable from 0.1.0 → 0.2.0** (within run-to-run variance): 0.2.0's optimizations live in the Rust materialization core (see *Rust vs C++* above — the UInt64 owned row), which is a small slice of Python end-to-end time, where PyO3 FFI + Python object construction dominate.
+
 ### Python vs Official `clickhouse-connect` (HTTP)
 
 | Workload | st-click sync | official sync | st-click async | official async |
@@ -622,7 +624,7 @@ Run locally:
 Rust users depend on one public crate:
 
 ```toml
-st-clickhouse-lib = { version = "0.1", features = ["derive", "tls", "lz4"] }
+st-clickhouse-lib = { version = "0.2", features = ["derive", "tls", "lz4"] }
 ```
 
 The Rust import path is `st_clickhouse`. The `st-clickhouse-derive` crate is an implementation detail required by Rust's proc-macro model and is pulled in by the `derive` feature.
