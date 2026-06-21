@@ -43,9 +43,9 @@ impl StringColumnData {
 
     pub fn get_bytes(&self, index: usize) -> Result<&[u8]> {
         let (start, end) = self.range(index)?;
-        self.data
-            .get(start..end)
-            .ok_or_else(|| super::super::error::Error::Protocol("StringColumnData: invalid range".into()))
+        self.data.get(start..end).ok_or_else(|| {
+            super::super::error::Error::Protocol("StringColumnData: invalid range".into())
+        })
     }
 
     pub fn get_string(&self, index: usize) -> Result<String> {
@@ -85,8 +85,9 @@ impl ClickHouseValue for String {
         let len = wire::read_varint(reader)? as usize;
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
-        String::from_utf8(buf)
-            .map_err(|e| super::super::error::Error::Protocol(format!("invalid UTF-8 in String: {e}")))
+        String::from_utf8(buf).map_err(|e| {
+            super::super::error::Error::Protocol(format!("invalid UTF-8 in String: {e}"))
+        })
     }
 
     fn write_to<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
@@ -107,36 +108,33 @@ impl ClickHouseColumn for String {
         if rows == 0 {
             return Ok(StringColumnData::new(Vec::new(), Vec::new()));
         }
-        // First pass: scan varints to find total bytes needed for `rows` strings.
-        // We scan from ctx.pos without advancing it.
+        // Pass 1: scan the varints (without advancing `ctx`) to find the
+        // column's byte extent, record each string's body range, and sum body
+        // sizes so `data` is allocated exactly once.
+        let mut bodies: Vec<(usize, usize)> = Vec::with_capacity(rows);
         let mut scan_pos = 0usize;
+        let mut total_body = 0usize;
         for _ in 0..rows {
-            let avail = ctx.buf.len() - (ctx.pos + scan_pos);
-            if avail == 0 {
-                return Err(super::super::error::Error::Protocol(
-                    "StringColumnData: unexpected end of data".into(),
-                ));
-            }
             let (len, consumed) = read_varint_from_slice(&ctx.buf[ctx.pos + scan_pos..])?;
-            scan_pos += consumed + len as usize;
+            let len = len as usize;
+            let body_start = scan_pos + consumed;
+            let body_end = body_start.checked_add(len).ok_or_else(|| {
+                super::super::error::Error::Protocol("StringColumnData: body range overflow".into())
+            })?;
+            bodies.push((body_start, body_end));
+            total_body = total_body.checked_add(len).ok_or_else(|| {
+                super::super::error::Error::Protocol("StringColumnData: total body overflow".into())
+            })?;
+            scan_pos = body_end;
         }
-        // Now read exactly `scan_pos` bytes — this is the true extent of this column.
+        // Consume the whole column in one bounds-checked slice.
         let raw = ctx.read_exact(scan_pos)?;
-        if raw.len() < scan_pos {
-            return Err(super::super::error::Error::Protocol(
-                "StringColumnData: short read".into(),
-            ));
-        }
-        // Second pass: extract string data and build offsets
+        // Pass 2: copy bodies into a contiguous buffer using the recorded ranges
+        // — no second varint parse.
+        let mut data = Vec::with_capacity(total_body);
         let mut offsets = Vec::with_capacity(rows);
-        let mut data = Vec::new();
-        let mut rpos = 0usize;
-        for _ in 0..rows {
-            let (len, consumed) = read_varint_from_slice(&raw[rpos..])?;
-            rpos += consumed;
-            let end = rpos + len as usize;
-            data.extend_from_slice(&raw[rpos..end]);
-            rpos = end;
+        for &(start, end) in &bodies {
+            data.extend_from_slice(&raw[start..end]);
             offsets.push(data.len() as u64);
         }
         Ok(StringColumnData::new(offsets, data))
@@ -162,7 +160,9 @@ fn read_varint_from_slice(data: &[u8]) -> Result<(u64, usize)> {
         }
         shift += 7;
         if shift >= 64 {
-            return Err(super::super::error::Error::Protocol("varint overflow".into()));
+            return Err(super::super::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
         }
     }
     Err(super::super::error::Error::Protocol(
