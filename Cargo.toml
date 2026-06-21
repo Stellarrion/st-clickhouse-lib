@@ -160,6 +160,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "bench_all_workloads"
+path = "benches/bench_all_workloads.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "profile"
 path = "benches/profile.rs"
 test = false

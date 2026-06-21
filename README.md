@@ -488,37 +488,26 @@ Top critical risks addressed in v0.1:
 
 ## Performance
 
-These are local benchmark-harness results, not universal performance guarantees. They run on the same local ClickHouse (`26.4.2.10`), native TCP protocol (`127.0.0.1:9000`), revision `54459`,
-with `output_format_native_write_json_as_string=1`, `ratio_of_defaults_for_sparse_serialization=0`.
+These are local benchmark-harness results, not universal performance guarantees. Both columns run **identical** `numbers(N)` queries against the same local ClickHouse over native TCP (`127.0.0.1:9000`), with `output_format_native_write_json_as_string=1`, `ratio_of_defaults_for_sparse_serialization=0`. (`numbers(N)` is used instead of `system.numbers LIMIT` because `clickhouse-cpp` mishandles that aggregate plan and blocks.) Re-run yourself: `cargo run --release --bin bench_all_workloads` (Rust) and `benches/cpp/st_bench.cpp` built against `clickhouse-cpp -O3` — see `benches/README.md`.
 
-Lower latency is better. `vs C++` = `st-clickhouse / clickhouse-cpp`, so values below `1.00x` are faster than C++.
-
-> **0.2.0 performance work** (measured locally, ClickHouse 26.4, `127.0.0.1:9000`):
-> - Row materialization `.all::<T>()` for PlainColumn tuples is **~33% faster**
->   (1M `UInt64` tuples 4.2ms → 2.8ms) via a per-column bulk-slice fast path that
->   skips per-row type dispatch. Mixed tuples (`String`/`Array` fields) fall back
->   to the per-row path unchanged.
-> - **String column decode is ~3.3× faster** (100K strings 1.09ms → 0.33ms):
->   `StringColumnData` now borrows the block buffer (zero-copy) with a single-pass
->   varint scan.
->
-> The reference table below predates 0.2.0; the C++ column requires `clickhouse-cpp`
-> and was not re-measured here. See [CHANGELOG.md](CHANGELOG.md) for the full list.
+Lower latency is better. `vs C++` = `st-clickhouse / clickhouse-cpp`, so values below `1.00x` are faster than C++. Values are the min of ~15-30 runs; the owned-materialization row is cache-sensitive and varies a few %.
 
 ### Rust vs C++
 
-| Workload | st-clickhouse `benchmark` | clickhouse-cpp `-O3` | vs C++ |
-|----------|--------------------------|----------------------|--------|
-| `SELECT 1` | 0.469ms | 0.447ms | 1.05x |
-| `COUNT()` over 1M rows | 1.041ms | 1.085ms | **0.96x** |
-| `GROUP BY` 1K groups | 1.314ms | 1.262ms | 1.04x |
-| `ORDER BY ... LIMIT 100` | 0.862ms | 0.934ms | **0.92x** |
-| JSON materialization | 1.433ms | 1.558ms | **0.92x** |
-| 50 columns × 1K rows | 1.004ms | 1.025ms | **0.98x** |
-| 1 UInt64 × 1M rows (owned) | 2.806ms | 2.002ms | 1.40x |
-| 1 UInt64 × 1M rows (borrowed) | 2.226ms | N/A | — |
-| INSERT Memory 10K rows | 59.430ms | 59.429ms | 1.00x |
-| ALTER UPDATE 5K/10K rows | 9.654ms | 9.647ms | 1.00x |
+| Workload | st-clickhouse | clickhouse-cpp `-O3` | vs C++ |
+|----------|---------------|----------------------|--------|
+| `SELECT 1` | 0.400ms | 0.416ms | **0.96x** |
+| `COUNT()` over 1M rows | 0.805ms | 0.796ms | 1.01x |
+| `GROUP BY` 1K groups | 2.664ms | 3.011ms | **0.89x** |
+| `ORDER BY ... LIMIT 100` | 1.255ms | 1.337ms | **0.94x** |
+| JSON materialization (1K) | 0.551ms | 0.526ms | 1.05x |
+| 50 columns × 1K rows | 0.920ms | 0.914ms | 1.01x |
+| 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **0.54x** |
+| 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **0.98x** |
+| INSERT Memory 10K rows | 0.549ms | 0.534ms | 1.03x |
+| ALTER UPDATE 5K/10K rows | 0.525ms | 0.518ms | 1.01x |
+
+The **UInt64 owned-materialization row** is where st-clickhouse's 0.2.0 PlainColumn bulk-slice fast path (`read_all` / `query_all`) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms (~1.85× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
 
 ### Python Materialization (Multiple Output Shapes)
 
