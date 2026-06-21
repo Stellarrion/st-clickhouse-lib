@@ -154,6 +154,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "owned_vs_borrowed"
+path = "benches/owned_vs_borrowed.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "profile"
 path = "benches/profile.rs"
 test = false
