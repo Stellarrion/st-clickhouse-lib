@@ -176,6 +176,17 @@ impl fmt::Display for ColumnType {
 
 /// Parse a ClickHouse type name string into a `ColumnType`.
 pub fn parse_type(s: &str) -> Result<ColumnType, String> {
+    parse_type_rec(s, 0)
+}
+
+/// Cap recursion so a pathological nested type string (e.g. thousands of
+/// `Array(` wrappers from a malicious server) cannot overflow the stack.
+const MAX_TYPE_NESTING: usize = 256;
+
+fn parse_type_rec(s: &str, depth: usize) -> Result<ColumnType, String> {
+    if depth > MAX_TYPE_NESTING {
+        return Err(format!("type nesting exceeds {MAX_TYPE_NESTING} levels"));
+    }
     let s = s.trim();
     // Find the base type name: alphanumeric characters, underscores
     let paren = s.find('(');
@@ -194,19 +205,19 @@ pub fn parse_type(s: &str) -> Result<ColumnType, String> {
         let inner = s[paren_pos + 1..s.len() - 1].trim();
         match base {
             "Nullable" => {
-                let inner_type = parse_type(inner)?;
+                let inner_type = parse_type_rec(inner, depth + 1)?;
                 Ok(ColumnType::Nullable(Box::new(inner_type)))
             },
             "Array" => {
-                let inner_type = parse_type(inner)?;
+                let inner_type = parse_type_rec(inner, depth + 1)?;
                 Ok(ColumnType::Array(Box::new(inner_type)))
             },
             "Map" => {
                 // Parse two comma-separated types at the top level
                 let comma = find_top_level_comma(inner)
                     .ok_or_else(|| format!("cannot parse Map types from: {inner}"))?;
-                let kt = parse_type(&inner[..comma])?;
-                let vt = parse_type(&inner[comma + 1..])?;
+                let kt = parse_type_rec(&inner[..comma], depth + 1)?;
+                let vt = parse_type_rec(&inner[comma + 1..], depth + 1)?;
                 Ok(ColumnType::Map(Box::new(kt), Box::new(vt)))
             },
             "Tuple" => {
@@ -216,11 +227,11 @@ pub fn parse_type(s: &str) -> Result<ColumnType, String> {
                     let comma = find_top_level_comma(remaining);
                     match comma {
                         Some(pos) => {
-                            types.push(parse_type(&remaining[..pos])?);
+                            types.push(parse_type_rec(&remaining[..pos], depth + 1)?);
                             remaining = &remaining[pos + 1..];
                         },
                         None => {
-                            types.push(parse_type(remaining)?);
+                            types.push(parse_type_rec(remaining, depth + 1)?);
                             break;
                         },
                     }
@@ -228,7 +239,7 @@ pub fn parse_type(s: &str) -> Result<ColumnType, String> {
                 Ok(ColumnType::Tuple(types))
             },
             "LowCardinality" => {
-                let inner_type = parse_type(inner)?;
+                let inner_type = parse_type_rec(inner, depth + 1)?;
                 Ok(ColumnType::LowCardinality(Box::new(inner_type)))
             },
             "Enum8" | "Enum16" => {
@@ -319,11 +330,11 @@ pub fn parse_type(s: &str) -> Result<ColumnType, String> {
                     let comma = find_top_level_comma(remaining);
                     match comma {
                         Some(pos) => {
-                            types.push(parse_type(&remaining[..pos])?);
+                            types.push(parse_type_rec(&remaining[..pos], depth + 1)?);
                             remaining = &remaining[pos + 1..];
                         },
                         None => {
-                            types.push(parse_type(remaining)?);
+                            types.push(parse_type_rec(remaining, depth + 1)?);
                             break;
                         },
                     }
@@ -456,6 +467,17 @@ mod tests {
         // Well-formed still parse.
         assert!(parse_type("Array(Int64)").is_ok());
         assert!(parse_type("Nullable(String)").is_ok());
+    }
+
+    #[test]
+    fn test_deeply_nested_type_is_capped() {
+        // Hundreds of nested wrappers must hit the depth cap (Err), not overflow.
+        let mut s = String::from("UInt8");
+        for _ in 0..(MAX_TYPE_NESTING + 10) {
+            s = format!("Array({s})");
+        }
+        assert!(parse_type(&s).is_err());
+        assert!(parse_type("Array(Array(Array(UInt8)))").is_ok());
     }
 
     #[test]

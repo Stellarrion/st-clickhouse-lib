@@ -109,14 +109,7 @@ impl Client {
     pub async fn connect_tls(
         addr: impl crate::runtime::net::ToSocketAddrs, domain: &str,
     ) -> Result<Self> {
-        let mut root_store = rustls::RootCertStore::empty();
-        let cert_result = rustls_native_certs::load_native_certs();
-        if !cert_result.errors.is_empty() {
-            eprintln!("rustls-native-certs warnings: {:?}", cert_result.errors);
-        }
-        for cert in cert_result.certs {
-            let _ = root_store.add(cert);
-        }
+        let root_store = crate::connection::config::native_root_store()?;
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();

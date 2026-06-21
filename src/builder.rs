@@ -654,6 +654,12 @@ fn hex_val(b: u8) -> Option<u8> {
 fn default_rustls_config() -> rustls::ClientConfig {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Also honor the OS trust store so internal/private CAs — accepted by
+    // Client::with_tls() — validate consistently under clickhouses:// / secure.
+    #[cfg(feature = "tokio-tls")]
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = root_store.add(cert);
+    }
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()

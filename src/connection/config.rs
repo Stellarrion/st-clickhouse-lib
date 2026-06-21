@@ -156,16 +156,7 @@ impl Client {
     /// encrypted.
     #[cfg(feature = "tokio-tls")]
     pub fn with_tls(mut self, domain: &str) -> Result<Self> {
-        // Use platform-native certificate store
-        let mut root_store = rustls::RootCertStore::empty();
-        let cert_result = rustls_native_certs::load_native_certs();
-        if !cert_result.errors.is_empty() {
-            // Log but don't fail — system may have partial certs
-            eprintln!("rustls-native-certs warnings: {:?}", cert_result.errors);
-        }
-        for cert in cert_result.certs {
-            let _ = root_store.add(cert);
-        }
+        let root_store = native_root_store()?;
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -183,4 +174,29 @@ impl Client {
         self.pool.set_tls(config, domain);
         self
     }
+}
+
+/// Build a root certificate store from the platform's native trust store.
+///
+/// Logs any partial-load warnings via `tracing` and returns an error if the
+/// resulting store is empty — a misconfigured system must not silently degrade
+/// into "trust nothing", which rustls would otherwise surface only as opaque
+/// handshake failures. Supply a custom config via [`Client::with_tls_config`]
+/// when the system store is intentionally unavailable.
+#[cfg(feature = "tokio-tls")]
+pub(crate) fn native_root_store() -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        tracing::warn!(errors = ?cert_result.errors, "rustls-native-certs: partial cert load");
+    }
+    for cert in cert_result.certs {
+        let _ = root_store.add(cert);
+    }
+    if root_store.is_empty() {
+        return Err(crate::error::Error::Config(
+            "no trusted root certificates found in the system store; use Client::with_tls_config() to supply a custom config".into(),
+        ));
+    }
+    Ok(root_store)
 }
