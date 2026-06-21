@@ -123,7 +123,12 @@ impl<'a> BatchBuilder<'a> {
         let merged_settings = merge_settings(&self.client.settings, &self.settings);
         let compression = self.compression.or(self.client.compression);
         let response_compressed = compression_flag(compression) == 1;
-        let template = build_batch_query_packet_template(&merged_settings, compression, rev);
+        let template = build_batch_query_packet_template(
+            &merged_settings,
+            compression,
+            rev,
+            self.client.pool.quota_key(),
+        );
 
         let mut all_packets = Vec::new();
         let ignored_part_uuids_packet = (!self.ignored_part_uuids.is_empty()).then(|| {
@@ -286,8 +291,9 @@ struct BatchQueryPacketTemplate {
 
 fn build_batch_query_packet_template(
     settings: &HashMap<String, String>, compression: Option<CompressionMethod>, rev: u64,
+    quota_key: &str,
 ) -> BatchQueryPacketTemplate {
-    let common = build_query_packet_common_template(settings, compression, rev);
+    let common = build_query_packet_common_template(settings, compression, rev, quota_key);
 
     let mut suffix = Vec::with_capacity(16);
     if rev >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS {
@@ -353,6 +359,7 @@ mod packet_template_tests {
             &settings,
             compression,
             revision::DEFAULT_PROTOCOL_REVISION,
+            "",
         );
 
         let mut templated = Vec::new();

@@ -14,6 +14,18 @@ impl Client {
         self
     }
 
+    /// Set the quota key sent in ClientInfo and the handshake addendum.
+    ///
+    /// Used by ClickHouse for quota accounting (multi-tenant). The key is sent
+    /// on the wire both in the per-query ClientInfo block and in the connection
+    /// handshake addendum. Pooled connections reconnect so the addendum carries
+    /// the new key. `""` by default (no quota key).
+    pub fn with_quota_key(mut self, key: &str) -> Self {
+        self.pool.set_quota_key(key);
+        self.refresh_query_template();
+        self
+    }
+
     /// Control Native JSON serialization for materialized query results.
     ///
     /// Enabled by default to match clickhouse-cpp. Pass `false` to opt back into
@@ -110,6 +122,7 @@ impl Client {
             &self.settings,
             self.compression,
             revision::DEFAULT_PROTOCOL_REVISION,
+            self.pool.quota_key(),
         );
     }
 

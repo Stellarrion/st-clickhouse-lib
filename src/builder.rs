@@ -29,6 +29,7 @@ struct BuilderOptions {
     user: String,
     password: String,
     database: String,
+    quota_key: String,
     pool_size: usize,
     compression: Option<CompressionMethod>,
     settings: HashMap<String, String>,
@@ -68,6 +69,7 @@ impl Default for BuilderOptions {
             user: "default".to_owned(),
             password: String::new(),
             database: String::new(),
+            quota_key: String::new(),
             pool_size: 1,
             compression: None,
             settings: HashMap::new(),
@@ -139,6 +141,12 @@ impl<M> ClientBuilder<M> {
 
     pub fn database(mut self, database: impl Into<String>) -> Self {
         self.opts.database = database.into();
+        self
+    }
+
+    /// Set the quota key sent in ClientInfo and the handshake addendum.
+    pub fn quota_key(mut self, key: impl Into<String>) -> Self {
+        self.opts.quota_key = key.into();
         self
     }
 
@@ -274,6 +282,7 @@ impl ClientBuilder<Async> {
         let mut pool = crate::pool::SimplePool::new(addrs, self.opts.pool_size);
         pool.set_credentials(&self.opts.user, &self.opts.password);
         pool.set_database(&self.opts.database);
+        pool.set_quota_key(&self.opts.quota_key);
         if logical_addrs.len() == 1 {
             pool.set_hostname(logical_addrs.into_iter().next());
         }
@@ -513,6 +522,7 @@ fn parse_query(query: &str, opts: &mut BuilderOptions) -> std::result::Result<()
             "user" => opts.user = value,
             "password" => opts.password = value,
             "database" | "db" => opts.database = value,
+            "quota_key" => opts.quota_key = value,
             "compression" => opts.compression = Some(parse_compression(&value)?),
             "secure" | "tls" => opts.secure = parse_bool(&value)?,
             "tls_domain" | "sni" => opts.tls_domain = Some(value),
@@ -704,5 +714,31 @@ mod acquire_timeout_tests {
         )
         .expect("url should parse");
         assert_eq!(b.opts.acquire_timeout, Some(Duration::from_millis(50)));
+    }
+}
+
+#[cfg(test)]
+mod quota_key_tests {
+    use super::*;
+
+    #[test]
+    fn builder_stores_quota_key() {
+        let b = ClientBuilder::<Async>::new().quota_key("tenant-42");
+        assert_eq!(b.opts.quota_key, "tenant-42");
+    }
+
+    #[test]
+    fn builder_default_has_empty_quota_key() {
+        let b = ClientBuilder::<Async>::new();
+        assert!(b.opts.quota_key.is_empty());
+    }
+
+    #[test]
+    fn url_parses_quota_key() {
+        let b = ClientBuilder::<Async>::from_url(
+            "clickhouse://honne:honne@127.0.0.1:9000?quota_key=tenant-42",
+        )
+        .expect("url should parse");
+        assert_eq!(b.opts.quota_key, "tenant-42");
     }
 }

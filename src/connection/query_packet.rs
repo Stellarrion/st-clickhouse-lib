@@ -21,6 +21,9 @@ static QUERY_ID_PROCESS_PREFIX: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct QueryPacketTemplate {
     pub(crate) revision: u64,
     compression: Option<CompressionMethod>,
+    /// Per-client quota key, retained so the template can be rebuilt if the
+    /// server negotiates a different revision (mirrors `compression`).
+    quota_key: String,
     common: QueryPacketCommonTemplate,
     select_suffix: Vec<u8>,
     insert_suffix: Vec<u8>,
@@ -43,8 +46,9 @@ pub(crate) fn next_query_id(buf: &mut [u8; 22]) -> usize {
 
 pub(crate) fn build_query_packet_template(
     settings: &HashMap<String, String>, compression: Option<CompressionMethod>, rev: u64,
+    quota_key: &str,
 ) -> QueryPacketTemplate {
-    let common = build_query_packet_common_template(settings, compression, rev);
+    let common = build_query_packet_common_template(settings, compression, rev, quota_key);
 
     let mut insert_suffix = Vec::with_capacity(1);
     if rev >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS {
@@ -58,6 +62,7 @@ pub(crate) fn build_query_packet_template(
     QueryPacketTemplate {
         revision: rev,
         compression,
+        quota_key: quota_key.to_owned(),
         common,
         select_capacity: fixed_capacity + select_suffix.len(),
         insert_capacity: fixed_capacity + insert_suffix.len(),
@@ -123,7 +128,8 @@ pub(crate) fn build_query_packet_from_cached_or_revision(
         );
     }
 
-    let template = build_query_packet_template(settings, cached.compression, rev);
+    let template =
+        build_query_packet_template(settings, cached.compression, rev, &cached.quota_key);
     build_query_packet_from_template(&template, query, query_id, include_empty_block, params)
 }
 

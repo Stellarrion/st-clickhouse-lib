@@ -24,6 +24,7 @@ impl Client {
     }
 
     pub(crate) fn from_pool(pool: crate::pool::SimplePool) -> Self {
+        let quota_key = pool.quota_key().to_owned();
         Self {
             pool,
             settings: HashMap::new(),
@@ -31,6 +32,7 @@ impl Client {
                 &HashMap::new(),
                 None,
                 revision::DEFAULT_PROTOCOL_REVISION,
+                &quota_key,
             ),
             compression: None,
             ping_before_query: false,

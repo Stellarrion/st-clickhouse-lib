@@ -256,7 +256,8 @@ impl<'a> QueryBuilder<'a> {
                 settings
             },
         };
-        let template = build_query_packet_template(&settings, compression, rev);
+        let template =
+            build_query_packet_template(&settings, compression, rev, self.client.pool.quota_key());
         let pkt = build_query_packet(
             &template,
             &self.sql,

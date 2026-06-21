@@ -132,12 +132,13 @@ pub(crate) struct QueryPacketCommonTemplate {
 
 pub(crate) fn build_query_packet_common_template(
     settings: &HashMap<String, String>, compression: Option<CompressionMethod>, rev: u64,
+    quota_key: &str,
 ) -> QueryPacketCommonTemplate {
     let mut prefix = Vec::with_capacity(4);
     wire::write_varint_to_vec(&mut prefix, 1); // ClientCode::Query
 
     let client_info = (rev >= revision::DBMS_MIN_REVISION_WITH_CLIENT_INFO)
-        .then(|| build_client_info_template(rev));
+        .then(|| build_client_info_template(rev, quota_key));
 
     let mut before_query = Vec::with_capacity(256);
     write_protocol_default_settings(&mut before_query, settings, rev);

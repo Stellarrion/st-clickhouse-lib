@@ -22,8 +22,12 @@ fn query_template_matches_dynamic_packet_builder() {
     settings.insert("max_block_size".to_string(), "1024".to_string());
     let compression = Some(CompressionMethod::Lz4);
 
-    let template =
-        build_query_packet_template(&settings, compression, revision::DEFAULT_PROTOCOL_REVISION);
+    let template = build_query_packet_template(
+        &settings,
+        compression,
+        revision::DEFAULT_PROTOCOL_REVISION,
+        "",
+    );
     let templated = build_query_packet_from_template(&template, "SELECT 1", b"", true, &[]);
     let dynamic = build_query_packet(&template, "SELECT 1", &[], b"", &[]);
 
@@ -34,7 +38,7 @@ fn query_template_matches_dynamic_packet_builder() {
 fn query_packet_defaults_json_to_string_serialization() {
     let settings = HashMap::new();
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(&template, "SELECT 1", &[], b"", &[]);
     let setting_name =
         crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING.as_bytes();
@@ -51,7 +55,7 @@ fn query_packet_serializes_server_side_parameters() {
     let settings = HashMap::new();
     let query = "SELECT {id:UInt64}, {name:String}";
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(
         &template,
         query,
@@ -89,7 +93,7 @@ fn explicit_json_serialization_setting_is_not_duplicated() {
         "0".to_string(),
     );
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(&template, "SELECT 1", &[], b"", &[]);
     let setting_name =
         crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING.as_bytes();
@@ -345,7 +349,7 @@ fn test_build_query_packet_template_returns_valid_structure() {
     let mut settings = HashMap::new();
     settings.insert("max_threads".to_string(), "4".to_string());
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet_from_template(&template, "SELECT 1", b"test-id", true, &[]);
     // Should contain the query text
     assert!(packet.windows(8).any(|w| w == b"SELECT 1"));
@@ -364,7 +368,7 @@ fn test_build_query_packet_template_returns_valid_structure() {
 fn test_build_query_packet_with_empty_query() {
     let settings = HashMap::new();
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(&template, "", &[], b"", &[]);
     assert!(!packet.is_empty());
     assert!(packet.contains(&2)); // trailing empty Data packet
@@ -374,7 +378,7 @@ fn test_build_query_packet_with_empty_query() {
 fn test_query_kind_detection_create() {
     let settings = HashMap::new();
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let pkt = build_query_packet(
         &template,
         "CREATE TABLE foo (x UInt64) ENGINE = Memory",
@@ -394,6 +398,7 @@ fn test_client() -> Client {
             &HashMap::new(),
             None,
             revision::DEFAULT_PROTOCOL_REVISION,
+            "",
         ),
         compression: None,
         ping_before_query: false,
