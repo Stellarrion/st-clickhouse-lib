@@ -2,7 +2,8 @@ use crate::compression::CompressionMethod;
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::io::{compression_flag, ping_stream};
 use crate::connection::query_packet::{
-    build_query_packet, build_query_packet_template, merge_materialized_settings, query_id_bytes,
+    build_query_packet, build_query_packet_template, cached_template_reusable,
+    merge_materialized_settings, query_id_bytes,
 };
 use crate::connection::query_result::QueryResult;
 use crate::connection::row_stream_reader::read_query_blocks;
@@ -235,36 +236,60 @@ impl<'a> QueryBuilder<'a> {
         let query_id = query_id_bytes(self.query_id.as_deref(), &mut query_id_buf);
         let compression = self.compression.or(self.client.compression);
         let response_compressed = compression_flag(compression) == 1;
-        let settings = match mode {
-            QuerySettingsMode::Materialized => {
-                merge_materialized_settings(&self.client.settings, &self.settings)
-            },
-            QuerySettingsMode::RawCapture => {
-                let mut settings =
-                    merge_materialized_settings(&self.client.settings, &self.settings);
-                settings
-                    .entry(
-                        crate::protocol::settings::OUTPUT_FORMAT_NATIVE_USE_FLATTENED_DYNAMIC_AND_JSON_SERIALIZATION
-                            .into(),
-                    )
-                    .or_insert_with(|| "1".into());
-                settings
-                    .entry(
-                        crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING.into(),
-                    )
-                    .or_insert_with(|| "0".into());
-                settings
-            },
+        let pkt = if matches!(mode, QuerySettingsMode::Materialized)
+            && cached_template_reusable(
+                &self.settings,
+                self.compression,
+                self.client.query_template.revision,
+                rev,
+            ) {
+            // Fast path: no per-query overrides and the cached client template
+            // already matches the negotiated revision — reuse it instead of
+            // cloning the settings map and re-serializing the whole template.
+            build_query_packet(
+                &self.client.query_template,
+                &self.sql,
+                &self.external_tables,
+                query_id,
+                &self.params,
+            )
+        } else {
+            let settings = match mode {
+                QuerySettingsMode::Materialized => {
+                    merge_materialized_settings(&self.client.settings, &self.settings)
+                },
+                QuerySettingsMode::RawCapture => {
+                    let mut settings =
+                        merge_materialized_settings(&self.client.settings, &self.settings);
+                    settings
+                        .entry(
+                            crate::protocol::settings::OUTPUT_FORMAT_NATIVE_USE_FLATTENED_DYNAMIC_AND_JSON_SERIALIZATION
+                                .into(),
+                        )
+                        .or_insert_with(|| "1".into());
+                    settings
+                        .entry(
+                            crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING
+                                .into(),
+                        )
+                        .or_insert_with(|| "0".into());
+                    settings
+                },
+            };
+            let template = build_query_packet_template(
+                &settings,
+                compression,
+                rev,
+                self.client.pool.quota_key(),
+            );
+            build_query_packet(
+                &template,
+                &self.sql,
+                &self.external_tables,
+                query_id,
+                &self.params,
+            )
         };
-        let template =
-            build_query_packet_template(&settings, compression, rev, self.client.pool.quota_key());
-        let pkt = build_query_packet(
-            &template,
-            &self.sql,
-            &self.external_tables,
-            query_id,
-            &self.params,
-        );
         write_ignored_part_uuids_if_any(stream, &self.ignored_part_uuids).await?;
         stream.write_packet(&pkt).await?;
         stream.flush().await?;
