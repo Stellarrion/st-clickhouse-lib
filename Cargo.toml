@@ -148,6 +148,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "uint64_breakdown"
+path = "benches/uint64_bench.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "profile"
 path = "benches/profile.rs"
 test = false
