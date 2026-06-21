@@ -52,6 +52,15 @@ fn clickhouse_host() -> String {
 }
 
 async fn connect_soak_client(host: &str) -> Client {
+    // Env override for non-default users (e.g. CLICKHOUSE_USER=honne CLICKHOUSE_PASSWORD=honne).
+    if let (Ok(user), Ok(password)) = (
+        std::env::var("CLICKHOUSE_USER"),
+        std::env::var("CLICKHOUSE_PASSWORD"),
+    ) {
+        return Client::connect_with_credentials(host, &user, &password)
+            .await
+            .expect("soak connect should succeed");
+    }
     match Client::connect(host).await {
         Ok(client) => client,
         Err(_) => Client::connect_with_credentials(host, "default", "test")
