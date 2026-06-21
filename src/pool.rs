@@ -52,7 +52,21 @@ pub(crate) struct StreamWrapper {
     chunk_fill: usize,
     len_buf: [u8; 4],
     len_pos: usize,
+    /// Raw-framing prefetch buffer. Bytes read ahead from the socket and served
+    /// across many small reads, so byte-wise reads don't each hit the socket.
+    /// Only used when `!use_chunked_recv` (the chunked path buffers
+    /// length-prefixed frames in `chunk`). Prefetched bytes are later packets
+    /// of the same response, consumed in order by subsequent reads; after
+    /// EndOfStream the buffer is drained and the server sends nothing more.
+    rd_buf: Box<[u8]>,
+    rd_pos: usize,
+    rd_fill: usize,
 }
+
+/// Capacity of the raw-framing read prefetch buffer. Bytes read ahead from
+/// the socket are served to many small reads (varints, block headers, string
+/// bodies) without each polling the socket.
+const READ_BUF_CAP: usize = 8 * 1024;
 
 impl AsyncRead for StreamWrapper {
     fn poll_read(
@@ -61,13 +75,7 @@ impl AsyncRead for StreamWrapper {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         if !this.use_chunked_recv {
-            let before = buf.remaining();
-            let poll = poll_inner_read(&mut this.inner, cx, buf);
-            if let std::task::Poll::Ready(Ok(())) = &poll {
-                let n = before.saturating_sub(buf.remaining());
-                this.record_bytes(n);
-            }
-            return poll;
+            return read_buffered(this, cx, buf);
         }
 
         loop {
@@ -147,6 +155,47 @@ fn poll_inner_read(
     }
 }
 
+/// Raw-framing read: serve prefetched bytes first; when drained, bulk-prefetch
+/// up to [`READ_BUF_CAP`] bytes from the socket and loop to drain. Prefetched
+/// bytes belong to later packets of the same response and are consumed in order
+/// by subsequent reads, so nothing is lost across reads.
+fn read_buffered(
+    this: &mut StreamWrapper, cx: &mut std::task::Context<'_>,
+    buf: &mut crate::runtime::io::ReadBuf<'_>,
+) -> std::task::Poll<std::io::Result<()>> {
+    loop {
+        if this.rd_pos < this.rd_fill {
+            let n = buf.remaining().min(this.rd_fill - this.rd_pos);
+            if n == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&this.rd_buf[this.rd_pos..this.rd_pos + n]);
+            this.rd_pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        // Buffer fully consumed (rd_pos >= rd_fill) — prefetch a full run from
+        // the socket. Only commit rd_pos/rd_fill AFTER a successful read: a
+        // Pending or EOF return must leave the (empty) buffer state untouched so
+        // the next poll refills instead of re-serving consumed bytes.
+        let cap = this.rd_buf.len();
+        let filled = {
+            let mut rd = crate::runtime::io::ReadBuf::new(&mut this.rd_buf[..]);
+            match poll_inner_read(&mut this.inner, cx, &mut rd) {
+                std::task::Poll::Ready(Ok(())) => cap - rd.remaining(),
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        };
+        this.rd_pos = 0;
+        this.rd_fill = filled;
+        if filled == 0 {
+            // Clean EOF: report it (read_exact callers turn this into UnexpectedEof).
+            return std::task::Poll::Ready(Ok(()));
+        }
+        this.record_bytes(filled);
+    }
+}
+
 impl AsyncWrite for StreamWrapper {
     fn poll_write(
         self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8],
@@ -192,6 +241,9 @@ impl StreamWrapper {
             chunk_fill: 0,
             len_buf: [0; 4],
             len_pos: 0,
+            rd_buf: vec![0u8; READ_BUF_CAP].into_boxed_slice(),
+            rd_pos: 0,
+            rd_fill: 0,
         }
     }
 
@@ -208,6 +260,9 @@ impl StreamWrapper {
             chunk_fill: 0,
             len_buf: [0; 4],
             len_pos: 0,
+            rd_buf: vec![0u8; READ_BUF_CAP].into_boxed_slice(),
+            rd_pos: 0,
+            rd_fill: 0,
         }
     }
 
@@ -218,6 +273,10 @@ impl StreamWrapper {
         self.chunk_pos = 0;
         self.chunk_fill = 0;
         self.len_pos = 0;
+        // Drop any raw-framing prefetch so toggling modes mid-life can't serve
+        // stale bytes from the other path's buffer.
+        self.rd_pos = 0;
+        self.rd_fill = 0;
     }
 
     pub(crate) fn set_metrics(&mut self, metrics: Option<&'static crate::metrics::Metrics>) {

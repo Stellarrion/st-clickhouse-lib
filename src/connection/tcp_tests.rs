@@ -412,3 +412,98 @@ fn test_client() -> Client {
         validate_schema: false,
     }
 }
+
+// ---------------------------------------------------------------------------
+// StreamWrapper raw-framing read buffer
+// ---------------------------------------------------------------------------
+
+async fn spawn_server(
+    payload: Vec<u8>, trickle: Option<std::time::Duration>,
+) -> std::net::SocketAddr {
+    use crate::runtime::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        if let Some(delay) = trickle {
+            for b in &payload {
+                let _ = sock.write_all(&[*b]).await;
+                tokio::time::sleep(delay).await;
+            }
+        } else {
+            let _ = sock.write_all(&payload).await;
+        }
+        // hold the socket briefly so reads don't race ahead of writes
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn stream_wrapper_serves_bytes_across_tiny_reads() {
+    use crate::runtime::io::AsyncReadExt;
+    let payload: Vec<u8> = (0..300u32).flat_map(|v| v.to_le_bytes()).collect();
+    let addr = spawn_server(payload.clone(), None).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = vec![0u8; payload.len()];
+    for i in 0..payload.len() {
+        sw.read_exact(&mut got[i..i + 1]).await.expect("read byte");
+    }
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn stream_wrapper_read_exact_spans_refills() {
+    use crate::runtime::io::AsyncReadExt;
+    // Larger than the 8 KiB prefetch buffer → exercises multiple refills.
+    let payload = vec![0xA5u8; 50_000];
+    let addr = spawn_server(payload.clone(), None).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = vec![0u8; payload.len()];
+    sw.read_exact(&mut got).await.expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn stream_wrapper_handles_trickled_writes() {
+    // Server writes one byte at a time → client refills return partial data and
+    // Pending, exercising the refill state machine. A state bug (committing
+    // rd_pos before a successful read) would re-serve consumed bytes here.
+    use crate::runtime::io::AsyncReadExt;
+    let payload: Vec<u8> = (0..100u8).collect();
+    let addr = spawn_server(payload.clone(), Some(std::time::Duration::from_millis(2))).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = vec![0u8; payload.len()];
+    sw.read_exact(&mut got).await.expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn stream_wrapper_propagates_eof() {
+    use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let _ = sock.write_all(&[1, 2, 3]).await;
+        let _ = sock.shutdown().await;
+    });
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = [0u8; 3];
+    sw.read_exact(&mut got).await.expect("read 3");
+    assert_eq!(&got, &[1, 2, 3]);
+    // After EOF the next read must error, not re-serve consumed bytes.
+    let err = sw
+        .read_exact(&mut [0u8; 1])
+        .await
+        .expect_err("expected EOF");
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
