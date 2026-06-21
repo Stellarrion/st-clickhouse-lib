@@ -255,6 +255,24 @@ impl<'a> AnyColumnData<'a> {
             std::any::type_name::<T>(),
         )))
     }
+
+    /// Native slice view of this column when it holds PlainColumn values of
+    /// type `T` in an aligned buffer — `None` otherwise (non-PlainColumn types
+    /// like `String`, or a misaligned buffer). Lets callers materialize
+    /// fixed-size columns at memcpy speed instead of per-row `to_typed`.
+    pub fn plain_slice<T: 'static>(&self) -> Option<&[T]> {
+        let tid = std::any::TypeId::of::<T>();
+        try_any_plain_slice!(
+            self, tid;
+            UInt8 => u8, UInt16 => u16, UInt32 => u32, UInt64 => u64, UInt128 => u128,
+            Int8 => i8, Int16 => i16, Int32 => i32, Int64 => i64, Int128 => i128,
+            Float32 => f32, Float64 => f64,
+            DateTime64 => DateTime64Value, Decimal32 => Decimal32, Decimal64 => Decimal64,
+            Decimal128 => Decimal128, Decimal256 => Decimal256, UInt256 => UInt256, Int256 => Int256,
+            Date => Date, DateTime => DateTime, Uuid => Uuid, IPv4 => Ipv4,
+        );
+        None
+    }
 }
 
 unsafe fn copy_value_checked<T, Inner>(value: Inner) -> Result<T> {

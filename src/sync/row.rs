@@ -29,6 +29,17 @@ pub trait Row: Sized {
             "from_columns not implemented for this Row type".into(),
         ))
     }
+
+    /// Materialize all `n` rows from pre-extracted columns. The default loops
+    /// [`from_columns`](Self::from_columns); tuple impls override it with a
+    /// PlainColumn bulk-slice fast path that skips per-row type dispatch.
+    fn from_columns_collect(columns: &[&AnyColumnData<'_>], n: usize) -> Result<Vec<Self>> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(Self::from_columns(columns, i)?);
+        }
+        Ok(out)
+    }
 }
 
 define_row_read_all!(crate::sync::error::Error);
