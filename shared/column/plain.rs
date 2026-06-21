@@ -310,13 +310,20 @@ impl JsonColumnData {
     }
     /// Get the JSON text for a given row.
     pub fn get_string(&self, index: usize) -> Result<String> {
+        // Offsets are server-supplied; bounds-check both the offset lookup and
+        // the data slice before indexing (a malformed server payload must not panic).
+        let end = *self.offsets.get(index).ok_or_else(|| {
+            super::super::error::Error::Protocol("JsonColumnData: index out of range".into())
+        })?;
         let start = if index == 0 {
             0
         } else {
-            self.offsets[index - 1] as usize
+            self.offsets[index - 1]
         };
-        let end = self.offsets[index] as usize;
-        Ok(String::from_utf8_lossy(&self.data[start..end]).into_owned())
+        let bytes = self.data.get(start as usize..end as usize).ok_or_else(|| {
+            super::super::error::Error::Protocol("JsonColumnData: invalid byte range".into())
+        })?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
@@ -628,9 +635,9 @@ impl<'a> Ipv6ColumnData<'a> {
                 self.count
             )));
         }
-        let offset = index
-            .checked_mul(16)
-            .ok_or_else(|| super::super::error::Error::Protocol("IPv6 column offset overflow".into()))?;
+        let offset = index.checked_mul(16).ok_or_else(|| {
+            super::super::error::Error::Protocol("IPv6 column offset overflow".into())
+        })?;
         let bytes: [u8; 16] = self.buf[offset..offset + 16]
             .try_into()
             .map_err(|_| super::super::error::Error::Protocol("short IPv6 value".into()))?;
@@ -783,10 +790,9 @@ impl ClickHouseColumn for Ipv6 {
         Self: 'a;
 
     fn read_column<'a>(ctx: &mut ReadColumnContext<'a>) -> Result<Self::ColumnData<'a>> {
-        let nbytes = ctx
-            .rows
-            .checked_mul(16)
-            .ok_or_else(|| super::super::error::Error::Protocol("IPv6 column size overflow".into()))?;
+        let nbytes = ctx.rows.checked_mul(16).ok_or_else(|| {
+            super::super::error::Error::Protocol("IPv6 column size overflow".into())
+        })?;
         let bytes = ctx.read_exact(nbytes)?;
         Ok(Ipv6ColumnData {
             buf: bytes,
@@ -1269,6 +1275,15 @@ impl ClickHouseValue for Decimal256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_json_get_string_rejects_bad_offsets() {
+        // Server-controlled offsets that overrun the data must error, not panic.
+        let col = JsonColumnData::new(vec![5, 100], b"hello".to_vec());
+        assert_eq!(col.get_string(0).expect("first row valid").len(), 5);
+        assert!(col.get_string(1).is_err()); // [5..100] overruns 5-byte data
+        assert!(col.get_string(5).is_err()); // index past offsets length
+    }
 
     #[test]
     fn test_plain_column_aligned() {

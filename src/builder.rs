@@ -23,7 +23,7 @@ pub struct ClientBuilder<M = Async> {
     _mode: PhantomData<M>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct BuilderOptions {
     hosts: Vec<HostEndpoint>,
     user: String,
@@ -44,6 +44,33 @@ struct BuilderOptions {
     validate_schema: bool,
     secure: bool,
     tls_domain: Option<String>,
+}
+
+impl std::fmt::Debug for BuilderOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never emit the cleartext password (mirrors sync config.rs).
+        f.debug_struct("BuilderOptions")
+            .field("hosts", &self.hosts)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("database", &self.database)
+            .field("quota_key", &self.quota_key)
+            .field("pool_size", &self.pool_size)
+            .field("compression", &self.compression)
+            .field("settings", &self.settings)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("recv_timeout", &self.recv_timeout)
+            .field("send_timeout", &self.send_timeout)
+            .field("retry_timeout", &self.retry_timeout)
+            .field("query_timeout", &self.query_timeout)
+            .field("acquire_timeout", &self.acquire_timeout)
+            .field("send_retries", &self.send_retries)
+            .field("ping_before_query", &self.ping_before_query)
+            .field("validate_schema", &self.validate_schema)
+            .field("secure", &self.secure)
+            .field("tls_domain", &self.tls_domain)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +662,17 @@ fn default_rustls_config() -> rustls::ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_password() {
+        let builder = ClientBuilder::<Async>::default().password("hunter2-secret");
+        let s = format!("{:?}", builder);
+        assert!(!s.contains("hunter2-secret"), "Debug leaked password: {s}");
+        assert!(
+            s.contains("<redacted>"),
+            "password should be redacted in Debug: {s}"
+        );
+    }
 
     #[test]
     fn parses_clickhouse_url() {

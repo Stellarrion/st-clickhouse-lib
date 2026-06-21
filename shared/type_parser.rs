@@ -188,6 +188,9 @@ pub fn parse_type(s: &str) -> Result<ColumnType, String> {
 
     // Check for nested types (have parenthesized parameters)
     if let Some(paren_pos) = paren {
+        if !s.ends_with(')') || paren_pos + 1 >= s.len() {
+            return Err(format!("malformed type name (unclosed paren): {s}"));
+        }
         let inner = s[paren_pos + 1..s.len() - 1].trim();
         match base {
             "Nullable" => {
@@ -442,6 +445,17 @@ mod tests {
         assert_eq!(parse_type("DateTime64(3)"), Ok(ColumnType::DateTime64(3)));
         assert_eq!(parse_type("Time64(6)"), Ok(ColumnType::Time64(6)));
         assert_eq!(parse_type("Float64"), Ok(ColumnType::Float64));
+    }
+
+    #[test]
+    fn test_malformed_nested_type_is_err() {
+        // Truncated/unclosed type strings must error, not panic on slicing.
+        assert!(parse_type("Array(").is_err());
+        assert!(parse_type("Nullable(Int64").is_err());
+        assert!(parse_type("Tuple(").is_err());
+        // Well-formed still parse.
+        assert!(parse_type("Array(Int64)").is_ok());
+        assert!(parse_type("Nullable(String)").is_ok());
     }
 
     #[test]

@@ -880,7 +880,7 @@ async fn read_lc_async<
     })?);
     let mut num_keys_bytes = [0u8; 8];
     num_keys_bytes.copy_from_slice(&meta[16..24]);
-    let num_keys = u64::from_le_bytes(num_keys_bytes) as usize;
+    let num_keys = checked_usize(u64::from_le_bytes(num_keys_bytes), "LowCardinality keys")?;
     let mut serial_type_bytes = [0u8; 8];
     serial_type_bytes.copy_from_slice(&meta[8..16]);
     let serial_type = u64::from_le_bytes(serial_type_bytes);
@@ -892,7 +892,7 @@ async fn read_lc_async<
     };
     let mut il = [0u8; 8];
     stream.read_exact(&mut il).await?;
-    let ni = u64::from_le_bytes(il) as usize;
+    let ni = checked_usize(u64::from_le_bytes(il), "LowCardinality indexes")?;
     if ni != rows {
         return Err(crate::error::Error::Protocol(format!(
             "LowCardinality index count {ni} does not match row count {rows}"

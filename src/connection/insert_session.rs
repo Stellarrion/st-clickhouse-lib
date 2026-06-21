@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::block::Block;
 use crate::runtime::io::AsyncWriteExt;
-use crate::schema::TableSchema;
+use crate::schema::{TableSchema, quote_identifier_path};
 use std::time::Duration;
 
 pub struct InsertSession<'a> {
@@ -30,7 +30,8 @@ impl Client {
         } else {
             None
         };
-        let query = format!("INSERT INTO {} FORMAT Native", table);
+        let quoted = quote_identifier_path(table)?;
+        let query = format!("INSERT INTO {quoted} FORMAT Native");
         let mut guard = self.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
         let mut query_id_buf = [0u8; 22];

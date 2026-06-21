@@ -112,12 +112,26 @@ pub fn decode_frame<R: Read>(r: &mut R) -> Result<Vec<u8>> {
     let uncompressed_size =
         u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
 
+    // Both sizes are attacker-controlled (a corrupt or malicious frame). Cap them
+    // so a tiny frame cannot claim a multi-GiB allocation (decompression-bomb/OOM).
+    const MAX_FRAME_SIZE: usize = 1 << 30;
+    if uncompressed_size > MAX_FRAME_SIZE {
+        return Err(crate::error::Error::Compression(format!(
+            "uncompressed_size {uncompressed_size} exceeds {MAX_FRAME_SIZE} byte cap"
+        )));
+    }
+
     if compressed_size < HEADER_LEN {
         return Err(crate::error::Error::Compression(format!(
             "compressed_size {compressed_size} < header length {HEADER_LEN}"
         )));
     }
     let body_len = compressed_size - HEADER_LEN;
+    if body_len > MAX_FRAME_SIZE {
+        return Err(crate::error::Error::Compression(format!(
+            "compressed body {body_len} exceeds {MAX_FRAME_SIZE} byte cap"
+        )));
+    }
     let mut body = vec![0u8; body_len];
     r.read_exact(&mut body)?;
 
@@ -173,6 +187,19 @@ pub fn decode_frame_bytes(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_frame_rejects_oversized_uncompressed() {
+        // 16-byte checksum (the size cap fires before checksum verify) + 9-byte
+        // header: method NONE, compressed_size = HEADER_LEN (body_len 0),
+        // uncompressed_size = u32::MAX (~4 GiB) — must error, not pre-allocate.
+        let mut frame = vec![0u8; 16];
+        frame.push(0x02); // NONE
+        frame.extend_from_slice(&9u32.to_le_bytes()); // compressed_size
+        frame.extend_from_slice(&u32::MAX.to_le_bytes()); // uncompressed_size
+        let mut cursor = std::io::Cursor::new(frame);
+        assert!(decode_frame(&mut cursor).is_err());
+    }
 
     #[test]
     fn test_none_frame_roundtrip() {
