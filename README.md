@@ -493,6 +493,18 @@ with `output_format_native_write_json_as_string=1`, `ratio_of_defaults_for_spars
 
 Lower latency is better. `vs C++` = `st-clickhouse / clickhouse-cpp`, so values below `1.00x` are faster than C++.
 
+> **0.2.0 performance work** (measured locally, ClickHouse 26.4, `127.0.0.1:9000`):
+> - Row materialization `.all::<T>()` for PlainColumn tuples is **~33% faster**
+>   (1M `UInt64` tuples 4.2ms → 2.8ms) via a per-column bulk-slice fast path that
+>   skips per-row type dispatch. Mixed tuples (`String`/`Array` fields) fall back
+>   to the per-row path unchanged.
+> - **String column decode is ~3.3× faster** (100K strings 1.09ms → 0.33ms):
+>   `StringColumnData` now borrows the block buffer (zero-copy) with a single-pass
+>   varint scan.
+>
+> The reference table below predates 0.2.0; the C++ column requires `clickhouse-cpp`
+> and was not re-measured here. See [CHANGELOG.md](CHANGELOG.md) for the full list.
+
 ### Rust vs C++
 
 | Workload | st-clickhouse `benchmark` | clickhouse-cpp `-O3` | vs C++ |

@@ -36,7 +36,7 @@ wildcard_dependencies = "deny"
 multiple_crate_versions = "allow"
 
 [dependencies]
-st-clickhouse = { package = "st-clickhouse-lib", version = "0.1", path = "..", default-features = false, features = ["lz4", "tls"] }
+st-clickhouse = { package = "st-clickhouse-lib", version = "0.2", path = "..", default-features = false, features = ["lz4", "tls"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 webpki-roots = "1"
 bytes = "1"

@@ -24,6 +24,47 @@ All notable changes to st-clickhouse are documented here.
   `?quota_key=` is now the protocol ClientInfo field (previously it fell through
   to the ClickHouse `settings` map).
 
+## [0.2.0] — 2026-06-21
+
+### Changed (BREAKING)
+- **`StringColumnData` now borrows the block buffer** (`StringColumnData<'a>`) — true
+  zero-copy String column reads. `get_bytes` / `get_str` return `&'a`. Previously the
+  column owned a copy of every string body; the read path is now a single varint scan
+  over the borrowed buffer (~3.3× faster decode of 100K strings). Mirrors the existing
+  `FixedStringColumnData<'a>` shape.
+
+### Performance
+- **Row materialization fast path**: `read_all` / `query_all` materialize all-PlainColumn
+  tuples by indexing native per-column slices instead of dispatching `to_typed` per row
+  (~33% faster: 1M `UInt64` tuples 4.2ms → 2.8ms, to within ~0.5ms of the block floor).
+  Mixed tuples (String/Array fields) silently fall back to the per-row path.
+- **Zero-copy String column** (see Breaking) + single-pass varint scan.
+- **Stream-level read prefetch buffer** in `StreamWrapper` (8 KiB) — all byte-wise reads
+  (varints, headers, string bodies, cancel/drain) hit a persistent buffer drained at
+  EndOfStream. Transparent to every read path.
+- **Bulk-read Array/Map offset columns** in one `read_exact`.
+- **Reuse the cached query template** on the common SELECT path (no per-query HashMap
+  clone + re-serialize).
+- **Skip the acquire-time Ping** for recently-used connections (idle-gated), with
+  invalidate-on-broken-connection so it is strictly as safe as before.
+- **Streaming cursor** decodes each block via the column-pre-extraction fast path.
+
+### Added
+- `AnyColumnData::plain_slice::<T>() -> Option<&[T]>` — native slice view for
+  PlainColumn types (powers the row fast path).
+- `Row::from_columns_collect` — bulk materialization hook (default loops; tuple impls
+  override with the PlainColumn fast path).
+- Benchmarks: `column_decode_bench`, `uint64_breakdown` (decode/access breakdown),
+  `owned_vs_borrowed` (1M-row materialization).
+
+### Fixed (security)
+- TLS root-store hardening + type-parser recursion cap.
+- Harden untrusted-input parsing + credential redaction.
+
+### Refactor
+- Dedup async/sync columns via `shared/` + `include!`.
+- Extract LowCardinality header validation.
+
 ## [0.1.0] — 2026-05-18
 
 ### Added
