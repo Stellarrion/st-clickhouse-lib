@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 /// (spawned by `QueryBuilder::rows`) checks this flag and sends a Cancel
 /// packet before exiting.
 pub struct RowCursor<T> {
-    current_block: Option<(Block, usize)>,
+    /// Decoded rows of the current block, handed out one `next()` at a time.
+    pending: std::collections::VecDeque<T>,
     block_rx: mpsc::Receiver<Result<Option<Block>>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _phantom: std::marker::PhantomData<T>,
@@ -27,7 +28,7 @@ impl<T: Row> RowCursor<T> {
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
-            current_block: None,
+            pending: std::collections::VecDeque::new(),
             block_rx,
             cancel,
             _phantom: std::marker::PhantomData,
@@ -47,17 +48,15 @@ impl<T: Row> RowCursor<T> {
     /// Get the next row (owned).
     pub async fn next(&mut self) -> Result<Option<T>> {
         loop {
-            if let Some((ref block, ref mut idx)) = self.current_block {
-                if *idx < block.row_count() {
-                    let row = T::from_row(block, *idx)?;
-                    *idx += 1;
-                    return Ok(Some(row));
-                }
-                self.current_block = None;
+            if let Some(row) = self.pending.pop_front() {
+                return Ok(Some(row));
             }
+            // No decoded rows left — pull the next block and decode all of its
+            // rows in one pass via `read_all`, which pre-extracts each column
+            // once and iterates rows without per-row column dispatch.
             match self.block_rx.recv().await {
                 Some(Ok(Some(block))) if block.row_count() > 0 => {
-                    self.current_block = Some((block, 0));
+                    self.pending = crate::row::read_all::<T>(&block)?.into();
                 },
                 Some(Ok(None)) | None => return Ok(None),
                 Some(Err(e)) => return Err(e),
@@ -249,6 +248,38 @@ fn read_varint_bytes(data: &[u8]) -> (u64, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cursor_yields_block_rows_in_order() {
+        // Characterization test: the cursor must hand out a block's rows in
+        // order. Built against the lazy implementation; must keep passing after
+        // the buffered fast-path refactor.
+        use crate::protocol::block::{Block, ColumnInfo};
+
+        let (tx, rx) = mpsc::channel::<Result<Option<Block>>>(4);
+        // One UInt64 column with rows [10, 20, 30].
+        let mut buf = Vec::new();
+        for v in [10u64, 20, 30] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let block = Block {
+            columns: vec![ColumnInfo {
+                name: "x".to_string(),
+                type_name: "UInt64".to_string(),
+                data: bytes::Bytes::from(buf),
+                lc_materialized: bytes::Bytes::new(),
+            }],
+            rows: 3,
+        };
+        tx.send(Ok(Some(block))).await.expect("send block");
+        tx.send(Ok(None)).await.expect("send eos"); // end of stream
+        drop(tx);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cursor: RowCursor<(u64,)> = RowCursor::new(rx, cancel);
+        let rows = cursor.collect().await.expect("decode failed");
+        assert_eq!(rows, vec![(10u64,), (20,), (30,)]);
+    }
 
     #[test]
     fn test_row_cursor_cancel_on_drop() {
