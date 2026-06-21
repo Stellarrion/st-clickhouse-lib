@@ -15,6 +15,14 @@ All notable changes to st-clickhouse are documented here.
   `acquire_timeout=`. Returns the retryable `Error::PoolTimeout` when no slot is
   free in time. Default `None` (unbounded — unchanged). Async client only.
   An acquire timeout also bumps the `connection_errors` metric.
+- **Quota key**: configurable `quota_key` sent in ClientInfo and the connection
+  handshake addendum, via `Client::with_quota_key(s)` /
+  `ClientBuilder::quota_key(s)` / URL `?quota_key=`. Parity with the sync core,
+  which previously hardcoded `""` on the async path. Default `""` — no wire
+  change for existing users. Setting it (or changing it) bumps the pool's config
+  generation so pooled connections reconnect carrying the new key. Note: URL
+  `?quota_key=` is now the protocol ClientInfo field (previously it fell through
+  to the ClickHouse `settings` map).
 
 ## [0.1.0] — 2026-05-18
 
