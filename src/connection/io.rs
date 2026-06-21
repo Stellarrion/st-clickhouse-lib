@@ -564,14 +564,16 @@ pub(crate) async fn read_offsets_column<
 >(
     stream: &mut S, rows: usize, name: &str,
 ) -> Result<(Vec<u8>, usize)> {
+    // Offsets are `rows` contiguous little-endian u64s on the wire — read them
+    // in one shot instead of one read_exact per row, then scan for the max.
+    let nbytes = checked_len(rows, 8)?;
+    let mut offsets = vec![0u8; nbytes];
+    stream.read_exact(&mut offsets).await?;
     let mut total = 0usize;
-    let mut offsets = Vec::with_capacity(checked_len(rows, 8)?);
-    for _ in 0..rows {
-        let mut offset = [0u8; 8];
-        stream.read_exact(&mut offset).await?;
-        let value = checked_usize(u64::from_le_bytes(offset), name)?;
-        total = total.max(value);
-        offsets.extend_from_slice(&offset);
+    for chunk in offsets.chunks_exact(8) {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(chunk);
+        total = total.max(checked_usize(u64::from_le_bytes(b), name)?);
     }
     Ok((offsets, total))
 }
@@ -743,5 +745,34 @@ mod timeout_tests {
             packet_read_timeout(Duration::from_secs(300), Some(dl)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod offset_read_tests {
+    use super::read_offsets_column;
+    use crate::runtime::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_offsets_column_reads_all_and_finds_max() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        // 3 little-endian u64 offsets: 2, 7, 4 — the max is 7.
+        let bytes: Vec<u8> = [2u64, 7, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        tx.write_all(&bytes).await.expect("write offsets");
+        let (offsets, total) = read_offsets_column(&mut rx, 3, "test")
+            .await
+            .expect("read offsets");
+        assert_eq!(offsets, bytes);
+        assert_eq!(total, 7);
+    }
+
+    #[tokio::test]
+    async fn read_offsets_column_zero_rows_is_empty() {
+        let (_tx, mut rx) = tokio::io::duplex(8);
+        let (offsets, total) = read_offsets_column(&mut rx, 0, "test")
+            .await
+            .expect("read offsets");
+        assert!(offsets.is_empty());
+        assert_eq!(total, 0);
     }
 }
