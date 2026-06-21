@@ -85,6 +85,18 @@ impl Client {
         self
     }
 
+    /// Set the idle threshold for the acquire-time liveness Ping.
+    ///
+    /// Connections reused within `t` skip the Ping/Pong round-trip (the hot
+    /// path for back-to-back queries); connections idle longer than `t` are
+    /// still pinged to catch sockets dropped by the server or a proxy. Default
+    /// 15s. Pass `Duration::ZERO` to ping on every acquire (the historical
+    /// behaviour).
+    pub fn with_ping_idle_threshold(mut self, t: Duration) -> Self {
+        self.pool.set_ping_idle_threshold(t);
+        self
+    }
+
     /// Set receive timeout.
     pub fn with_recv_timeout(mut self, t: Duration) -> Self {
         self.recv_timeout = t;

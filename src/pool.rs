@@ -285,6 +285,9 @@ pub(crate) struct Connection {
     pub(crate) server_info: handshake::ServerInfo,
     /// When this connection was established. Used for TTL-based recycling.
     pub(crate) created_at: crate::runtime::time::Instant,
+    /// When this connection was last returned to the pool (went idle). Used to
+    /// decide whether the next acquire needs a liveness Ping.
+    pub(crate) last_used_at: crate::runtime::time::Instant,
     /// Pool configuration generation this connection was opened with.
     config_generation: u64,
 }
@@ -387,6 +390,7 @@ async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
         stream,
         server_info,
         created_at: crate::runtime::time::Instant::now(),
+        last_used_at: crate::runtime::time::Instant::now(),
         config_generation: 0,
     })
 }
@@ -494,6 +498,9 @@ pub(crate) struct SimplePool {
     connect_timeout: Option<Duration>,
     /// Max wait for a free slot in `get()` (None = unbounded, today's behaviour).
     acquire_timeout: Option<Duration>,
+    /// Connections reused within this idle window skip the acquire-time
+    /// Ping/Pong. Default 15s; `ZERO` pings on every acquire.
+    ping_idle_threshold: Duration,
     user: String,
     password: String,
     database: String,
@@ -534,6 +541,7 @@ impl SimplePool {
             ttl: std::time::Duration::ZERO,
             connect_timeout: None,
             acquire_timeout: None,
+            ping_idle_threshold: Duration::from_secs(15),
             user: String::from("default"),
             password: String::new(),
             database: String::new(),
@@ -571,6 +579,12 @@ impl SimplePool {
     /// Set the max wait for a free pool slot. `None` = unbounded (default).
     pub(crate) fn set_acquire_timeout(&mut self, t: Option<Duration>) {
         self.acquire_timeout = t;
+    }
+
+    /// Set the idle threshold for the acquire-time liveness Ping. Connections
+    /// reused within `t` skip the Ping; `ZERO` pings on every acquire.
+    pub(crate) fn set_ping_idle_threshold(&mut self, t: Duration) {
+        self.ping_idle_threshold = t;
     }
 
     /// Set the hostname for periodic DNS refresh. Pass `None` to disable.
@@ -805,9 +819,19 @@ impl SimplePool {
             *slot_guard = Some(self.connect_round_robin().await?);
         }
         let should_reconnect = if let Some(conn) = slot_guard.as_mut() {
-            Self::connection_expired(conn, self.ttl)
-                || self.connection_config_stale(conn)
-                || !is_connection_alive(conn).await
+            let expired = Self::connection_expired(conn, self.ttl);
+            let stale = self.connection_config_stale(conn);
+            if expired || stale {
+                true
+            } else {
+                // Skip the Ping/Pong round-trip for connections reused within
+                // the idle threshold: a recently used socket is trusted, with
+                // TCP keepalive (set per-socket) and the query itself surfacing
+                // any breakage. Idle connections past the threshold are pinged
+                // to catch sockets dropped by the server or a proxy.
+                should_liveness_ping(conn.last_used_at.elapsed(), self.ping_idle_threshold)
+                    && !is_connection_alive(conn).await
+            }
         } else {
             true
         };
@@ -869,6 +893,15 @@ impl Drop for SimplePool {
     }
 }
 
+/// Whether a pooled connection needs an acquire-time Ping/Pong.
+///
+/// Returns true only when the connection has been idle for at least `threshold`
+/// — recently used sockets are trusted. `threshold == ZERO` always returns true
+/// (ping on every acquire).
+fn should_liveness_ping(idle: Duration, threshold: Duration) -> bool {
+    idle >= threshold
+}
+
 async fn is_connection_alive(conn: &mut Connection) -> bool {
     if conn
         .stream
@@ -920,12 +953,28 @@ impl<'a> PoolGuard<'a> {
             None => std::process::abort(),
         }
     }
+
+    /// If `result` is a connection-fatal error, drop the underlying connection
+    /// so the next `get()` reconnects instead of reusing a broken socket.
+    /// Keeps a failed socket from being trusted by the idle-threshold Ping skip.
+    pub(crate) fn invalidate_on_err<T>(&mut self, result: &crate::error::Result<T>) {
+        if let Err(e) = result
+            && e.is_broken_connection()
+        {
+            let _ = self.take_stream();
+        }
+    }
 }
 
 impl Drop for PoolGuard<'_> {
     fn drop(&mut self) {
         if let Some(metrics) = self.metrics {
             metrics.pool_in_use.fetch_sub(1, Ordering::Relaxed);
+        }
+        // Record when this connection went back to idle so the next acquire
+        // can decide whether a liveness Ping is warranted.
+        if let Some(conn) = self._guard.as_mut() {
+            conn.last_used_at = crate::runtime::time::Instant::now();
         }
     }
 }
@@ -1016,6 +1065,45 @@ mod tests {
         assert_eq!(pool.acquire_timeout, Some(Duration::from_millis(50)));
         pool.set_acquire_timeout(None);
         assert!(pool.acquire_timeout.is_none());
+    }
+
+    #[test]
+    fn test_ping_idle_threshold_default_and_setter() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 2);
+        // Default: trust connections reused within 15s, ping only after idle.
+        assert_eq!(pool.ping_idle_threshold, Duration::from_secs(15));
+        pool.set_ping_idle_threshold(Duration::from_secs(60));
+        assert_eq!(pool.ping_idle_threshold, Duration::from_secs(60));
+        // ZERO restores the old always-ping behaviour.
+        pool.set_ping_idle_threshold(Duration::ZERO);
+        assert_eq!(pool.ping_idle_threshold, Duration::ZERO);
+    }
+
+    #[test]
+    fn should_liveness_ping_only_after_idle_threshold() {
+        // Recently used → trust, skip the round-trip.
+        assert!(!should_liveness_ping(
+            Duration::ZERO,
+            Duration::from_secs(15)
+        ));
+        assert!(!should_liveness_ping(
+            Duration::from_secs(14),
+            Duration::from_secs(15)
+        ));
+        // Idle at/over the threshold → ping.
+        assert!(should_liveness_ping(
+            Duration::from_secs(15),
+            Duration::from_secs(15)
+        ));
+        assert!(should_liveness_ping(
+            Duration::from_secs(60),
+            Duration::from_secs(15)
+        ));
+        // ZERO threshold = always ping (old behaviour).
+        assert!(should_liveness_ping(Duration::ZERO, Duration::ZERO));
     }
 
     #[test]

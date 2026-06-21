@@ -90,6 +90,15 @@ impl Error {
         )
     }
 
+    /// Returns `true` if the error means the socket is broken and the
+    /// connection must not be reused (forced close or I/O failure).
+    ///
+    /// Excludes query timeouts: a query deadline cancels+drains server-side and
+    /// returns the connection to the pool still usable.
+    pub fn is_broken_connection(&self) -> bool {
+        matches!(self, Error::ConnectionClosed(_) | Error::Io(_))
+    }
+
     /// Returns `true` if the error is retryable (connection issues, timeouts).
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -118,6 +127,20 @@ mod tests {
         assert!(Error::PoolTimeout("no slot".into()).is_pool_timeout());
         assert!(!Error::Timeout("query".into()).is_pool_timeout());
         assert!(!Error::ConnectionClosed("x".into()).is_pool_timeout());
+    }
+
+    #[test]
+    fn broken_connection_is_io_or_closed_not_timeout() {
+        assert!(
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset"
+            ))
+            .is_broken_connection()
+        );
+        assert!(Error::ConnectionClosed("server closed".into()).is_broken_connection());
+        // A query timeout cancels+drains and leaves the connection usable.
+        assert!(!Error::Timeout("query exceeded deadline".into()).is_broken_connection());
     }
 
     #[test]

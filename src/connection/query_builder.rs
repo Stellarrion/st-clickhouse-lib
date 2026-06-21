@@ -228,10 +228,6 @@ impl<'a> QueryBuilder<'a> {
     ) -> Result<(crate::pool::PoolGuard<'_>, bool)> {
         let mut guard = self.client.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
-        let stream = guard.stream_mut();
-        if self.client.ping_before_query {
-            ping_stream(stream).await?;
-        }
         let mut query_id_buf = [0u8; 22];
         let query_id = query_id_bytes(self.query_id.as_deref(), &mut query_id_buf);
         let compression = self.compression.or(self.client.compression);
@@ -290,10 +286,28 @@ impl<'a> QueryBuilder<'a> {
                 &self.params,
             )
         };
-        write_ignored_part_uuids_if_any(stream, &self.ignored_part_uuids).await?;
-        stream.write_packet(&pkt).await?;
-        stream.flush().await?;
-        Ok((guard, response_compressed))
+        // Send phase: scope the stream borrow so the connection can be
+        // invalidated on a write/flush failure rather than returned broken.
+        let send: Result<()> = async {
+            let stream = guard.stream_mut();
+            if self.client.ping_before_query {
+                ping_stream(stream).await?;
+            }
+            write_ignored_part_uuids_if_any(stream, &self.ignored_part_uuids).await?;
+            stream.write_packet(&pkt).await?;
+            stream.flush().await?;
+            Ok(())
+        }
+        .await;
+        match send {
+            Ok(()) => Ok((guard, response_compressed)),
+            Err(e) => {
+                if e.is_broken_connection() {
+                    guard.take_stream();
+                }
+                Err(e)
+            },
+        }
     }
 
     /// Fetch the first result block with retries on retryable errors.
@@ -308,7 +322,7 @@ impl<'a> QueryBuilder<'a> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
-        read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
             deadline,
@@ -316,7 +330,9 @@ impl<'a> QueryBuilder<'a> {
             &self.callbacks,
             FirstBlockHandler::default(),
         )
-        .await
+        .await;
+        guard.invalidate_on_err(&result);
+        result
     }
 
     /// Stream rows via a background task that owns the TcpStream.
@@ -419,7 +435,7 @@ impl<'a> QueryBuilder<'a> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
-        read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
             deadline,
@@ -427,7 +443,9 @@ impl<'a> QueryBuilder<'a> {
             &self.callbacks,
             RowCountHandler::default(),
         )
-        .await
+        .await;
+        guard.invalidate_on_err(&result);
+        result
     }
 
     /// Internal all-rows read — called in retry loop.
@@ -437,7 +455,7 @@ impl<'a> QueryBuilder<'a> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
-        read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
             deadline,
@@ -445,7 +463,9 @@ impl<'a> QueryBuilder<'a> {
             &self.callbacks,
             AllRowsHandler::<T>::default(),
         )
-        .await
+        .await;
+        guard.invalidate_on_err(&result);
+        result
     }
 
     /// Fetch raw native block bodies without materializing parsed [`Block`] values.
@@ -455,7 +475,7 @@ impl<'a> QueryBuilder<'a> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::RawCapture)
             .await?;
-        let blocks = read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
             deadline,
@@ -463,7 +483,9 @@ impl<'a> QueryBuilder<'a> {
             &self.callbacks,
             RawBlocksHandler::default(),
         )
-        .await?;
+        .await;
+        guard.invalidate_on_err(&result);
+        let blocks = result?;
         metric_guard.succeed();
         Ok(blocks)
     }
