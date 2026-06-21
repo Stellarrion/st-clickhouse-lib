@@ -54,7 +54,7 @@ pub enum AnyColumnData<'a> {
     Int128(PlainColumnData<'a, i128>),
     Float32(PlainColumnData<'a, f32>),
     Float64(PlainColumnData<'a, f64>),
-    String(StringColumnData),
+    String(StringColumnData<'a>),
     FixedString(FixedStringColumnData<'a>),
     DateTime64(PlainColumnData<'a, DateTime64Value>),
     Decimal32(PlainColumnData<'a, Decimal32>),

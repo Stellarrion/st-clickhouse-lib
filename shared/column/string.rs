@@ -1,47 +1,41 @@
 // Shared string column logic. Provided in scope by the including
 // module: super::super::error::Result, super::super::protocol::block::ReadColumnContext, super::super::protocol::wire, super::{ClickHouseColumn, ClickHouseColumnData, ClickHouseValue}.
-/// Owned String column data.
+/// Borrowed String column data — zero copy.
 ///
 /// String columns use **RowBinary format**: each value is `varint(length) + bytes`.
-/// Since varints and data are interleaved, we copy strings into a contiguous
-/// buffer and build cumulative offset array.
-///
-/// TODO(zero-copy): Once we have an arena or shared buffer, eliminate the copy
-/// by scanning in-place with an index array.
+/// Since varints and bodies are interleaved, we keep the raw column bytes by
+/// reference (borrowed from the block buffer) and store a `(start, end)` body
+/// range per row, computed in a single scan. No string body is ever copied.
 #[derive(Debug)]
-pub struct StringColumnData {
-    offsets: Vec<u64>,
-    data: Vec<u8>,
+pub struct StringColumnData<'a> {
+    /// Per-row `(start, end)` byte range of each string body within `data`.
+    ranges: Vec<(u64, u64)>,
+    /// Raw column bytes (varints + bodies), borrowed from the block buffer.
+    data: &'a [u8],
 }
 
-impl StringColumnData {
-    pub(crate) fn new(offsets: Vec<u64>, data: Vec<u8>) -> Self {
-        Self { offsets, data }
+impl<'a> StringColumnData<'a> {
+    pub(crate) fn new(ranges: Vec<(u64, u64)>, data: &'a [u8]) -> Self {
+        Self { ranges, data }
     }
 
     pub fn len(&self) -> usize {
-        self.offsets.len()
+        self.ranges.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.ranges.is_empty()
     }
 
     fn range(&self, index: usize) -> Result<(usize, usize)> {
-        let start = if index == 0 {
-            0
-        } else {
-            self.offsets.get(index - 1).copied().ok_or_else(|| {
-                super::super::error::Error::Protocol("StringColumnData: index out of bounds".into())
-            })? as usize
-        };
-        let end = self.offsets.get(index).copied().ok_or_else(|| {
+        let (start, end) = self.ranges.get(index).copied().ok_or_else(|| {
             super::super::error::Error::Protocol("StringColumnData: index out of bounds".into())
-        })? as usize;
-        Ok((start, end))
+        })?;
+        Ok((start as usize, end as usize))
     }
 
-    pub fn get_bytes(&self, index: usize) -> Result<&[u8]> {
+    /// Borrowed bytes of the value at `index` — zero alloc, zero copy.
+    pub fn get_bytes(&self, index: usize) -> Result<&'a [u8]> {
         let (start, end) = self.range(index)?;
         self.data.get(start..end).ok_or_else(|| {
             super::super::error::Error::Protocol("StringColumnData: invalid range".into())
@@ -54,21 +48,21 @@ impl StringColumnData {
     }
 
     /// Get a borrowed string reference — zero alloc.
-    pub fn get_str(&self, index: usize) -> Result<&str> {
+    pub fn get_str(&self, index: usize) -> Result<&'a str> {
         let bytes = self.get_bytes(index)?;
         std::str::from_utf8(bytes).map_err(|e| {
             super::super::error::Error::Protocol(format!("invalid UTF-8 at row {index}: {e}"))
         })
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = Result<&[u8]>> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = Result<&'a [u8]>> + '_ {
         (0..self.len()).map(|i| self.get_bytes(i))
     }
 }
 
-impl ClickHouseColumnData<'_, String> for StringColumnData {
+impl<'a> ClickHouseColumnData<'a, String> for StringColumnData<'a> {
     fn len(&self) -> usize {
-        self.offsets.len()
+        self.ranges.len()
     }
 
     fn get(&self, index: usize) -> Result<String> {
@@ -98,22 +92,18 @@ impl ClickHouseValue for String {
 }
 
 impl ClickHouseColumn for String {
-    type ColumnData<'a>
-        = StringColumnData
-    where
-        String: 'a;
+    type ColumnData<'a> = StringColumnData<'a>;
 
     fn read_column<'a>(ctx: &mut ReadColumnContext<'a>) -> Result<Self::ColumnData<'a>> {
         let rows = ctx.rows;
         if rows == 0 {
-            return Ok(StringColumnData::new(Vec::new(), Vec::new()));
+            return Ok(StringColumnData::new(Vec::new(), &[]));
         }
-        // Pass 1: scan the varints (without advancing `ctx`) to find the
-        // column's byte extent, record each string's body range, and sum body
-        // sizes so `data` is allocated exactly once.
-        let mut bodies: Vec<(usize, usize)> = Vec::with_capacity(rows);
+        // Single scan over the in-buffer bytes: decode each varint to find the
+        // body range, recording `(start, end)` without advancing `ctx`. The
+        // bodies stay borrowed from the block buffer — no copy, no second pass.
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(rows);
         let mut scan_pos = 0usize;
-        let mut total_body = 0usize;
         for _ in 0..rows {
             let (len, consumed) = read_varint_from_slice(&ctx.buf[ctx.pos + scan_pos..])?;
             let len = len as usize;
@@ -121,23 +111,13 @@ impl ClickHouseColumn for String {
             let body_end = body_start.checked_add(len).ok_or_else(|| {
                 super::super::error::Error::Protocol("StringColumnData: body range overflow".into())
             })?;
-            bodies.push((body_start, body_end));
-            total_body = total_body.checked_add(len).ok_or_else(|| {
-                super::super::error::Error::Protocol("StringColumnData: total body overflow".into())
-            })?;
+            ranges.push((body_start as u64, body_end as u64));
             scan_pos = body_end;
         }
-        // Consume the whole column in one bounds-checked slice.
-        let raw = ctx.read_exact(scan_pos)?;
-        // Pass 2: copy bodies into a contiguous buffer using the recorded ranges
-        // — no second varint parse.
-        let mut data = Vec::with_capacity(total_body);
-        let mut offsets = Vec::with_capacity(rows);
-        for &(start, end) in &bodies {
-            data.extend_from_slice(&raw[start..end]);
-            offsets.push(data.len() as u64);
-        }
-        Ok(StringColumnData::new(offsets, data))
+        // Consume the whole column in one bounds-checked slice — the borrowed
+        // view the ranges index into.
+        let data = ctx.read_exact(scan_pos)?;
+        Ok(StringColumnData::new(ranges, data))
     }
 
     fn write_column(data: &[Self], buf: &mut Vec<u8>) -> Result<()> {
@@ -191,5 +171,31 @@ mod tests {
         assert_eq!(col.get_bytes(1).expect("test operation failed"), b"hello");
         assert_eq!(col.get_bytes(2).expect("test operation failed"), b"world!");
         assert_eq!(col.get_string(1).expect("test operation failed"), "hello");
+    }
+
+    #[test]
+    fn string_column_borrows_source_buffer_no_copy() {
+        // Zero-copy contract: StringColumnData must reference the block buffer
+        // directly, never own a copy of the string bodies. Verified by pointer
+        // identity — the returned slice must live inside the original buffer.
+        let ctx_data: Vec<u8> = vec![2, b'h', b'i', 5, b'w', b'o', b'r', b'l', b'd'];
+        let base = ctx_data.as_ptr() as usize;
+        let end = base + ctx_data.len();
+        let mut ctx = ReadColumnContext {
+            rows: 2,
+            pos: 0,
+            buf: &ctx_data,
+        };
+        let col = String::read_column(&mut ctx).expect("read column");
+        for i in 0..col.len() {
+            let bytes = col.get_bytes(i).expect("get bytes");
+            let ptr = bytes.as_ptr() as usize;
+            assert!(
+                ptr >= base && ptr < end,
+                "row {i} bytes must reference the source buffer (zero copy)"
+            );
+        }
+        assert_eq!(col.get_bytes(0).expect("row 0"), b"hi");
+        assert_eq!(col.get_bytes(1).expect("row 1"), b"world");
     }
 }
