@@ -3,9 +3,19 @@ mod common;
 use st_clickhouse::{ClickHouseColumnData, Client, QualifiedTableName, QueryParameter};
 
 async fn connect() -> Client {
-    match Client::connect(common::clickhouse_addr()).await {
+    let addr = common::clickhouse_addr();
+    // Env override for non-default users (e.g. CLICKHOUSE_USER=honne CLICKHOUSE_PASSWORD=honne).
+    if let (Ok(user), Ok(password)) = (
+        std::env::var("CLICKHOUSE_USER"),
+        std::env::var("CLICKHOUSE_PASSWORD"),
+    ) {
+        return Client::connect_with_credentials(addr, &user, &password)
+            .await
+            .expect("test operation failed");
+    }
+    match Client::connect(addr).await {
         Ok(client) => client,
-        Err(_) => Client::connect_with_credentials(common::clickhouse_addr(), "default", "test")
+        Err(_) => Client::connect_with_credentials(addr, "default", "test")
             .await
             .expect("test operation failed"),
     }

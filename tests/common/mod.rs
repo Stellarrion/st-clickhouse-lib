@@ -8,27 +8,41 @@ pub fn clickhouse_addr() -> &'static str {
 
 #[allow(dead_code)]
 pub async fn connect_client() -> st_clickhouse::Client {
-    match st_clickhouse::Client::connect(clickhouse_addr()).await {
+    let addr = clickhouse_addr();
+    // Env override for non-default users (e.g. CLICKHOUSE_USER=honne CLICKHOUSE_PASSWORD=honne).
+    if let (Ok(user), Ok(password)) = (
+        std::env::var("CLICKHOUSE_USER"),
+        std::env::var("CLICKHOUSE_PASSWORD"),
+    ) {
+        return st_clickhouse::Client::connect_with_credentials(addr, &user, &password)
+            .await
+            .expect("test operation failed");
+    }
+    match st_clickhouse::Client::connect(addr).await {
         Ok(client) => client,
-        Err(_) => {
-            st_clickhouse::Client::connect_with_credentials(clickhouse_addr(), "default", "test")
-                .await
-                .expect("test operation failed")
-        },
+        Err(_) => st_clickhouse::Client::connect_with_credentials(addr, "default", "test")
+            .await
+            .expect("test operation failed"),
     }
 }
 
 #[allow(dead_code)]
 pub async fn connect_client_pool(size: usize) -> st_clickhouse::Client {
-    match st_clickhouse::Client::connect_with_pool(clickhouse_addr(), size).await {
+    let addr = clickhouse_addr();
+    if let (Ok(user), Ok(password)) = (
+        std::env::var("CLICKHOUSE_USER"),
+        std::env::var("CLICKHOUSE_PASSWORD"),
+    ) {
+        return st_clickhouse::Client::connect_with_pool_credentials(addr, size, &user, &password)
+            .await
+            .expect("test operation failed");
+    }
+    match st_clickhouse::Client::connect_with_pool(addr, size).await {
         Ok(client) => client,
-        Err(_) => st_clickhouse::Client::connect_with_pool_credentials(
-            clickhouse_addr(),
-            size,
-            "default",
-            "test",
-        )
-        .await
-        .expect("test operation failed"),
+        Err(_) => {
+            st_clickhouse::Client::connect_with_pool_credentials(addr, size, "default", "test")
+                .await
+                .expect("test operation failed")
+        },
     }
 }

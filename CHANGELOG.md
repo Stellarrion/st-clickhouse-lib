@@ -2,6 +2,73 @@
 
 All notable changes to st-clickhouse are documented here.
 
+## [Unreleased]
+
+### Added
+- **Query timeout**: opt-in hard wall-clock deadline via `Client::with_query_timeout(d)`
+  and per-query `QueryBuilder::timeout(d)`. On expiry the query is cancelled server-side
+  (`Cancel` packet) and the pooled connection is drained and reused. Default `None` —
+  no behaviour change for existing users. Async client only; sync core already
+  supported `query_timeout`.
+- **Pool acquire timeout**: bound the wait for a free pool slot via
+  `Client::with_acquire_timeout(d)` / `ClientBuilder::acquire_timeout(d)` / URL
+  `acquire_timeout=`. Returns the retryable `Error::PoolTimeout` when no slot is
+  free in time. Default `None` (unbounded — unchanged). Async client only.
+  An acquire timeout also bumps the `connection_errors` metric.
+- **Quota key**: configurable `quota_key` sent in ClientInfo and the connection
+  handshake addendum, via `Client::with_quota_key(s)` /
+  `ClientBuilder::quota_key(s)` / URL `?quota_key=`. Parity with the sync core,
+  which previously hardcoded `""` on the async path. Default `""` — no wire
+  change for existing users. Setting it (or changing it) bumps the pool's config
+  generation so pooled connections reconnect carrying the new key. Note: URL
+  `?quota_key=` is now the protocol ClientInfo field (previously it fell through
+  to the ClickHouse `settings` map).
+
+## [0.2.0] — 2026-06-21
+
+### Changed (BREAKING)
+- **`StringColumnData` now borrows the block buffer** (`StringColumnData<'a>`) — true
+  zero-copy String column reads. `get_bytes` / `get_str` return `&'a`. Previously the
+  column owned a copy of every string body; the read path is now a single varint scan
+  over the borrowed buffer (~3.3× faster decode of 100K strings). Mirrors the existing
+  `FixedStringColumnData<'a>` shape.
+
+### Performance
+- **Row materialization fast path**: `read_all` / `query_all` materialize all-PlainColumn
+  tuples by indexing native per-column slices instead of dispatching `to_typed` per row
+  (~33% faster: 1M `UInt64` tuples 4.2ms → 2.8ms, to within ~0.5ms of the block floor).
+  Mixed tuples (String/Array fields) silently fall back to the per-row path.
+- **Zero-copy String column** (see Breaking) + single-pass varint scan.
+- **Stream-level read prefetch buffer** in `StreamWrapper` (8 KiB) — all byte-wise reads
+  (varints, headers, string bodies, cancel/drain) hit a persistent buffer drained at
+  EndOfStream. Transparent to every read path.
+- **Bulk-read Array/Map offset columns** in one `read_exact`.
+- **Reuse the cached query template** on the common SELECT path (no per-query HashMap
+  clone + re-serialize).
+- **Skip the acquire-time Ping** for recently-used connections (idle-gated), with
+  invalidate-on-broken-connection so it is strictly as safe as before.
+- **Streaming cursor** decodes each block via the column-pre-extraction fast path.
+
+### Added
+- `AnyColumnData::plain_slice::<T>() -> Option<&[T]>` — native slice view for
+  PlainColumn types (powers the row fast path).
+- `Row::from_columns_collect` — bulk materialization hook (default loops; tuple impls
+  override with the PlainColumn fast path).
+- Benchmarks: `column_decode_bench`, `uint64_breakdown` (decode/access breakdown),
+  `owned_vs_borrowed` (1M-row materialization).
+
+### Fixed (security)
+- TLS root-store hardening + type-parser recursion cap.
+- Harden untrusted-input parsing + credential redaction.
+
+### Refactor
+- Dedup async/sync columns via `shared/` + `include!`.
+- Extract LowCardinality header validation.
+
+### Python
+- `st-clickhouse-py` version-aligned to `0.2.0`; rebuilt against the 0.2.0 Rust core.
+  No Python binding API change.
+
 ## [0.1.0] — 2026-05-18
 
 ### Added

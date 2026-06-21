@@ -24,7 +24,7 @@ pub(crate) struct ClientInfoTemplate {
     pub(crate) after_initial_query_id: Vec<u8>,
 }
 
-pub(crate) fn build_client_info_template(revision: u64) -> ClientInfoTemplate {
+pub(crate) fn build_client_info_template(revision: u64, quota_key: &str) -> ClientInfoTemplate {
     let mut before_initial_query_id = Vec::with_capacity(16);
     let mut after_initial_query_id = Vec::with_capacity(96);
 
@@ -41,7 +41,7 @@ pub(crate) fn build_client_info_template(revision: u64) -> ClientInfoTemplate {
     wire::write_varint_to_vec(&mut after_initial_query_id, 4);
     wire::write_varint_to_vec(&mut after_initial_query_id, revision);
     if revision >= protocol_revision::DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO {
-        wire::write_string_to_vec(&mut after_initial_query_id, "");
+        wire::write_string_to_vec(&mut after_initial_query_id, quota_key);
     }
     if revision >= protocol_revision::DBMS_MIN_REVISION_WITH_DISTRIBUTED_DEPTH {
         wire::write_varint_to_vec(&mut after_initial_query_id, 0);
@@ -131,5 +131,37 @@ pub(crate) fn write_client_info_with_query_id(
     }
     if revision >= protocol_revision::DBMS_MIN_REVISION_WITH_JWT_IN_INTERSERVER {
         buf.push(0); // has_jwt = 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REV: u64 = protocol_revision::DEFAULT_PROTOCOL_REVISION;
+
+    #[test]
+    fn quota_key_encoded_in_client_info_template() {
+        // The default revision always carries the quota_key field
+        // (DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO).
+        let with_key = build_client_info_template(REV, "tenant-42");
+        let empty = build_client_info_template(REV, "");
+
+        // The key (9 bytes) must be present in the template that carries it,
+        // and absent when the key is empty.
+        assert!(
+            with_key
+                .after_initial_query_id
+                .windows(9)
+                .any(|w| w == b"tenant-42"),
+            "quota_key not encoded in client info template"
+        );
+        assert!(
+            !empty
+                .after_initial_query_id
+                .windows(9)
+                .any(|w| w == b"tenant-42"),
+            "empty quota_key must not encode the key"
+        );
     }
 }

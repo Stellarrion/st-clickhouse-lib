@@ -23,12 +23,13 @@ pub struct ClientBuilder<M = Async> {
     _mode: PhantomData<M>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct BuilderOptions {
     hosts: Vec<HostEndpoint>,
     user: String,
     password: String,
     database: String,
+    quota_key: String,
     pool_size: usize,
     compression: Option<CompressionMethod>,
     settings: HashMap<String, String>,
@@ -36,11 +37,40 @@ struct BuilderOptions {
     recv_timeout: Option<Duration>,
     send_timeout: Option<Duration>,
     retry_timeout: Option<Duration>,
+    query_timeout: Option<Duration>,
+    acquire_timeout: Option<Duration>,
     send_retries: Option<u32>,
     ping_before_query: bool,
     validate_schema: bool,
     secure: bool,
     tls_domain: Option<String>,
+}
+
+impl std::fmt::Debug for BuilderOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never emit the cleartext password (mirrors sync config.rs).
+        f.debug_struct("BuilderOptions")
+            .field("hosts", &self.hosts)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("database", &self.database)
+            .field("quota_key", &self.quota_key)
+            .field("pool_size", &self.pool_size)
+            .field("compression", &self.compression)
+            .field("settings", &self.settings)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("recv_timeout", &self.recv_timeout)
+            .field("send_timeout", &self.send_timeout)
+            .field("retry_timeout", &self.retry_timeout)
+            .field("query_timeout", &self.query_timeout)
+            .field("acquire_timeout", &self.acquire_timeout)
+            .field("send_retries", &self.send_retries)
+            .field("ping_before_query", &self.ping_before_query)
+            .field("validate_schema", &self.validate_schema)
+            .field("secure", &self.secure)
+            .field("tls_domain", &self.tls_domain)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +96,7 @@ impl Default for BuilderOptions {
             user: "default".to_owned(),
             password: String::new(),
             database: String::new(),
+            quota_key: String::new(),
             pool_size: 1,
             compression: None,
             settings: HashMap::new(),
@@ -73,6 +104,8 @@ impl Default for BuilderOptions {
             recv_timeout: None,
             send_timeout: None,
             retry_timeout: None,
+            query_timeout: None,
+            acquire_timeout: None,
             send_retries: None,
             ping_before_query: false,
             validate_schema: false,
@@ -138,6 +171,12 @@ impl<M> ClientBuilder<M> {
         self
     }
 
+    /// Set the quota key sent in ClientInfo and the handshake addendum.
+    pub fn quota_key(mut self, key: impl Into<String>) -> Self {
+        self.opts.quota_key = key.into();
+        self
+    }
+
     pub fn pool_size(mut self, size: usize) -> Self {
         self.opts.pool_size = size.max(1);
         self
@@ -177,6 +216,16 @@ impl<M> ClientBuilder<M> {
 
     pub fn retry_timeout(mut self, timeout: Duration) -> Self {
         self.opts.retry_timeout = Some(timeout);
+        self
+    }
+
+    pub fn query_timeout(mut self, timeout: Duration) -> Self {
+        self.opts.query_timeout = Some(timeout);
+        self
+    }
+
+    pub fn acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.opts.acquire_timeout = Some(timeout);
         self
     }
 
@@ -260,6 +309,7 @@ impl ClientBuilder<Async> {
         let mut pool = crate::pool::SimplePool::new(addrs, self.opts.pool_size);
         pool.set_credentials(&self.opts.user, &self.opts.password);
         pool.set_database(&self.opts.database);
+        pool.set_quota_key(&self.opts.quota_key);
         if logical_addrs.len() == 1 {
             pool.set_hostname(logical_addrs.into_iter().next());
         }
@@ -268,6 +318,9 @@ impl ClientBuilder<Async> {
         }
         if let Some(timeout) = self.opts.send_timeout {
             pool.set_send_timeout(Some(timeout));
+        }
+        if let Some(timeout) = self.opts.acquire_timeout {
+            pool.set_acquire_timeout(Some(timeout));
         }
         #[cfg(feature = "tokio-tls")]
         if self.opts.secure {
@@ -291,6 +344,9 @@ impl ClientBuilder<Async> {
         }
         if let Some(timeout) = self.opts.retry_timeout {
             client.retry_timeout = timeout;
+        }
+        if let Some(timeout) = self.opts.query_timeout {
+            client.query_timeout = Some(timeout);
         }
         if let Some(retries) = self.opts.send_retries {
             client.send_retries = retries;
@@ -493,6 +549,7 @@ fn parse_query(query: &str, opts: &mut BuilderOptions) -> std::result::Result<()
             "user" => opts.user = value,
             "password" => opts.password = value,
             "database" | "db" => opts.database = value,
+            "quota_key" => opts.quota_key = value,
             "compression" => opts.compression = Some(parse_compression(&value)?),
             "secure" | "tls" => opts.secure = parse_bool(&value)?,
             "tls_domain" | "sni" => opts.tls_domain = Some(value),
@@ -505,6 +562,7 @@ fn parse_query(query: &str, opts: &mut BuilderOptions) -> std::result::Result<()
             "connect_timeout" => opts.connect_timeout = Some(parse_duration(&value)?),
             "recv_timeout" | "query_timeout" => opts.recv_timeout = Some(parse_duration(&value)?),
             "send_timeout" => opts.send_timeout = Some(parse_duration(&value)?),
+            "acquire_timeout" => opts.acquire_timeout = Some(parse_duration(&value)?),
             "retry_timeout" => opts.retry_timeout = Some(parse_duration(&value)?),
             "send_retries" => {
                 opts.send_retries = Some(
@@ -596,6 +654,12 @@ fn hex_val(b: u8) -> Option<u8> {
 fn default_rustls_config() -> rustls::ClientConfig {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Also honor the OS trust store so internal/private CAs — accepted by
+    // Client::with_tls() — validate consistently under clickhouses:// / secure.
+    #[cfg(feature = "tokio-tls")]
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = root_store.add(cert);
+    }
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth()
@@ -604,6 +668,17 @@ fn default_rustls_config() -> rustls::ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_password() {
+        let builder = ClientBuilder::<Async>::default().password("hunter2-secret");
+        let s = format!("{:?}", builder);
+        assert!(!s.contains("hunter2-secret"), "Debug leaked password: {s}");
+        assert!(
+            s.contains("<redacted>"),
+            "password should be redacted in Debug: {s}"
+        );
+    }
 
     #[test]
     fn parses_clickhouse_url() {
@@ -638,5 +713,76 @@ mod tests {
             Some("1000")
         );
         assert!(builder.opts.secure);
+    }
+}
+
+#[cfg(test)]
+mod query_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn builder_stores_query_timeout() {
+        let b = ClientBuilder::<Async>::new().query_timeout(Duration::from_secs(12));
+        assert_eq!(b.opts.query_timeout, Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn builder_default_has_no_query_timeout() {
+        let b = ClientBuilder::<Async>::new();
+        assert_eq!(b.opts.query_timeout, None);
+    }
+}
+
+#[cfg(test)]
+mod acquire_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn builder_stores_acquire_timeout() {
+        let b = ClientBuilder::<Async>::new().acquire_timeout(Duration::from_millis(250));
+        assert_eq!(b.opts.acquire_timeout, Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn builder_default_has_no_acquire_timeout() {
+        let b = ClientBuilder::<Async>::new();
+        assert_eq!(b.opts.acquire_timeout, None);
+    }
+
+    #[test]
+    fn url_parses_acquire_timeout() {
+        let b = ClientBuilder::<Async>::from_url(
+            "clickhouse://honne:honne@127.0.0.1:9000?acquire_timeout=50ms",
+        )
+        .expect("url should parse");
+        assert_eq!(b.opts.acquire_timeout, Some(Duration::from_millis(50)));
+    }
+}
+
+#[cfg(test)]
+mod quota_key_tests {
+    use super::*;
+
+    #[test]
+    fn builder_stores_quota_key() {
+        let b = ClientBuilder::<Async>::new().quota_key("tenant-42");
+        assert_eq!(b.opts.quota_key, "tenant-42");
+    }
+
+    #[test]
+    fn builder_default_has_empty_quota_key() {
+        let b = ClientBuilder::<Async>::new();
+        assert!(b.opts.quota_key.is_empty());
+    }
+
+    #[test]
+    fn url_parses_quota_key() {
+        let b = ClientBuilder::<Async>::from_url(
+            "clickhouse://honne:honne@127.0.0.1:9000?quota_key=tenant-42",
+        )
+        .expect("url should parse");
+        assert_eq!(b.opts.quota_key, "tenant-42");
     }
 }

@@ -17,6 +17,9 @@ pub fn read_varint<R: std::io::Read>(reader: &mut R) -> Result<u64> {
     let mut r = 0u64;
     let mut shift = 0;
     loop {
+        if shift >= 64 {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
         r |= ((byte[0] & 0x7F) as u64) << shift;
@@ -33,8 +36,7 @@ pub fn read_string<R: std::io::Read>(reader: &mut R) -> Result<String> {
     let len = checked_string_len(read_varint(reader)?)?;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
-    String::from_utf8(buf)
-        .map_err(|e| Error::Protocol(format!("invalid utf8: {e}")))
+    String::from_utf8(buf).map_err(|e| Error::Protocol(format!("invalid utf8: {e}")))
 }
 
 /// Read a ClickHouse byte string (varint-prefixed).
@@ -163,8 +165,8 @@ pub fn parse_string<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a str> {
 }
 
 fn checked_string_len(value: u64) -> Result<usize> {
-    let value = usize::try_from(value)
-        .map_err(|_| Error::Protocol("string length too large".into()))?;
+    let value =
+        usize::try_from(value).map_err(|_| Error::Protocol("string length too large".into()))?;
     if value > MAX_STRING_BYTES {
         return Err(Error::Protocol(format!(
             "string length {value} exceeds clickhouse-cpp limit {MAX_STRING_BYTES}"
@@ -252,5 +254,14 @@ mod tests {
         let parsed = parse_string(&buf, &mut pos).expect("test operation failed");
         assert_eq!(parsed, s);
         assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn test_read_varint_overflow_is_err() {
+        // Overlong varint (>=10 continuation bytes) would shift past 64 bits;
+        // must return Err rather than panic/UB.
+        let mut cursor = std::io::Cursor::new([0x80u8; 12]);
+        let res = read_varint(&mut cursor);
+        assert!(res.is_err(), "overlong varint must error, got {res:?}");
     }
 }

@@ -2,7 +2,8 @@ use crate::compression::CompressionMethod;
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::io::{compression_flag, ping_stream};
 use crate::connection::query_packet::{
-    build_query_packet, build_query_packet_template, merge_materialized_settings, query_id_bytes,
+    build_query_packet, build_query_packet_template, cached_template_reusable,
+    merge_materialized_settings, query_id_bytes,
 };
 use crate::connection::query_result::QueryResult;
 use crate::connection::row_stream_reader::read_query_blocks;
@@ -14,11 +15,11 @@ use crate::connection::tcp::Client;
 use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::block::{Block, RawBlock};
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::parameters::QueryParameter;
 use crate::runtime::io::AsyncWriteExt;
 use crate::runtime::sync::mpsc;
 use std::collections::HashMap;
-use std::future::Future;
 
 impl Client {
     /// Start building a SELECT query.
@@ -34,6 +35,7 @@ impl Client {
             external_tables: Vec::new(),
             ignored_part_uuids: Vec::new(),
             tracing_context: None,
+            timeout: None,
         }
     }
 
@@ -54,6 +56,7 @@ pub struct QueryBuilder<'a> {
     external_tables: Vec<(String, Block)>,
     ignored_part_uuids: Vec<[u8; 16]>,
     tracing_context: Option<crate::client_info::TracingContext>,
+    timeout: Option<std::time::Duration>,
 }
 
 enum QuerySettingsMode {
@@ -127,6 +130,14 @@ impl<'a> QueryBuilder<'a> {
         self
     }
 
+    /// Set a per-query wall-clock timeout that overrides the client-level
+    /// [`Client::with_query_timeout`](crate::Client::with_query_timeout).
+    /// The deadline starts when the query is first sent.
+    pub fn timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = Some(t);
+        self
+    }
+
     /// Bind a server-side query parameter for `{name:Type}` placeholders.
     ///
     /// Values are sent through the native protocol parameter section instead
@@ -170,20 +181,35 @@ impl<'a> QueryBuilder<'a> {
         self
     }
 
-    async fn retry<T, F, Fut>(&self, mut op: F) -> Result<T>
+    /// Effective whole-query deadline: per-query override else client-level.
+    fn effective_deadline(&self) -> Option<crate::runtime::time::Instant> {
+        self.timeout
+            .or(self.client.query_timeout)
+            .map(|t| crate::runtime::time::Instant::now() + t)
+    }
+
+    async fn retry<T, F, Fut>(
+        &self, deadline: Option<crate::runtime::time::Instant>, mut op: F,
+    ) -> Result<T>
     where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        F: FnMut(Option<crate::runtime::time::Instant>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
     {
         let metric_guard = QueryMetricGuard::new(self.client.metrics(), 1);
         let retries = self.client.send_retries.max(1);
         for attempt in 0..retries {
-            match op().await {
+            match op(deadline).await {
                 Ok(value) => {
                     metric_guard.succeed();
                     return Ok(value);
                 },
                 Err(e) if e.is_retryable() && attempt + 1 < retries => {
+                    // A timed-out query under an explicit deadline must not be
+                    // re-run (it would just time out again, server-side). With
+                    // no deadline configured, behavior is unchanged.
+                    if deadline.is_some() && e.is_timeout() {
+                        return Err(e);
+                    }
                     metric_guard.retry();
                     let base_ms = self.client.retry_timeout.as_millis() as u64;
                     let delay = base_ms.saturating_mul(1u64 << attempt);
@@ -202,68 +228,111 @@ impl<'a> QueryBuilder<'a> {
     ) -> Result<(crate::pool::PoolGuard<'_>, bool)> {
         let mut guard = self.client.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
-        let stream = guard.stream_mut();
-        if self.client.ping_before_query {
-            ping_stream(stream).await?;
-        }
         let mut query_id_buf = [0u8; 22];
         let query_id = query_id_bytes(self.query_id.as_deref(), &mut query_id_buf);
         let compression = self.compression.or(self.client.compression);
         let response_compressed = compression_flag(compression) == 1;
-        let settings = match mode {
-            QuerySettingsMode::Materialized => {
-                merge_materialized_settings(&self.client.settings, &self.settings)
-            },
-            QuerySettingsMode::RawCapture => {
-                let mut settings =
-                    merge_materialized_settings(&self.client.settings, &self.settings);
-                settings
-                    .entry(
-                        crate::protocol::settings::OUTPUT_FORMAT_NATIVE_USE_FLATTENED_DYNAMIC_AND_JSON_SERIALIZATION
-                            .into(),
-                    )
-                    .or_insert_with(|| "1".into());
-                settings
-                    .entry(
-                        crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING.into(),
-                    )
-                    .or_insert_with(|| "0".into());
-                settings
-            },
+        let pkt = if matches!(mode, QuerySettingsMode::Materialized)
+            && cached_template_reusable(
+                &self.settings,
+                self.compression,
+                self.client.query_template.revision,
+                rev,
+            ) {
+            // Fast path: no per-query overrides and the cached client template
+            // already matches the negotiated revision — reuse it instead of
+            // cloning the settings map and re-serializing the whole template.
+            build_query_packet(
+                &self.client.query_template,
+                &self.sql,
+                &self.external_tables,
+                query_id,
+                &self.params,
+            )
+        } else {
+            let settings = match mode {
+                QuerySettingsMode::Materialized => {
+                    merge_materialized_settings(&self.client.settings, &self.settings)
+                },
+                QuerySettingsMode::RawCapture => {
+                    let mut settings =
+                        merge_materialized_settings(&self.client.settings, &self.settings);
+                    settings
+                        .entry(
+                            crate::protocol::settings::OUTPUT_FORMAT_NATIVE_USE_FLATTENED_DYNAMIC_AND_JSON_SERIALIZATION
+                                .into(),
+                        )
+                        .or_insert_with(|| "1".into());
+                    settings
+                        .entry(
+                            crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING
+                                .into(),
+                        )
+                        .or_insert_with(|| "0".into());
+                    settings
+                },
+            };
+            let template = build_query_packet_template(
+                &settings,
+                compression,
+                rev,
+                self.client.pool.quota_key(),
+            );
+            build_query_packet(
+                &template,
+                &self.sql,
+                &self.external_tables,
+                query_id,
+                &self.params,
+            )
         };
-        let template = build_query_packet_template(&settings, compression, rev);
-        let pkt = build_query_packet(
-            &template,
-            &self.sql,
-            &self.external_tables,
-            query_id,
-            &self.params,
-        );
-        write_ignored_part_uuids_if_any(stream, &self.ignored_part_uuids).await?;
-        stream.write_packet(&pkt).await?;
-        stream.flush().await?;
-        Ok((guard, response_compressed))
+        // Send phase: scope the stream borrow so the connection can be
+        // invalidated on a write/flush failure rather than returned broken.
+        let send: Result<()> = async {
+            let stream = guard.stream_mut();
+            if self.client.ping_before_query {
+                ping_stream(stream).await?;
+            }
+            write_ignored_part_uuids_if_any(stream, &self.ignored_part_uuids).await?;
+            stream.write_packet(&pkt).await?;
+            stream.flush().await?;
+            Ok(())
+        }
+        .await;
+        match send {
+            Ok(()) => Ok((guard, response_compressed)),
+            Err(e) => {
+                if e.is_broken_connection() {
+                    guard.take_stream();
+                }
+                Err(e)
+            },
+        }
     }
 
     /// Fetch the first result block with retries on retryable errors.
     /// Reads until EoS on `stream_mut()` — connection stays clean.
     pub async fn block(self) -> Result<Block> {
-        self.retry(|| self._try_block()).await
+        let deadline = self.effective_deadline();
+        self.retry(deadline, |dl| self._try_block(dl)).await
     }
 
     /// Internal block read — called in retry loop.
-    async fn _try_block(&self) -> Result<Block> {
+    async fn _try_block(&self, deadline: Option<crate::runtime::time::Instant>) -> Result<Block> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
-        read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            deadline,
             response_compressed,
             &self.callbacks,
             FirstBlockHandler::default(),
         )
-        .await
+        .await;
+        guard.invalidate_on_err(&result);
+        result
     }
 
     /// Stream rows via a background task that owns the TcpStream.
@@ -283,6 +352,8 @@ impl<'a> QueryBuilder<'a> {
 
         // Cancel signal shared with the background task
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deadline = self.effective_deadline();
+        let recv_timeout = self.client.recv_timeout;
 
         // Spawn a short-lived task that owns the stream and reads all blocks
         let (block_tx, block_rx) = mpsc::channel(4);
@@ -290,13 +361,22 @@ impl<'a> QueryBuilder<'a> {
         crate::runtime::spawn(async move {
             let mut stream = stream;
             if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::runtime::io::AsyncWriteExt::write_all(&mut stream, &[3])
+                stream
+                    .write_packet(&[ClientPacket::Cancel as u8])
                     .await
                     .ok();
+                stream.flush().await.ok();
                 return;
             }
-            if let Err(e) =
-                read_query_blocks(stream, &block_tx, &self.callbacks, Some(&cancel_clone)).await
+            if let Err(e) = read_query_blocks(
+                stream,
+                &block_tx,
+                &self.callbacks,
+                Some(&cancel_clone),
+                recv_timeout,
+                deadline,
+            )
+            .await
             {
                 let _ = block_tx.send(Err(e)).await;
             }
@@ -308,7 +388,8 @@ impl<'a> QueryBuilder<'a> {
 
     /// Fetch all rows into a Vec with retries on retryable errors.
     pub async fn all<T: crate::row::Row>(self) -> Result<Vec<T>> {
-        self.retry(|| self._try_all::<T>()).await
+        let deadline = self.effective_deadline();
+        self.retry(deadline, |dl| self._try_all::<T>(dl)).await
     }
 
     /// Fetch exactly one row.
@@ -344,52 +425,67 @@ impl<'a> QueryBuilder<'a> {
 
     /// Count response rows without materializing result blocks.
     pub async fn row_count(self) -> Result<usize> {
-        self.retry(|| self._try_row_count()).await
+        let deadline = self.effective_deadline();
+        self.retry(deadline, |dl| self._try_row_count(dl)).await
     }
 
-    async fn _try_row_count(&self) -> Result<usize> {
+    async fn _try_row_count(
+        &self, deadline: Option<crate::runtime::time::Instant>,
+    ) -> Result<usize> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
-        read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            deadline,
             response_compressed,
             &self.callbacks,
             RowCountHandler::default(),
         )
-        .await
+        .await;
+        guard.invalidate_on_err(&result);
+        result
     }
 
     /// Internal all-rows read — called in retry loop.
-    async fn _try_all<T: crate::row::Row>(&self) -> Result<Vec<T>> {
+    async fn _try_all<T: crate::row::Row>(
+        &self, deadline: Option<crate::runtime::time::Instant>,
+    ) -> Result<Vec<T>> {
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
-        read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            deadline,
             response_compressed,
             &self.callbacks,
             AllRowsHandler::<T>::default(),
         )
-        .await
+        .await;
+        guard.invalidate_on_err(&result);
+        result
     }
 
     /// Fetch raw native block bodies without materializing parsed [`Block`] values.
     pub async fn raw(self) -> Result<Vec<RawBlock>> {
         let metric_guard = QueryMetricGuard::new(self.client.metrics(), 1);
+        let deadline = self.effective_deadline();
         let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::RawCapture)
             .await?;
-        let blocks = read_select_response(
+        let result = read_select_response(
             guard.stream_mut(),
             self.client.recv_timeout,
+            deadline,
             response_compressed,
             &self.callbacks,
             RawBlocksHandler::default(),
         )
-        .await?;
+        .await;
+        guard.invalidate_on_err(&result);
+        let blocks = result?;
         metric_guard.succeed();
         Ok(blocks)
     }

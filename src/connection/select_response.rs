@@ -3,11 +3,12 @@ use crate::connection::block_reader::{
 };
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::io::{
-    read_exception, read_profile_info_packet, read_progress_packet, read_varint_async,
+    packet_read_timeout, read_exception, read_profile_info_packet, read_progress_packet,
+    read_varint_async,
 };
 use crate::connection::raw_block_reader::read_raw_data_block;
 use crate::connection::server_packets::{
-    handle_coordinator_packet, read_part_uuids_update, read_timezone_update,
+    cancel_and_drain, handle_coordinator_packet, read_part_uuids_update, read_timezone_update,
     unsupported_server_packet,
 };
 use crate::error::Result;
@@ -48,15 +49,33 @@ pub(super) trait SelectResponseHandler {
 }
 
 pub(super) async fn read_select_response<H: SelectResponseHandler>(
-    stream: &mut crate::pool::StreamWrapper, recv_timeout: Duration, response_compressed: bool,
+    stream: &mut crate::pool::StreamWrapper, recv_timeout: Duration,
+    deadline: Option<crate::runtime::time::Instant>, response_compressed: bool,
     callbacks: &QueryCallbacks, mut handler: H,
 ) -> Result<H::Output> {
     loop {
-        let typ = match crate::runtime::time::timeout(recv_timeout, read_varint_async(stream)).await
-        {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(crate::error::Error::Protocol("timeout".into())),
+        let typ = match packet_read_timeout(recv_timeout, deadline) {
+            Some(per_read) => {
+                match crate::runtime::time::timeout(per_read, read_varint_async(stream)).await {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        if deadline.is_some() {
+                            cancel_and_drain(stream, recv_timeout, response_compressed).await?;
+                            return Err(crate::error::Error::Timeout(
+                                "query exceeded deadline".into(),
+                            ));
+                        }
+                        return Err(crate::error::Error::Protocol("timeout".into()));
+                    },
+                }
+            },
+            None => {
+                cancel_and_drain(stream, recv_timeout, response_compressed).await?;
+                return Err(crate::error::Error::Timeout(
+                    "query exceeded deadline".into(),
+                ));
+            },
         };
         match typ {
             1 => handler.on_data(stream, response_compressed).await?,

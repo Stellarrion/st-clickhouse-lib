@@ -1,16 +1,18 @@
-//! Connection pool using `crate::runtime::sync::Semaphore` — no `std::sync::Mutex`, no manual wakers.
+//! Connection pool with per-slot async mutexes and round-robin selection.
 //!
 //! Architecture:
-//!   - `Semaphore` with N permits (one per slot) — controls slot acquisition
-//!   - Per-slot `crate::runtime::sync::Mutex` — protects the `Option<Connection>`
-//!   - Atomic round-robin index — assigns slots without a free-list mutex
+//!   - Per-slot `crate::runtime::sync::Mutex` — guards each `Option<Connection>`
+//!   - Atomic round-robin index (`next_idx`) — assigns slots without a free-list
+//!     lock
 //!
-//! No blocking mutex in any async path. Zero contention between concurrent users
-//! (each locks a different slot). `PoolGuard::drop` releases a semaphore permit,
-//! which wakes the next waiter — no manual waker management.
+//! No blocking mutex in any async path. Each concurrent user typically locks a
+//! different slot; when more callers contend than there are slots, the wait for
+//! a free slot is optionally bounded by `acquire_timeout` (default: unbounded).
+//! `PoolGuard::drop` drops the slot guard, waking the next waiter.
 
 use crate::error::Result;
 use crate::protocol::handshake;
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::revision;
 use crate::runtime::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::runtime::sync::{Mutex as AsyncMutex, MutexGuard};
@@ -50,7 +52,21 @@ pub(crate) struct StreamWrapper {
     chunk_fill: usize,
     len_buf: [u8; 4],
     len_pos: usize,
+    /// Raw-framing prefetch buffer. Bytes read ahead from the socket and served
+    /// across many small reads, so byte-wise reads don't each hit the socket.
+    /// Only used when `!use_chunked_recv` (the chunked path buffers
+    /// length-prefixed frames in `chunk`). Prefetched bytes are later packets
+    /// of the same response, consumed in order by subsequent reads; after
+    /// EndOfStream the buffer is drained and the server sends nothing more.
+    rd_buf: Box<[u8]>,
+    rd_pos: usize,
+    rd_fill: usize,
 }
+
+/// Capacity of the raw-framing read prefetch buffer. Bytes read ahead from
+/// the socket are served to many small reads (varints, block headers, string
+/// bodies) without each polling the socket.
+const READ_BUF_CAP: usize = 8 * 1024;
 
 impl AsyncRead for StreamWrapper {
     fn poll_read(
@@ -59,13 +75,7 @@ impl AsyncRead for StreamWrapper {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
         if !this.use_chunked_recv {
-            let before = buf.remaining();
-            let poll = poll_inner_read(&mut this.inner, cx, buf);
-            if let std::task::Poll::Ready(Ok(())) = &poll {
-                let n = before.saturating_sub(buf.remaining());
-                this.record_bytes(n);
-            }
-            return poll;
+            return read_buffered(this, cx, buf);
         }
 
         loop {
@@ -145,6 +155,47 @@ fn poll_inner_read(
     }
 }
 
+/// Raw-framing read: serve prefetched bytes first; when drained, bulk-prefetch
+/// up to [`READ_BUF_CAP`] bytes from the socket and loop to drain. Prefetched
+/// bytes belong to later packets of the same response and are consumed in order
+/// by subsequent reads, so nothing is lost across reads.
+fn read_buffered(
+    this: &mut StreamWrapper, cx: &mut std::task::Context<'_>,
+    buf: &mut crate::runtime::io::ReadBuf<'_>,
+) -> std::task::Poll<std::io::Result<()>> {
+    loop {
+        if this.rd_pos < this.rd_fill {
+            let n = buf.remaining().min(this.rd_fill - this.rd_pos);
+            if n == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&this.rd_buf[this.rd_pos..this.rd_pos + n]);
+            this.rd_pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        // Buffer fully consumed (rd_pos >= rd_fill) — prefetch a full run from
+        // the socket. Only commit rd_pos/rd_fill AFTER a successful read: a
+        // Pending or EOF return must leave the (empty) buffer state untouched so
+        // the next poll refills instead of re-serving consumed bytes.
+        let cap = this.rd_buf.len();
+        let filled = {
+            let mut rd = crate::runtime::io::ReadBuf::new(&mut this.rd_buf[..]);
+            match poll_inner_read(&mut this.inner, cx, &mut rd) {
+                std::task::Poll::Ready(Ok(())) => cap - rd.remaining(),
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        };
+        this.rd_pos = 0;
+        this.rd_fill = filled;
+        if filled == 0 {
+            // Clean EOF: report it (read_exact callers turn this into UnexpectedEof).
+            return std::task::Poll::Ready(Ok(()));
+        }
+        this.record_bytes(filled);
+    }
+}
+
 impl AsyncWrite for StreamWrapper {
     fn poll_write(
         self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8],
@@ -190,6 +241,9 @@ impl StreamWrapper {
             chunk_fill: 0,
             len_buf: [0; 4],
             len_pos: 0,
+            rd_buf: vec![0u8; READ_BUF_CAP].into_boxed_slice(),
+            rd_pos: 0,
+            rd_fill: 0,
         }
     }
 
@@ -206,6 +260,9 @@ impl StreamWrapper {
             chunk_fill: 0,
             len_buf: [0; 4],
             len_pos: 0,
+            rd_buf: vec![0u8; READ_BUF_CAP].into_boxed_slice(),
+            rd_pos: 0,
+            rd_fill: 0,
         }
     }
 
@@ -216,6 +273,10 @@ impl StreamWrapper {
         self.chunk_pos = 0;
         self.chunk_fill = 0;
         self.len_pos = 0;
+        // Drop any raw-framing prefetch so toggling modes mid-life can't serve
+        // stale bytes from the other path's buffer.
+        self.rd_pos = 0;
+        self.rd_fill = 0;
     }
 
     pub(crate) fn set_metrics(&mut self, metrics: Option<&'static crate::metrics::Metrics>) {
@@ -283,6 +344,9 @@ pub(crate) struct Connection {
     pub(crate) server_info: handshake::ServerInfo,
     /// When this connection was established. Used for TTL-based recycling.
     pub(crate) created_at: crate::runtime::time::Instant,
+    /// When this connection was last returned to the pool (went idle). Used to
+    /// decide whether the next acquire needs a liveness Ping.
+    pub(crate) last_used_at: crate::runtime::time::Instant,
     /// Pool configuration generation this connection was opened with.
     config_generation: u64,
 }
@@ -292,6 +356,7 @@ struct RawConnectConfig<'a> {
     user: &'a str,
     password: &'a str,
     database: &'a str,
+    quota_key: &'a str,
     send_timeout: Option<std::time::Duration>,
     ssh_signer: Option<&'a handshake::SshSigner>,
     #[cfg(feature = "tokio-tls")]
@@ -350,7 +415,7 @@ async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
     // Addendum (rev >= 54458)
     if server_info.negotiated_revision >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM {
         let mut buf = Vec::new();
-        crate::protocol::wire::write_string(&mut buf, "")?; // quota_key
+        crate::protocol::wire::write_string(&mut buf, config.quota_key)?; // quota_key
         if server_info.negotiated_revision
             >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS
         {
@@ -373,7 +438,7 @@ async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
         stream.set_send_timeout(Some(timeout));
     }
     // Ping
-    stream.write_packet(&[4]).await?;
+    stream.write_packet(&[ClientPacket::Ping as u8]).await?;
     stream.flush().await?;
     let mut pkt = [0u8; 1];
     stream.read_exact(&mut pkt).await?;
@@ -384,6 +449,7 @@ async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
         stream,
         server_info,
         created_at: crate::runtime::time::Instant::now(),
+        last_used_at: crate::runtime::time::Instant::now(),
         config_generation: 0,
     })
 }
@@ -477,7 +543,7 @@ fn choose_chunked_mode(
 // SimplePool
 // ---------------------------------------------------------------------------
 
-/// A semaphore-based pool of ClickHouse connections.
+/// A pool of ClickHouse connections with per-slot async mutexes.
 ///
 /// Slots are assigned round-robin via an atomic counter. Each slot holds
 /// `Option<Connection>` and is lazily connected on first use.
@@ -489,9 +555,16 @@ pub(crate) struct SimplePool {
     config_generation: AtomicU64,
     ttl: std::time::Duration,
     connect_timeout: Option<Duration>,
+    /// Max wait for a free slot in `get()` (None = unbounded, today's behaviour).
+    acquire_timeout: Option<Duration>,
+    /// Connections reused within this idle window skip the acquire-time
+    /// Ping/Pong. Default 15s; `ZERO` pings on every acquire.
+    ping_idle_threshold: Duration,
     user: String,
     password: String,
     database: String,
+    /// Quota key sent in ClientInfo and the handshake addendum (rev >= 54458).
+    quota_key: String,
     ssh_signer: Option<handshake::SshSigner>,
     /// Addresses marked dead after connection failure, with cooldown expiry.
     dead_addrs: parking_lot::Mutex<HashMap<std::net::SocketAddr, Instant>>,
@@ -526,9 +599,12 @@ impl SimplePool {
             config_generation: AtomicU64::new(0),
             ttl: std::time::Duration::ZERO,
             connect_timeout: None,
+            acquire_timeout: None,
+            ping_idle_threshold: Duration::from_secs(15),
             user: String::from("default"),
             password: String::new(),
             database: String::new(),
+            quota_key: String::new(),
             ssh_signer: None,
             dead_addrs: parking_lot::Mutex::new(HashMap::new()),
             failure_counts: parking_lot::Mutex::new(HashMap::new()),
@@ -557,6 +633,17 @@ impl SimplePool {
     pub(crate) fn set_send_timeout(&mut self, t: Option<Duration>) {
         self.send_timeout = t;
         self.bump_config_generation();
+    }
+
+    /// Set the max wait for a free pool slot. `None` = unbounded (default).
+    pub(crate) fn set_acquire_timeout(&mut self, t: Option<Duration>) {
+        self.acquire_timeout = t;
+    }
+
+    /// Set the idle threshold for the acquire-time liveness Ping. Connections
+    /// reused within `t` skip the Ping; `ZERO` pings on every acquire.
+    pub(crate) fn set_ping_idle_threshold(&mut self, t: Duration) {
+        self.ping_idle_threshold = t;
     }
 
     /// Set the hostname for periodic DNS refresh. Pass `None` to disable.
@@ -621,6 +708,21 @@ impl SimplePool {
     pub(crate) fn set_database(&mut self, database: &str) {
         self.database = database.to_owned();
         self.bump_config_generation();
+    }
+
+    /// Set the quota key sent in ClientInfo and the handshake addendum.
+    ///
+    /// Bumps the config generation so pooled connections reconnect and the
+    /// handshake addendum carries the new key (same semantics as
+    /// [`set_database`](Self::set_database)).
+    pub(crate) fn set_quota_key(&mut self, quota_key: &str) {
+        self.quota_key = quota_key.to_owned();
+        self.bump_config_generation();
+    }
+
+    /// Current quota key (sent in ClientInfo and the handshake addendum).
+    pub(crate) fn quota_key(&self) -> &str {
+        &self.quota_key
     }
 
     /// Set SSH-key authentication signer for the handshake.
@@ -696,6 +798,7 @@ impl SimplePool {
                 user: &self.user,
                 password: &self.password,
                 database: &self.database,
+                quota_key: &self.quota_key,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
                 tls_config: self.tls_config.clone(),
@@ -708,6 +811,7 @@ impl SimplePool {
                 user: &self.user,
                 password: &self.password,
                 database: &self.database,
+                quota_key: &self.quota_key,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
             })
@@ -756,14 +860,37 @@ impl SimplePool {
     pub(crate) async fn get(&self) -> Result<PoolGuard<'_>> {
         // Round-robin slot selection
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        let mut slot_guard = self.slots[idx].lock().await;
+        let mut slot_guard = match self.acquire_timeout {
+            Some(t) => match crate::runtime::time::timeout(t, self.slots[idx].lock()).await {
+                Ok(g) => g,
+                Err(_) => {
+                    if let Some(m) = self.metrics {
+                        m.connection_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(crate::error::Error::PoolTimeout(format!(
+                        "no connection slot available within {t:?}"
+                    )));
+                },
+            },
+            None => self.slots[idx].lock().await,
+        };
         if slot_guard.is_none() {
             *slot_guard = Some(self.connect_round_robin().await?);
         }
         let should_reconnect = if let Some(conn) = slot_guard.as_mut() {
-            Self::connection_expired(conn, self.ttl)
-                || self.connection_config_stale(conn)
-                || !is_connection_alive(conn).await
+            let expired = Self::connection_expired(conn, self.ttl);
+            let stale = self.connection_config_stale(conn);
+            if expired || stale {
+                true
+            } else {
+                // Skip the Ping/Pong round-trip for connections reused within
+                // the idle threshold: a recently used socket is trusted, with
+                // TCP keepalive (set per-socket) and the query itself surfacing
+                // any breakage. Idle connections past the threshold are pinged
+                // to catch sockets dropped by the server or a proxy.
+                should_liveness_ping(conn.last_used_at.elapsed(), self.ping_idle_threshold)
+                    && !is_connection_alive(conn).await
+            }
         } else {
             true
         };
@@ -814,7 +941,8 @@ impl Drop for SimplePool {
                 if let Some(ref conn) = *guard {
                     // Send Cancel packet to gracefully close server-side query
                     if let Some(tcp) = conn.stream.raw_tcp() {
-                        let _: std::io::Result<usize> = tcp.try_write(&[3u8]);
+                        let _: std::io::Result<usize> =
+                            tcp.try_write(&[ClientPacket::Cancel as u8]);
                     }
                 }
             }
@@ -824,8 +952,22 @@ impl Drop for SimplePool {
     }
 }
 
+/// Whether a pooled connection needs an acquire-time Ping/Pong.
+///
+/// Returns true only when the connection has been idle for at least `threshold`
+/// — recently used sockets are trusted. `threshold == ZERO` always returns true
+/// (ping on every acquire).
+fn should_liveness_ping(idle: Duration, threshold: Duration) -> bool {
+    idle >= threshold
+}
+
 async fn is_connection_alive(conn: &mut Connection) -> bool {
-    if conn.stream.write_packet(&[4]).await.is_err() {
+    if conn
+        .stream
+        .write_packet(&[ClientPacket::Ping as u8])
+        .await
+        .is_err()
+    {
         return false;
     }
     if conn.stream.flush().await.is_err() {
@@ -870,12 +1012,28 @@ impl<'a> PoolGuard<'a> {
             None => std::process::abort(),
         }
     }
+
+    /// If `result` is a connection-fatal error, drop the underlying connection
+    /// so the next `get()` reconnects instead of reusing a broken socket.
+    /// Keeps a failed socket from being trusted by the idle-threshold Ping skip.
+    pub(crate) fn invalidate_on_err<T>(&mut self, result: &crate::error::Result<T>) {
+        if let Err(e) = result
+            && e.is_broken_connection()
+        {
+            let _ = self.take_stream();
+        }
+    }
 }
 
 impl Drop for PoolGuard<'_> {
     fn drop(&mut self) {
         if let Some(metrics) = self.metrics {
             metrics.pool_in_use.fetch_sub(1, Ordering::Relaxed);
+        }
+        // Record when this connection went back to idle so the next acquire
+        // can decide whether a liveness Ping is warranted.
+        if let Some(conn) = self._guard.as_mut() {
+            conn.last_used_at = crate::runtime::time::Instant::now();
         }
     }
 }
@@ -917,6 +1075,24 @@ mod tests {
     }
 
     #[test]
+    fn quota_key_default_empty_and_setter_stores() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test address should parse");
+        let mut pool = SimplePool::new(vec![addr], 1);
+        assert!(pool.quota_key().is_empty(), "default quota_key is empty");
+
+        let gen_before = pool.config_generation.load(Ordering::Relaxed);
+        pool.set_quota_key("tenant-42");
+        assert_eq!(pool.quota_key(), "tenant-42");
+        // set_quota_key bumps the generation so pooled connections reconnect.
+        assert!(
+            pool.config_generation.load(Ordering::Relaxed) > gen_before,
+            "set_quota_key must bump config_generation"
+        );
+    }
+
+    #[test]
     fn test_set_send_timeout() {
         let addr = "127.0.0.1:9000"
             .parse::<std::net::SocketAddr>()
@@ -927,6 +1103,66 @@ mod tests {
         assert_eq!(pool.send_timeout, Some(Duration::from_secs(10)));
         pool.set_send_timeout(None);
         assert!(pool.send_timeout.is_none());
+    }
+
+    #[test]
+    fn test_acquire_timeout_defaults_none() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let pool = SimplePool::new(vec![addr], 2);
+        assert!(pool.acquire_timeout.is_none());
+    }
+
+    #[test]
+    fn test_set_acquire_timeout() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 2);
+        pool.set_acquire_timeout(Some(Duration::from_millis(50)));
+        assert_eq!(pool.acquire_timeout, Some(Duration::from_millis(50)));
+        pool.set_acquire_timeout(None);
+        assert!(pool.acquire_timeout.is_none());
+    }
+
+    #[test]
+    fn test_ping_idle_threshold_default_and_setter() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 2);
+        // Default: trust connections reused within 15s, ping only after idle.
+        assert_eq!(pool.ping_idle_threshold, Duration::from_secs(15));
+        pool.set_ping_idle_threshold(Duration::from_secs(60));
+        assert_eq!(pool.ping_idle_threshold, Duration::from_secs(60));
+        // ZERO restores the old always-ping behaviour.
+        pool.set_ping_idle_threshold(Duration::ZERO);
+        assert_eq!(pool.ping_idle_threshold, Duration::ZERO);
+    }
+
+    #[test]
+    fn should_liveness_ping_only_after_idle_threshold() {
+        // Recently used → trust, skip the round-trip.
+        assert!(!should_liveness_ping(
+            Duration::ZERO,
+            Duration::from_secs(15)
+        ));
+        assert!(!should_liveness_ping(
+            Duration::from_secs(14),
+            Duration::from_secs(15)
+        ));
+        // Idle at/over the threshold → ping.
+        assert!(should_liveness_ping(
+            Duration::from_secs(15),
+            Duration::from_secs(15)
+        ));
+        assert!(should_liveness_ping(
+            Duration::from_secs(60),
+            Duration::from_secs(15)
+        ));
+        // ZERO threshold = always ping (old behaviour).
+        assert!(should_liveness_ping(Duration::ZERO, Duration::ZERO));
     }
 
     #[test]
@@ -1005,7 +1241,7 @@ mod tests {
             .insert(addr, Instant::now() - Duration::from_secs(1));
         assert!(!pool.dead_addrs.lock().is_empty());
 
-        // After acquiring a semaphore permit, we can send a "ping" packet to
+        // After acquiring a slot, we can send a "ping" packet to
         // the server.  In this test we only verify that the dead_addrs map
         // can be cleaned.  The connect_round_robin loop itself calls
         // dead.retain(|_, expiry| *expiry > Instant::now()) which prunes
@@ -1024,5 +1260,25 @@ mod tests {
             .expect("test operation failed");
         let pool = SimplePool::new(vec![addr], 5);
         assert_eq!(pool.slot_count(), 5);
+    }
+
+    /// Server-free proof that `get()` honours `acquire_timeout`: hold the only
+    /// slot from the test, so `get()` cannot acquire it and must time out.
+    /// The outer probe bound makes RED fail fast instead of hanging.
+    #[tokio::test]
+    async fn test_acquire_timeout_returns_pool_timeout_when_slot_contended() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 1);
+        pool.set_acquire_timeout(Some(Duration::from_millis(20)));
+        // Occupy the single slot; `get()` (round-robin idx 0) cannot lock it.
+        let _held = pool.slots[0].lock().await;
+
+        let res = crate::runtime::time::timeout(Duration::from_secs(2), pool.get()).await;
+        // `PoolGuard` isn't `Debug`, so the message is static. Use `assert!`
+        // rather than `panic!` (the crate denies `clippy::panic`).
+        assert!(
+            matches!(res, Ok(Err(crate::error::Error::PoolTimeout(_)))),
+            "expected PoolTimeout, got Ok(connection), other error, or probe elapsed"
+        );
     }
 }

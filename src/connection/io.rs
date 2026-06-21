@@ -4,9 +4,11 @@ use crate::client_info::{
 use crate::compression::CompressionMethod;
 use crate::connection::callbacks::{Profile, Progress};
 use crate::error::Result;
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::revision;
 use crate::protocol::wire;
 use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
+use crate::runtime::time::Instant;
 use std::collections::HashMap;
 
 const MAX_STRING_BYTES: usize = 0x00FF_FFFF;
@@ -16,6 +18,28 @@ pub(crate) fn compression_flag(compression: Option<CompressionMethod>) -> u64 {
     match compression {
         Some(CompressionMethod::Lz4 | CompressionMethod::Zstd) => 1,
         Some(CompressionMethod::None) | None => 0,
+    }
+}
+
+/// Per-read timeout for a packet loop: the smaller of `recv_timeout` and the
+/// time remaining until `deadline` (if set).
+///
+/// Returns `None` when the deadline has already elapsed — the caller must
+/// treat the query as timed out (cancel + drain + `Error::Timeout`).
+#[inline]
+pub(crate) fn packet_read_timeout(
+    recv_timeout: std::time::Duration, deadline: Option<Instant>,
+) -> Option<std::time::Duration> {
+    match deadline {
+        None => Some(recv_timeout),
+        Some(d) => {
+            let remaining = d.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                None
+            } else {
+                Some(std::cmp::min(recv_timeout, remaining))
+            }
+        },
     }
 }
 
@@ -108,12 +132,13 @@ pub(crate) struct QueryPacketCommonTemplate {
 
 pub(crate) fn build_query_packet_common_template(
     settings: &HashMap<String, String>, compression: Option<CompressionMethod>, rev: u64,
+    quota_key: &str,
 ) -> QueryPacketCommonTemplate {
     let mut prefix = Vec::with_capacity(4);
     wire::write_varint_to_vec(&mut prefix, 1); // ClientCode::Query
 
     let client_info = (rev >= revision::DBMS_MIN_REVISION_WITH_CLIENT_INFO)
-        .then(|| build_client_info_template(rev));
+        .then(|| build_client_info_template(rev, quota_key));
 
     let mut before_query = Vec::with_capacity(256);
     write_protocol_default_settings(&mut before_query, settings, rev);
@@ -162,7 +187,7 @@ pub(crate) fn write_query_packet_common_from_template(
 }
 
 pub(crate) async fn ping_stream(stream: &mut crate::pool::StreamWrapper) -> Result<()> {
-    stream.write_packet(&[4]).await?;
+    stream.write_packet(&[ClientPacket::Ping as u8]).await?;
     stream.flush().await?;
     let mut pkt = [0u8; 1];
     stream.read_exact(&mut pkt).await?;
@@ -539,14 +564,16 @@ pub(crate) async fn read_offsets_column<
 >(
     stream: &mut S, rows: usize, name: &str,
 ) -> Result<(Vec<u8>, usize)> {
+    // Offsets are `rows` contiguous little-endian u64s on the wire — read them
+    // in one shot instead of one read_exact per row, then scan for the max.
+    let nbytes = checked_len(rows, 8)?;
+    let mut offsets = vec![0u8; nbytes];
+    stream.read_exact(&mut offsets).await?;
     let mut total = 0usize;
-    let mut offsets = Vec::with_capacity(checked_len(rows, 8)?);
-    for _ in 0..rows {
-        let mut offset = [0u8; 8];
-        stream.read_exact(&mut offset).await?;
-        let value = checked_usize(u64::from_le_bytes(offset), name)?;
-        total = total.max(value);
-        offsets.extend_from_slice(&offset);
+    for chunk in offsets.chunks_exact(8) {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(chunk);
+        total = total.max(checked_usize(u64::from_le_bytes(b), name)?);
     }
     Ok((offsets, total))
 }
@@ -569,6 +596,30 @@ pub(crate) fn checked_len(rows: usize, width: usize) -> Result<usize> {
 pub(crate) fn checked_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| crate::error::Error::Protocol(format!("{name} count too large")))
+}
+
+/// Validate a LowCardinality header and derive the per-row index width.
+///
+/// The 24-byte header carries a `version` (must be 1) and a `serial_type`
+/// whose low 2 bits are the index width shift and whose bits 8/9 carry the
+/// "global dictionaries" (unsupported) and "additional keys" (required) flags.
+pub(crate) fn lc_idx_width(version: u64, serial_type: u64) -> Result<usize> {
+    if version != 1 {
+        return Err(crate::error::Error::Protocol(format!(
+            "unsupported LowCardinality key serialization version {version}"
+        )));
+    }
+    if (serial_type & (1u64 << 8)) != 0 {
+        return Err(crate::error::Error::Protocol(
+            "LowCardinality global dictionaries are not supported".into(),
+        ));
+    }
+    if (serial_type & (1u64 << 9)) == 0 {
+        return Err(crate::error::Error::Protocol(
+            "LowCardinality additional keys flag is missing".into(),
+        ));
+    }
+    Ok(1usize << (serial_type & 0x3))
 }
 
 pub(crate) fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
@@ -654,4 +705,74 @@ async fn discard_exact<
         len -= n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::packet_read_timeout;
+    use crate::runtime::time::Instant;
+    use std::time::Duration;
+
+    #[test]
+    fn no_deadline_returns_recv_timeout() {
+        assert_eq!(
+            packet_read_timeout(Duration::from_secs(300), None),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn deadline_far_returns_recv_timeout() {
+        let dl = Instant::now() + Duration::from_secs(600);
+        assert_eq!(
+            packet_read_timeout(Duration::from_secs(300), Some(dl)),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn deadline_near_returns_remaining() {
+        let dl = Instant::now() + Duration::from_millis(10);
+        let got = packet_read_timeout(Duration::from_secs(300), Some(dl));
+        assert!(got.is_some());
+        assert!(got.expect("checked is_some above") <= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn deadline_expired_returns_none() {
+        let dl = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            packet_read_timeout(Duration::from_secs(300), Some(dl)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod offset_read_tests {
+    use super::read_offsets_column;
+    use crate::runtime::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_offsets_column_reads_all_and_finds_max() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        // 3 little-endian u64 offsets: 2, 7, 4 — the max is 7.
+        let bytes: Vec<u8> = [2u64, 7, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        tx.write_all(&bytes).await.expect("write offsets");
+        let (offsets, total) = read_offsets_column(&mut rx, 3, "test")
+            .await
+            .expect("read offsets");
+        assert_eq!(offsets, bytes);
+        assert_eq!(total, 7);
+    }
+
+    #[tokio::test]
+    async fn read_offsets_column_zero_rows_is_empty() {
+        let (_tx, mut rx) = tokio::io::duplex(8);
+        let (offsets, total) = read_offsets_column(&mut rx, 0, "test")
+            .await
+            .expect("read offsets");
+        assert!(offsets.is_empty());
+        assert_eq!(total, 0);
+    }
 }

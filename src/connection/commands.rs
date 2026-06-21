@@ -5,6 +5,7 @@ use crate::connection::server_packets::write_ignored_part_uuids_if_any;
 use crate::connection::tcp::Client;
 use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
+use crate::protocol::packet::ClientPacket;
 use crate::protocol::parameters::QueryParameter;
 use crate::runtime::io::AsyncWriteExt;
 use crate::schema::query_may_change_schema;
@@ -38,13 +39,16 @@ impl Client {
     pub async fn execute_with_params_and_ignored_part_uuids(
         &self, query: &str, params: &[QueryParameter], uuids: &[[u8; 16]],
     ) -> Result<()> {
+        let deadline = self
+            .query_timeout
+            .map(|t| crate::runtime::time::Instant::now() + t);
         let span = info_span!("execute", query = %query, retries = self.send_retries);
         async {
             let metric_guard = QueryMetricGuard::new(self.metrics(), 1);
             let retries = self.send_retries.max(1);
             for attempt in 0..retries {
                 match self
-                    ._execute_with_params_and_ignored_part_uuids(query, params, uuids)
+                    ._execute_with_params_and_ignored_part_uuids(query, params, uuids, deadline)
                     .await
                 {
                     Ok(r) => {
@@ -52,7 +56,10 @@ impl Client {
                         return Ok(r);
                     },
                     Err(e) => {
-                        if !e.is_retryable() || attempt + 1 >= retries {
+                        if !e.is_retryable()
+                            || attempt + 1 >= retries
+                            || (deadline.is_some() && e.is_timeout())
+                        {
                             return Err(e);
                         }
                         metric_guard.retry();
@@ -82,6 +89,7 @@ impl Client {
 
     async fn _execute_with_params_and_ignored_part_uuids(
         &self, query: &str, params: &[QueryParameter], uuids: &[[u8; 16]],
+        deadline: Option<crate::runtime::time::Instant>,
     ) -> Result<()> {
         let mut guard = self.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
@@ -108,6 +116,7 @@ impl Client {
             stream,
             self.recv_timeout,
             compression_flag(self.compression) == 1,
+            deadline,
         )
         .await?;
         if query_may_change_schema(query) {
@@ -120,7 +129,7 @@ impl Client {
     pub async fn cancel(&self) -> Result<()> {
         let mut guard = self.pool.get().await?;
         let stream = guard.stream_mut();
-        stream.write_packet(&[3]).await?;
+        stream.write_packet(&[ClientPacket::Cancel as u8]).await?;
         stream.flush().await?;
         Ok(())
     }

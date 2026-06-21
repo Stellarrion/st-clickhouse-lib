@@ -98,7 +98,7 @@ try:
     from st_clickhouse._native import __version__ as _native_version
     __version__ = _native_version
 except ImportError:
-    __version__ = "0.1.0"
+    __version__ = "0.2.0"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -270,7 +270,7 @@ class Client:
             ``query()`` is best for small to medium result sets (up to ~100K rows).
             For larger results, use ``query_blocks()`` or ``query_tuples()``
             to avoid building a large list of dicts.
-        """""
+        """
         self._check_open()
         bound_params = _merge_query_params(params, kwargs)
         return _with_per_query_settings(

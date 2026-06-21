@@ -66,3 +66,4 @@ Thumbs.db
 # Generated integration-test assets
 tests/tls/.generated/
 tests/ssh/.generated/
+.serena/

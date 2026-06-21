@@ -2,14 +2,28 @@ mod common;
 
 use st_clickhouse::{Client, DynamicFieldValue, RawBlocks, RowCount};
 
-#[tokio::test]
-async fn query_raw_returns_native_block_body() {
-    let client = match Client::connect(common::clickhouse_addr()).await {
+async fn connect() -> Client {
+    let addr = common::clickhouse_addr();
+    // Env override for non-default users (e.g. CLICKHOUSE_USER=honne CLICKHOUSE_PASSWORD=honne).
+    if let (Ok(user), Ok(password)) = (
+        std::env::var("CLICKHOUSE_USER"),
+        std::env::var("CLICKHOUSE_PASSWORD"),
+    ) {
+        return Client::connect_with_credentials(addr, &user, &password)
+            .await
+            .expect("test operation failed");
+    }
+    match Client::connect(addr).await {
         Ok(client) => client,
-        Err(_) => Client::connect_with_credentials(common::clickhouse_addr(), "default", "test")
+        Err(_) => Client::connect_with_credentials(addr, "default", "test")
             .await
             .expect("test operation failed"),
-    };
+    }
+}
+
+#[tokio::test]
+async fn query_raw_returns_native_block_body() {
+    let client = connect().await;
     let blocks = client
         .query_raw("SELECT number FROM system.numbers LIMIT 3")
         .await
@@ -38,12 +52,7 @@ async fn query_raw_returns_native_block_body() {
 
 #[tokio::test]
 async fn materialized_variant_and_dynamic_have_typed_accessors() {
-    let client = match Client::connect(common::clickhouse_addr()).await {
-        Ok(client) => client,
-        Err(_) => Client::connect_with_credentials(common::clickhouse_addr(), "default", "test")
-            .await
-            .expect("test operation failed"),
-    };
+    let client = connect().await;
 
     match client
         .query("SELECT CAST(1 AS Variant(UInt8, String)) AS v")
@@ -85,12 +94,7 @@ async fn materialized_variant_and_dynamic_have_typed_accessors() {
 
 #[tokio::test]
 async fn query_raw_handles_nested_json_dynamic_layouts_when_server_supports_them() {
-    let client = match Client::connect(common::clickhouse_addr()).await {
-        Ok(client) => client,
-        Err(_) => Client::connect_with_credentials(common::clickhouse_addr(), "default", "test")
-            .await
-            .expect("test operation failed"),
-    };
+    let client = connect().await;
 
     for sql in [
         "SELECT CAST([toUInt8(1), toUInt8(2)] AS Dynamic) AS d",
@@ -122,12 +126,7 @@ async fn query_raw_handles_nested_json_dynamic_layouts_when_server_supports_them
 
 #[tokio::test]
 async fn query_raw_handles_json_dynamic_variant_when_server_supports_them() {
-    let client = match Client::connect(common::clickhouse_addr()).await {
-        Ok(client) => client,
-        Err(_) => Client::connect_with_credentials(common::clickhouse_addr(), "default", "test")
-            .await
-            .expect("test operation failed"),
-    };
+    let client = connect().await;
 
     for sql in [
         "SELECT CAST(1 AS Variant(UInt8, String)) AS v",

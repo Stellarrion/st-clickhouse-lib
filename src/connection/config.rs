@@ -14,6 +14,18 @@ impl Client {
         self
     }
 
+    /// Set the quota key sent in ClientInfo and the handshake addendum.
+    ///
+    /// Used by ClickHouse for quota accounting (multi-tenant). The key is sent
+    /// on the wire both in the per-query ClientInfo block and in the connection
+    /// handshake addendum. Pooled connections reconnect so the addendum carries
+    /// the new key. `""` by default (no quota key).
+    pub fn with_quota_key(mut self, key: &str) -> Self {
+        self.pool.set_quota_key(key);
+        self.refresh_query_template();
+        self
+    }
+
     /// Control Native JSON serialization for materialized query results.
     ///
     /// Enabled by default to match clickhouse-cpp. Pass `false` to opt back into
@@ -63,9 +75,45 @@ impl Client {
         self
     }
 
+    /// Set the maximum time to wait for a free pool slot.
+    ///
+    /// When set, an acquisition that cannot get a free slot within `t` returns
+    /// [`Error::PoolTimeout`](crate::error::Error::PoolTimeout) (retryable).
+    /// `None` by default — unbounded wait, today's behaviour.
+    pub fn with_acquire_timeout(mut self, t: Duration) -> Self {
+        self.pool.set_acquire_timeout(Some(t));
+        self
+    }
+
+    /// Set the idle threshold for the acquire-time liveness Ping.
+    ///
+    /// Connections reused within `t` skip the Ping/Pong round-trip (the hot
+    /// path for back-to-back queries); connections idle longer than `t` are
+    /// still pinged to catch sockets dropped by the server or a proxy. Default
+    /// 15s. Pass `Duration::ZERO` to ping on every acquire (the historical
+    /// behaviour).
+    pub fn with_ping_idle_threshold(mut self, t: Duration) -> Self {
+        self.pool.set_ping_idle_threshold(t);
+        self
+    }
+
     /// Set receive timeout.
     pub fn with_recv_timeout(mut self, t: Duration) -> Self {
         self.recv_timeout = t;
+        self
+    }
+
+    /// Set a whole-query wall-clock timeout.
+    ///
+    /// When set, a query that has not fully completed (read through
+    /// `EndOfStream`) within `t` is cancelled server-side and returns
+    /// [`Error::Timeout`](crate::error::Error::Timeout). The connection is
+    /// drained and returned to the pool alive. `None` by default.
+    ///
+    /// This bounds the *response-read* phase. INSERT data uploads (`send_data`)
+    /// are bounded separately by [`Client::with_send_timeout`].
+    pub fn with_query_timeout(mut self, t: Duration) -> Self {
+        self.query_timeout = Some(t);
         self
     }
 
@@ -86,6 +134,7 @@ impl Client {
             &self.settings,
             self.compression,
             revision::DEFAULT_PROTOCOL_REVISION,
+            self.pool.quota_key(),
         );
     }
 
@@ -119,16 +168,7 @@ impl Client {
     /// encrypted.
     #[cfg(feature = "tokio-tls")]
     pub fn with_tls(mut self, domain: &str) -> Result<Self> {
-        // Use platform-native certificate store
-        let mut root_store = rustls::RootCertStore::empty();
-        let cert_result = rustls_native_certs::load_native_certs();
-        if !cert_result.errors.is_empty() {
-            // Log but don't fail — system may have partial certs
-            eprintln!("rustls-native-certs warnings: {:?}", cert_result.errors);
-        }
-        for cert in cert_result.certs {
-            let _ = root_store.add(cert);
-        }
+        let root_store = native_root_store()?;
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -146,4 +186,29 @@ impl Client {
         self.pool.set_tls(config, domain);
         self
     }
+}
+
+/// Build a root certificate store from the platform's native trust store.
+///
+/// Logs any partial-load warnings via `tracing` and returns an error if the
+/// resulting store is empty — a misconfigured system must not silently degrade
+/// into "trust nothing", which rustls would otherwise surface only as opaque
+/// handshake failures. Supply a custom config via [`Client::with_tls_config`]
+/// when the system store is intentionally unavailable.
+#[cfg(feature = "tokio-tls")]
+pub(crate) fn native_root_store() -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        tracing::warn!(errors = ?cert_result.errors, "rustls-native-certs: partial cert load");
+    }
+    for cert in cert_result.certs {
+        let _ = root_store.add(cert);
+    }
+    if root_store.is_empty() {
+        return Err(crate::error::Error::Config(
+            "no trusted root certificates found in the system store; use Client::with_tls_config() to supply a custom config".into(),
+        ));
+    }
+    Ok(root_store)
 }

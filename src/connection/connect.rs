@@ -24,6 +24,7 @@ impl Client {
     }
 
     pub(crate) fn from_pool(pool: crate::pool::SimplePool) -> Self {
+        let quota_key = pool.quota_key().to_owned();
         Self {
             pool,
             settings: HashMap::new(),
@@ -31,6 +32,7 @@ impl Client {
                 &HashMap::new(),
                 None,
                 revision::DEFAULT_PROTOCOL_REVISION,
+                &quota_key,
             ),
             compression: None,
             ping_before_query: false,
@@ -39,6 +41,7 @@ impl Client {
             retry_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(30),
             recv_timeout: Duration::from_secs(300),
+            query_timeout: None,
             schema_cache: Arc::new(RwLock::new(HashMap::<String, TableSchema>::new())),
             validate_schema: false,
         }
@@ -106,14 +109,7 @@ impl Client {
     pub async fn connect_tls(
         addr: impl crate::runtime::net::ToSocketAddrs, domain: &str,
     ) -> Result<Self> {
-        let mut root_store = rustls::RootCertStore::empty();
-        let cert_result = rustls_native_certs::load_native_certs();
-        if !cert_result.errors.is_empty() {
-            eprintln!("rustls-native-certs warnings: {:?}", cert_result.errors);
-        }
-        for cert in cert_result.certs {
-            let _ = root_store.add(cert);
-        }
+        let root_store = crate::connection::config::native_root_store()?;
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();

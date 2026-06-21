@@ -22,8 +22,12 @@ fn query_template_matches_dynamic_packet_builder() {
     settings.insert("max_block_size".to_string(), "1024".to_string());
     let compression = Some(CompressionMethod::Lz4);
 
-    let template =
-        build_query_packet_template(&settings, compression, revision::DEFAULT_PROTOCOL_REVISION);
+    let template = build_query_packet_template(
+        &settings,
+        compression,
+        revision::DEFAULT_PROTOCOL_REVISION,
+        "",
+    );
     let templated = build_query_packet_from_template(&template, "SELECT 1", b"", true, &[]);
     let dynamic = build_query_packet(&template, "SELECT 1", &[], b"", &[]);
 
@@ -34,7 +38,7 @@ fn query_template_matches_dynamic_packet_builder() {
 fn query_packet_defaults_json_to_string_serialization() {
     let settings = HashMap::new();
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(&template, "SELECT 1", &[], b"", &[]);
     let setting_name =
         crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING.as_bytes();
@@ -51,7 +55,7 @@ fn query_packet_serializes_server_side_parameters() {
     let settings = HashMap::new();
     let query = "SELECT {id:UInt64}, {name:String}";
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(
         &template,
         query,
@@ -89,7 +93,7 @@ fn explicit_json_serialization_setting_is_not_duplicated() {
         "0".to_string(),
     );
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(&template, "SELECT 1", &[], b"", &[]);
     let setting_name =
         crate::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING.as_bytes();
@@ -345,7 +349,7 @@ fn test_build_query_packet_template_returns_valid_structure() {
     let mut settings = HashMap::new();
     settings.insert("max_threads".to_string(), "4".to_string());
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet_from_template(&template, "SELECT 1", b"test-id", true, &[]);
     // Should contain the query text
     assert!(packet.windows(8).any(|w| w == b"SELECT 1"));
@@ -364,7 +368,7 @@ fn test_build_query_packet_template_returns_valid_structure() {
 fn test_build_query_packet_with_empty_query() {
     let settings = HashMap::new();
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let packet = build_query_packet(&template, "", &[], b"", &[]);
     assert!(!packet.is_empty());
     assert!(packet.contains(&2)); // trailing empty Data packet
@@ -374,7 +378,7 @@ fn test_build_query_packet_with_empty_query() {
 fn test_query_kind_detection_create() {
     let settings = HashMap::new();
     let template =
-        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION);
+        build_query_packet_template(&settings, None, revision::DEFAULT_PROTOCOL_REVISION, "");
     let pkt = build_query_packet(
         &template,
         "CREATE TABLE foo (x UInt64) ENGINE = Memory",
@@ -394,6 +398,7 @@ fn test_client() -> Client {
             &HashMap::new(),
             None,
             revision::DEFAULT_PROTOCOL_REVISION,
+            "",
         ),
         compression: None,
         ping_before_query: false,
@@ -402,7 +407,103 @@ fn test_client() -> Client {
         retry_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(30),
         recv_timeout: Duration::from_secs(300),
+        query_timeout: None,
         schema_cache: Arc::new(RwLock::new(HashMap::new())),
         validate_schema: false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// StreamWrapper raw-framing read buffer
+// ---------------------------------------------------------------------------
+
+async fn spawn_server(
+    payload: Vec<u8>, trickle: Option<std::time::Duration>,
+) -> std::net::SocketAddr {
+    use crate::runtime::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        if let Some(delay) = trickle {
+            for b in &payload {
+                let _ = sock.write_all(&[*b]).await;
+                tokio::time::sleep(delay).await;
+            }
+        } else {
+            let _ = sock.write_all(&payload).await;
+        }
+        // hold the socket briefly so reads don't race ahead of writes
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn stream_wrapper_serves_bytes_across_tiny_reads() {
+    use crate::runtime::io::AsyncReadExt;
+    let payload: Vec<u8> = (0..300u32).flat_map(|v| v.to_le_bytes()).collect();
+    let addr = spawn_server(payload.clone(), None).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = vec![0u8; payload.len()];
+    for i in 0..payload.len() {
+        sw.read_exact(&mut got[i..i + 1]).await.expect("read byte");
+    }
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn stream_wrapper_read_exact_spans_refills() {
+    use crate::runtime::io::AsyncReadExt;
+    // Larger than the 8 KiB prefetch buffer → exercises multiple refills.
+    let payload = vec![0xA5u8; 50_000];
+    let addr = spawn_server(payload.clone(), None).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = vec![0u8; payload.len()];
+    sw.read_exact(&mut got).await.expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn stream_wrapper_handles_trickled_writes() {
+    // Server writes one byte at a time → client refills return partial data and
+    // Pending, exercising the refill state machine. A state bug (committing
+    // rd_pos before a successful read) would re-serve consumed bytes here.
+    use crate::runtime::io::AsyncReadExt;
+    let payload: Vec<u8> = (0..100u8).collect();
+    let addr = spawn_server(payload.clone(), Some(std::time::Duration::from_millis(2))).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = vec![0u8; payload.len()];
+    sw.read_exact(&mut got).await.expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn stream_wrapper_propagates_eof() {
+    use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let _ = sock.write_all(&[1, 2, 3]).await;
+        let _ = sock.shutdown().await;
+    });
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut sw = crate::pool::StreamWrapper::tcp(tcp);
+    let mut got = [0u8; 3];
+    sw.read_exact(&mut got).await.expect("read 3");
+    assert_eq!(&got, &[1, 2, 3]);
+    // After EOF the next read must error, not re-serve consumed bytes.
+    let err = sw
+        .read_exact(&mut [0u8; 1])
+        .await
+        .expect_err("expected EOF");
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
 }

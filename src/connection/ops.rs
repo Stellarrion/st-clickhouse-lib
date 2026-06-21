@@ -1,5 +1,6 @@
 use crate::connection::tcp::Client;
 use crate::error::Result;
+use crate::protocol::packet::ClientPacket;
 use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
 
 impl Client {
@@ -7,7 +8,7 @@ impl Client {
     pub async fn ping(&self) -> Result<()> {
         let mut guard = self.pool.get().await?;
         let stream = guard.stream_mut();
-        stream.write_packet(&[4]).await?;
+        stream.write_packet(&[ClientPacket::Ping as u8]).await?;
         stream.flush().await?;
         let mut pkt = [0u8; 1];
         stream.read_exact(&mut pkt).await?;

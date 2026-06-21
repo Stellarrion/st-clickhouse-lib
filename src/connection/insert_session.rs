@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::block::Block;
 use crate::runtime::io::AsyncWriteExt;
-use crate::schema::TableSchema;
+use crate::schema::{TableSchema, quote_identifier_path};
 use std::time::Duration;
 
 pub struct InsertSession<'a> {
@@ -15,6 +15,7 @@ pub struct InsertSession<'a> {
     block: Option<Block>,
     active: bool,
     recv_timeout: Duration,
+    deadline: Option<crate::runtime::time::Instant>,
     compression: Option<CompressionMethod>,
     table_name: String,
     schema: Option<TableSchema>,
@@ -29,7 +30,8 @@ impl Client {
         } else {
             None
         };
-        let query = format!("INSERT INTO {} FORMAT Native", table);
+        let quoted = quote_identifier_path(table)?;
+        let query = format!("INSERT INTO {quoted} FORMAT Native");
         let mut guard = self.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
         let mut query_id_buf = [0u8; 22];
@@ -51,13 +53,18 @@ impl Client {
         stream.write_packet(&pkt).await?;
         stream.flush().await?;
         let response_compressed = compression_flag(self.compression) == 1;
-        let block = read_table_structure(stream, self.recv_timeout, response_compressed).await?;
+        let deadline = self
+            .query_timeout
+            .map(|t| crate::runtime::time::Instant::now() + t);
+        let block =
+            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await?;
         metric_guard.succeed();
         Ok(InsertSession {
             guard,
             block: Some(block),
             active: true,
             recv_timeout: self.recv_timeout,
+            deadline,
             compression: self.compression,
             table_name: table.to_owned(),
             schema,
@@ -116,6 +123,7 @@ impl InsertSession<'_> {
             stream,
             self.recv_timeout,
             compression_flag(self.compression) == 1,
+            self.deadline,
         )
         .await
     }
