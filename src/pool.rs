@@ -294,6 +294,7 @@ struct RawConnectConfig<'a> {
     user: &'a str,
     password: &'a str,
     database: &'a str,
+    quota_key: &'a str,
     send_timeout: Option<std::time::Duration>,
     ssh_signer: Option<&'a handshake::SshSigner>,
     #[cfg(feature = "tokio-tls")]
@@ -352,7 +353,7 @@ async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
     // Addendum (rev >= 54458)
     if server_info.negotiated_revision >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM {
         let mut buf = Vec::new();
-        crate::protocol::wire::write_string(&mut buf, "")?; // quota_key
+        crate::protocol::wire::write_string(&mut buf, config.quota_key)?; // quota_key
         if server_info.negotiated_revision
             >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS
         {
@@ -496,6 +497,8 @@ pub(crate) struct SimplePool {
     user: String,
     password: String,
     database: String,
+    /// Quota key sent in ClientInfo and the handshake addendum (rev >= 54458).
+    quota_key: String,
     ssh_signer: Option<handshake::SshSigner>,
     /// Addresses marked dead after connection failure, with cooldown expiry.
     dead_addrs: parking_lot::Mutex<HashMap<std::net::SocketAddr, Instant>>,
@@ -534,6 +537,7 @@ impl SimplePool {
             user: String::from("default"),
             password: String::new(),
             database: String::new(),
+            quota_key: String::new(),
             ssh_signer: None,
             dead_addrs: parking_lot::Mutex::new(HashMap::new()),
             failure_counts: parking_lot::Mutex::new(HashMap::new()),
@@ -633,6 +637,21 @@ impl SimplePool {
         self.bump_config_generation();
     }
 
+    /// Set the quota key sent in ClientInfo and the handshake addendum.
+    ///
+    /// Bumps the config generation so pooled connections reconnect and the
+    /// handshake addendum carries the new key (same semantics as
+    /// [`set_database`](Self::set_database)).
+    pub(crate) fn set_quota_key(&mut self, quota_key: &str) {
+        self.quota_key = quota_key.to_owned();
+        self.bump_config_generation();
+    }
+
+    /// Current quota key (sent in ClientInfo and the handshake addendum).
+    pub(crate) fn quota_key(&self) -> &str {
+        &self.quota_key
+    }
+
     /// Set SSH-key authentication signer for the handshake.
     pub(crate) fn set_ssh_signer(&mut self, user: &str, signer: handshake::SshSigner) {
         self.user.zeroize();
@@ -706,6 +725,7 @@ impl SimplePool {
                 user: &self.user,
                 password: &self.password,
                 database: &self.database,
+                quota_key: &self.quota_key,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
                 tls_config: self.tls_config.clone(),
@@ -718,6 +738,7 @@ impl SimplePool {
                 user: &self.user,
                 password: &self.password,
                 database: &self.database,
+                quota_key: &self.quota_key,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
             })
@@ -943,6 +964,24 @@ mod tests {
         let pool = SimplePool::new(addrs, 2);
         assert_eq!(pool.addrs.read().len(), 3);
         assert_eq!(pool.slots.len(), 2);
+    }
+
+    #[test]
+    fn quota_key_default_empty_and_setter_stores() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test address should parse");
+        let mut pool = SimplePool::new(vec![addr], 1);
+        assert!(pool.quota_key().is_empty(), "default quota_key is empty");
+
+        let gen_before = pool.config_generation.load(Ordering::Relaxed);
+        pool.set_quota_key("tenant-42");
+        assert_eq!(pool.quota_key(), "tenant-42");
+        // set_quota_key bumps the generation so pooled connections reconnect.
+        assert!(
+            pool.config_generation.load(Ordering::Relaxed) > gen_before,
+            "set_quota_key must bump config_generation"
+        );
     }
 
     #[test]
