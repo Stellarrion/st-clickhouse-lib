@@ -490,6 +490,9 @@ pub(crate) async fn read_varint_async<
         let mut byte = [0u8; 1];
         stream.read_exact(&mut byte).await?;
         let b = byte[0];
+        if shift == 63 && (b & 0x7F) > 1 {
+            return Err(crate::error::Error::Protocol("varint overflow".into()));
+        }
         result |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
             return Ok(result);
@@ -745,6 +748,21 @@ mod timeout_tests {
             packet_read_timeout(Duration::from_secs(300), Some(dl)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod varint_read_tests {
+    use super::read_varint_async;
+    use crate::runtime::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_varint_async_rejects_tenth_byte_overflow() {
+        let (mut tx, mut rx) = tokio::io::duplex(16);
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02];
+        tx.write_all(&bytes).await.expect("write varint");
+        let result = read_varint_async(&mut rx).await;
+        assert!(result.is_err(), "10th-byte overflow must error: {result:?}");
     }
 }
 

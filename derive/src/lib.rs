@@ -225,6 +225,10 @@ fn expand_derive(input: &DeriveInput) -> syn::Result<TokenStream> {
             const COLUMN_NAMES: &'static [&'static str] = &[#(#col_names),*];
             const COLUMN_COUNT: usize = #col_count;
 
+            fn from_columns_by_name() -> bool {
+                true
+            }
+
             fn from_row(block: &st_clickhouse::Block, row_index: usize) -> st_clickhouse::Result<Self> {
                 Ok(#name {
                     #(#from_row_fields,)*

@@ -1443,9 +1443,19 @@ fn read_varint_into<R: Read>(reader: &mut R, data: &mut Vec<u8>) -> Result<u64> 
     let mut r = 0u64;
     let mut shift = 0;
     loop {
+        if shift >= 64 {
+            return Err(crate::sync::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
+        }
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
         data.push(byte[0]);
+        if shift == 63 && (byte[0] & 0x7F) > 1 {
+            return Err(crate::sync::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
+        }
         r |= ((byte[0] & 0x7F) as u64) << shift;
         if byte[0] & 0x80 == 0 {
             return Ok(r);
@@ -1688,6 +1698,16 @@ mod tests {
         wire::write_varint(buf, 0).expect("test operation failed"); // BlockInfo terminator
         wire::write_varint(buf, 0).expect("test operation failed"); // columns
         wire::write_varint(buf, 0).expect("test operation failed"); // rows
+    }
+
+    #[test]
+    fn read_varint_into_rejects_overlong_and_tenth_byte_overflow() {
+        let mut recorded = Vec::new();
+        let overflow = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02];
+        assert!(read_varint_into(&mut &overflow[..], &mut recorded).is_err());
+
+        let mut recorded = Vec::new();
+        assert!(read_varint_into(&mut &[0x80u8; 11][..], &mut recorded).is_err());
     }
 
     #[test]

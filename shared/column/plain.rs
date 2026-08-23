@@ -516,12 +516,26 @@ impl<'a, T: PlainColumn + Copy> PlainColumnData<'a, T> {
     }
 
     /// Read from a byte slice with a given number of elements.
-    pub fn read_from_bytes(bytes: &'a [u8], count: usize) -> Self {
-        PlainColumnData {
+    ///
+    /// Fails when `count` elements of `size_of::<T>()` bytes do not fit in
+    /// `bytes`: a safe constructor must never hand out a column whose
+    /// logical length exceeds its backing bytes, because `get()`/`as_slice()`
+    /// would then read out of bounds.
+    pub fn read_from_bytes(bytes: &'a [u8], count: usize) -> Result<Self> {
+        let nbytes = count.checked_mul(size_of::<T>()).ok_or_else(|| {
+            Error::Protocol("PlainColumnData: element count overflows byte length".into())
+        })?;
+        if nbytes > bytes.len() {
+            return Err(Error::Protocol(format!(
+                "PlainColumnData: {count} elements need {nbytes} bytes, backing slice has {}",
+                bytes.len()
+            )));
+        }
+        Ok(PlainColumnData {
             buf: bytes,
             count,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Number of elements.
@@ -541,13 +555,28 @@ impl<'a, T: PlainColumn + Copy> PlainColumnData<'a, T> {
                 self.count
             )));
         }
-        let offset = index * size_of::<T>();
-        let ptr = self.buf[offset..].as_ptr() as *const T;
+        // Even though the constructors preserve count * size <= buf.len(),
+        // re-check the byte window here so a malformed internal state can
+        // only produce an error, never an out-of-bounds read.
+        let offset = index.checked_mul(size_of::<T>()).ok_or_else(|| {
+            super::super::error::Error::Protocol(
+                "PlainColumnData: index byte offset overflow".into(),
+            )
+        })?;
+        let src = self
+            .buf
+            .get(offset..)
+            .and_then(|rest| rest.get(..size_of::<T>()))
+            .ok_or_else(|| {
+                super::super::error::Error::Protocol(
+                    "PlainColumnData: buffer shorter than logical length".into(),
+                )
+            })?;
         // SAFETY:
         // - T: PlainColumn guarantees any bit pattern is valid (no Undef)
         // - read_unaligned handles any alignment (safe on x86/ARM)
-        // - bounds check above ensures offset + size_of<T>() <= buf.len()
-        Ok(unsafe { ptr.read_unaligned() })
+        // - the byte-window check above proves a full element is in bounds
+        Ok(unsafe { src.as_ptr().cast::<T>().read_unaligned() })
     }
 
     /// Get all values as a slice — only when the buffer is properly aligned.
@@ -556,11 +585,18 @@ impl<'a, T: PlainColumn + Copy> PlainColumnData<'a, T> {
         if self.count == 0 {
             return Some(&[]);
         }
+        // count * size_of::<T>() must stay within the backing bytes; the
+        // constructors enforce it, this check keeps the unsafe projection
+        // sound even if the invariant were ever broken.
+        let nbytes = self.count.checked_mul(size_of::<T>())?;
+        if nbytes > self.buf.len() {
+            return None;
+        }
         let ptr = self.buf.as_ptr() as *const T;
         if (ptr as usize) % align_of::<T>() == 0 {
             // SAFETY: T: PlainColumn guarantees valid bit pattern + no padding.
-            // Alignment is verified above. Size is count * size_of::<T>() which
-            // matches buf.len() (validated in read_column).
+            // Alignment is verified above. Size is count * size_of::<T>(),
+            // proven within buf.len() by the check above.
             Some(unsafe { std::slice::from_raw_parts(ptr, self.count) })
         } else {
             None
@@ -842,11 +878,11 @@ impl ClickHouseColumn for JsonValue {
         let mut offsets = Vec::with_capacity(ctx.rows);
         let mut data = Vec::new();
         for _ in 0..ctx.rows {
-            let (l, consumed) = read_varint_from_slice(&ctx.buf[ctx.pos..]);
-            ctx.pos += consumed;
-            let _start = data.len();
-            data.extend_from_slice(&ctx.buf[ctx.pos..ctx.pos + l]);
-            ctx.pos += l;
+            let (len, consumed) = read_varint_from_slice(&ctx.buf[ctx.pos..])?;
+            ctx.pos = ctx.pos.checked_add(consumed).ok_or_else(|| {
+                super::super::error::Error::Protocol("JSON column position overflow".into())
+            })?;
+            data.extend_from_slice(ctx.read_exact(len)?);
             offsets.push(data.len() as u64);
         }
         Ok(JsonColumnData::new(offsets, data))
@@ -860,22 +896,32 @@ impl ClickHouseColumn for JsonValue {
 }
 
 /// Read a LEB128 varint from a byte slice, returning (value, bytes_consumed).
-fn read_varint_from_slice(data: &[u8]) -> (usize, usize) {
+fn read_varint_from_slice(data: &[u8]) -> Result<(usize, usize)> {
     let mut result = 0u64;
     let mut shift = 0;
-    let mut consumed = 0;
-    for &b in data {
-        consumed += 1;
-        result |= ((b & 0x7F) as u64) << shift;
-        if b & 0x80 == 0 {
-            return (result as usize, consumed);
+    for (index, &byte) in data.iter().enumerate() {
+        if shift == 63 && (byte & 0x7F) > 1 {
+            return Err(super::super::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
+        }
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            let value = usize::try_from(result).map_err(|_| {
+                super::super::error::Error::Protocol("length does not fit usize".into())
+            })?;
+            return Ok((value, index + 1));
         }
         shift += 7;
         if shift >= 64 {
-            break;
+            return Err(super::super::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
         }
     }
-    (result as usize, consumed)
+    Err(super::super::error::Error::Protocol(
+        "unexpected end of data in varint".into(),
+    ))
 }
 
 /// Write a string with varint prefix (matching `wire::write_string`).
@@ -1286,6 +1332,27 @@ mod tests {
     }
 
     #[test]
+    fn test_json_column_rejects_malformed_lengths_without_panicking() {
+        let overflow = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02,
+        ];
+        let mut ctx = ReadColumnContext {
+            rows: 1,
+            pos: 0,
+            buf: &overflow,
+        };
+        assert!(JsonValue::read_column(&mut ctx).is_err());
+
+        let truncated = [10u8, b'a'];
+        let mut ctx = ReadColumnContext {
+            rows: 1,
+            pos: 0,
+            buf: &truncated,
+        };
+        assert!(JsonValue::read_column(&mut ctx).is_err());
+    }
+
+    #[test]
     fn test_plain_column_aligned() {
         // Aligned buffer — as_slice() should work
         let bytes = 1u64
@@ -1339,6 +1406,29 @@ mod tests {
         };
         assert!(data.get(0).is_ok());
         assert!(data.get(1).is_err());
+    }
+
+    #[test]
+    fn read_from_bytes_rejects_len_beyond_backing_bytes() {
+        let bytes = [0u8; 8]; // room for exactly one u64
+        // Two elements claimed, one fits: the safe constructor must refuse,
+        // otherwise get(1)/as_slice() would read out of bounds.
+        let res = PlainColumnData::<u64>::read_from_bytes(&bytes, 2);
+        assert!(res.is_err(), "count beyond backing bytes must error, got {res:?}");
+        // usize::MAX elements overflows the byte-length product.
+        let res = PlainColumnData::<u64>::read_from_bytes(&bytes, usize::MAX);
+        assert!(res.is_err(), "overflowing count must error, got {res:?}");
+        // Exact fit still works and stays readable.
+        let col = PlainColumnData::<u64>::read_from_bytes(&bytes, 1)
+            .expect("one element fits");
+        assert_eq!(col.len(), 1);
+        assert_eq!(
+            col.get(0).expect("in-bounds element"),
+            u64::from_le_bytes(bytes)
+        );
+        // Empty column over empty (or any) bytes is fine.
+        let col = PlainColumnData::<u64>::read_from_bytes(&bytes, 0).expect("zero rows fit");
+        assert!(col.is_empty());
     }
 
     #[test]

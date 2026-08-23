@@ -215,3 +215,97 @@ async fn test_fetch_nullable() {
     assert_eq!(rows[3].0, None);
     eprintln!("SUCCESS: Nullable<UInt8> via fetch_all!");
 }
+
+// ── Derived-row fast path: SELECT column order vs struct order ──
+
+#[derive(st_clickhouse::Row)]
+struct ReorderedIdValue {
+    id: u64,
+    value: u64,
+}
+
+fn u64_column(name: &str, vals: &[u64]) -> st_clickhouse::protocol::block::ColumnInfo {
+    let mut data = Vec::with_capacity(vals.len() * 8);
+    for v in vals {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    st_clickhouse::protocol::block::ColumnInfo {
+        name: name.to_string(),
+        type_name: "UInt64".to_string(),
+        data: bytes::Bytes::from(data),
+        lc_materialized: bytes::Bytes::new(),
+    }
+}
+
+/// Server-free: the fast path must reorder once per block instead of
+/// silently swapping same-typed fields when SELECT order differs.
+#[test]
+fn test_derive_read_all_reordered_columns_not_swapped() {
+    use st_clickhouse::row::read_all;
+    let block = st_clickhouse::protocol::block::Block {
+        columns: vec![
+            u64_column("value", &[10, 20, 30]),
+            u64_column("id", &[1, 2, 3]),
+        ],
+        rows: 3,
+    };
+    let rows: Vec<ReorderedIdValue> = read_all(&block).expect("read_all");
+    assert_eq!(rows.len(), 3);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.id, i as u64 + 1, "id must come from the id column");
+        assert_eq!(row.value, (i as u64 + 1) * 10, "value must stay paired");
+    }
+}
+
+/// Matching column order keeps the ordered fast path.
+#[test]
+fn test_derive_read_all_matching_order_uses_fast_path() {
+    use st_clickhouse::row::read_all;
+    let block = st_clickhouse::protocol::block::Block {
+        columns: vec![
+            u64_column("id", &[1, 2, 3]),
+            u64_column("value", &[10, 20, 30]),
+        ],
+        rows: 3,
+    };
+    let rows: Vec<ReorderedIdValue> = read_all(&block).expect("read_all");
+    assert_eq!(rows.len(), 3);
+    assert_eq!((rows[0].id, rows[0].value), (1, 10));
+    assert_eq!((rows[2].id, rows[2].value), (3, 30));
+}
+
+/// End to end against a live server: SELECT returns (value, id) while the
+/// struct declares (id, value).
+#[tokio::test]
+async fn test_derive_all_reordered_columns_not_swapped() {
+    let client = common::connect_client().await;
+    let rows: Vec<ReorderedIdValue> = client
+        .query("SELECT toUInt64(2) AS value, toUInt64(1) AS id FROM system.numbers LIMIT 1")
+        .all()
+        .await
+        .expect("test operation failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 1, "id must map by name, not position");
+    assert_eq!(rows[0].value, 2, "value must map by name, not position");
+}
+
+// ── execute(): server exceptions must propagate ──
+
+#[tokio::test]
+async fn test_execute_returns_server_exception() {
+    // A one-slot pool also proves the connection remains synchronized after
+    // the exception: the follow-up query must reuse this same slot.
+    let client = common::connect_client_pool(1).await;
+    let err = client
+        .execute("SELECT nonexistent_function_xyz()")
+        .await
+        .expect_err("invalid query must surface the server exception");
+    assert!(err.is_server_error(), "expected ServerError, got: {err:?}");
+
+    let value: u64 = client
+        .query("SELECT toUInt64(1)")
+        .scalar()
+        .await
+        .expect("connection must remain usable after a server exception");
+    assert_eq!(value, 1);
+}

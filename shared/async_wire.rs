@@ -8,6 +8,9 @@ pub async fn async_read_varint<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u
     loop {
         reader.read_exact(&mut byte).await?;
         let b = byte[0];
+        if shift == 63 && (b & 0x7F) > 1 {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
         result |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
             return Ok(result);

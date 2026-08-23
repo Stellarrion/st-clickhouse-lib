@@ -103,10 +103,11 @@ pub(super) async fn drain_response(
             1 => {
                 let _ = read_data_block_maybe_compressed(stream, response_compressed).await;
             },
-            2 => {
-                let _ = read_exception(stream).await;
-                return Ok(());
-            },
+            // A server exception terminates the response for execute()/INSERT
+            // end(): surface it (mirrors read_select_response). The
+            // best-effort cancellation drain in cancel_and_drain stays
+            // lenient on purpose.
+            2 => return Err(read_exception(stream).await?),
             3 => {
                 let _ = read_progress_packet(stream).await;
             },
@@ -131,5 +132,95 @@ pub(super) async fn drain_response(
             },
             _ => return Err(unsupported_server_packet(stream, typ).await?),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_response;
+    use crate::error::Error;
+    use crate::runtime::io::AsyncWriteExt;
+    use std::time::Duration;
+
+    fn put_varint(buf: &mut Vec<u8>, v: u64) {
+        crate::connection::io::encode_varint(buf, v);
+    }
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        put_varint(buf, s.len() as u64);
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// Wire bytes for an Exception packet (type 2) with no nested exception.
+    fn exception_packet(code: i32, name: &str, message: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        put_varint(&mut buf, 2); // ServerPacket::Exception
+        buf.extend_from_slice(&code.to_le_bytes());
+        put_string(&mut buf, name);
+        put_string(&mut buf, message);
+        put_string(&mut buf, ""); // stack trace
+        buf.push(0); // has_nested = false
+        buf
+    }
+
+    /// Client-side `StreamWrapper` fed by a one-shot local TCP server that
+    /// writes `payload` and holds the socket open briefly.
+    async fn stream_with_payload(payload: Vec<u8>) -> crate::pool::StreamWrapper {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener local addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept client");
+            sock.write_all(&payload).await.expect("write payload");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        crate::pool::StreamWrapper::tcp(tcp)
+    }
+
+    #[tokio::test]
+    async fn drain_response_propagates_server_exception() {
+        let payload = exception_packet(60, "DB::Exception", "unknown function xyz");
+        let mut stream = stream_with_payload(payload).await;
+        let err = drain_response(&mut stream, Duration::from_secs(5), false, None)
+            .await
+            .expect_err("server exception must propagate as Err");
+        assert!(
+            matches!(err, Error::ServerError { code: 60, .. }),
+            "expected ServerError code 60, got {err:?}"
+        );
+        let Error::ServerError { message, .. } = &err else {
+            unreachable!("matched ServerError above");
+        };
+        assert!(
+            message.contains("unknown function xyz"),
+            "message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_response_end_of_stream_stays_ok() {
+        let payload = vec![5u8]; // EndOfStream
+        let mut stream = stream_with_payload(payload).await;
+        drain_response(&mut stream, Duration::from_secs(5), false, None)
+            .await
+            .expect("EndOfStream drains to Ok");
+    }
+
+    #[tokio::test]
+    async fn cancel_and_drain_stays_best_effort_on_exception() {
+        // The cancellation drain must keep swallowing exceptions: it runs
+        // after a deadline trip where the Timeout error is already decided.
+        let mut payload = exception_packet(159, "DB::Exception", "cancelled");
+        payload.push(5); // EndOfStream
+        let mut stream = stream_with_payload(payload).await;
+        crate::connection::server_packets::cancel_and_drain(
+            &mut stream,
+            Duration::from_secs(5),
+            false,
+        )
+        .await
+        .expect("best-effort cancellation drain returns Ok on exception");
     }
 }

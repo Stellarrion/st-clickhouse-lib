@@ -134,6 +134,11 @@ fn read_varint_from_slice(data: &[u8]) -> Result<(u64, usize)> {
     let mut consumed = 0;
     for &byte in data.iter() {
         consumed += 1;
+        if shift == 63 && (byte & 0x7F) > 1 {
+            return Err(super::super::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
+        }
         result |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             return Ok((result, consumed));

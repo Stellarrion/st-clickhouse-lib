@@ -22,6 +22,16 @@ pub trait Row: Sized {
 
     fn from_row(block: &Block, row_index: usize) -> Result<Self>;
 
+    /// Whether [`from_columns`](Self::from_columns) expects columns in
+    /// [`COLUMN_NAMES`](Self::COLUMN_NAMES) order rather than block order.
+    ///
+    /// The derive opts in because derived structs map fields by name. The
+    /// default stays positional for compatibility with existing manual
+    /// implementations and tuple rows.
+    fn from_columns_by_name() -> bool {
+        false
+    }
+
     /// Fast path: construct from pre-extracted column data.
     /// Override for zero per-row column dispatch overhead.
     fn from_columns(_columns: &[&AnyColumnData<'_>], _row_index: usize) -> Result<Self> {

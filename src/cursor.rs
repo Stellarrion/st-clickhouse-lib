@@ -77,49 +77,39 @@ impl<T: Row> RowCursor<T> {
 
 /// Materialize a LowCardinality column into the inner type's wire format.
 /// Called from the connection task when reading LC columns.
+///
+/// Mirrors the checked sync implementation: every count coming from the wire
+/// is validated with checked arithmetic and per-row bounds checks, so crafted
+/// dictionary or index data returns [`crate::error::Error::Protocol`] instead
+/// of panicking (slice indexing, `chunks`, capacity overflow) or silently
+/// producing misaligned output.
 pub fn materialize_lc_inner(
     dict_data: &[u8], inner: &crate::protocol::type_parser::ColumnType, indexes: &[u8],
     idx_width: usize, num_idx: usize,
 ) -> Result<Vec<u8>> {
+    use crate::error::Error;
     use crate::protocol::type_parser::ColumnType::*;
+    if num_idx > 0 {
+        // Bound `num_idx` by the physically present index bytes: this keeps
+        // every later `num_idx * width` product input-proportional.
+        let needed = num_idx
+            .checked_mul(idx_width)
+            .ok_or_else(|| Error::Protocol("LowCardinality index byte length overflow".into()))?;
+        if indexes.len() < needed {
+            return Err(Error::Protocol(format!(
+                "LowCardinality index data truncated: need {needed} bytes, have {}",
+                indexes.len()
+            )));
+        }
+    }
     match inner {
         UInt8 | Int8 | Bool | Enum8 => {
-            let w = inner.fixed_width().unwrap_or(1);
-            let entries: Vec<_> = dict_data
-                .chunks(w)
-                .map(|c| {
-                    let mut a = [0u8; 8];
-                    a[..c.len()].copy_from_slice(c);
-                    a
-                })
-                .collect();
-            let mut out = Vec::with_capacity(num_idx * w);
-            for i in 0..num_idx {
-                let idx = read_lc_idx(indexes, i, idx_width);
-                let v = entries.get(idx).copied().unwrap_or_default();
-                out.extend_from_slice(&v[..w]);
-            }
-            Ok(out)
+            materialize_lc_fixed(dict_data, 1, indexes, idx_width, num_idx)
         },
-        UInt16 | Int16 | Date | Date32 | Enum16 => {
-            let w = 2;
-            let entries: Vec<_> = dict_data
-                .chunks(w)
-                .map(|c| {
-                    let mut a = [0u8; 4];
-                    a[..2].copy_from_slice(c);
-                    a
-                })
-                .collect();
-            let mut out = Vec::with_capacity(num_idx * w);
-            for i in 0..num_idx {
-                let idx = read_lc_idx(indexes, i, idx_width);
-                let v = entries.get(idx).copied().unwrap_or_default();
-                out.extend_from_slice(&v[..w]);
-            }
-            Ok(out)
+        UInt16 | Int16 | Date | Enum16 => {
+            materialize_lc_fixed(dict_data, 2, indexes, idx_width, num_idx)
         },
-        UInt32 | Int32 | Float32 | DateTime | IPv4 => {
+        UInt32 | Int32 | Float32 | Date32 | DateTime | IPv4 => {
             materialize_lc_fixed(dict_data, 4, indexes, idx_width, num_idx)
         },
         UInt64 | Int64 | Float64 | DateTime64(_) => {
@@ -133,11 +123,18 @@ pub fn materialize_lc_inner(
             let mut offsets = Vec::new();
             let mut pos = 0usize;
             while pos < dict_data.len() {
-                let (len, consumed) = read_varint_bytes(&dict_data[pos..]);
+                let (len, consumed) = read_varint_bytes(&dict_data[pos..])?;
                 pos += consumed;
-                let end = pos + len as usize;
+                let len = usize::try_from(len).map_err(|_| {
+                    Error::Protocol("LowCardinality string length too large".into())
+                })?;
+                let end = pos.checked_add(len).ok_or_else(|| {
+                    Error::Protocol("LowCardinality string length overflow".into())
+                })?;
                 if end > dict_data.len() {
-                    break;
+                    return Err(Error::Protocol(
+                        "LowCardinality string dictionary is truncated".into(),
+                    ));
                 }
                 offsets.push((pos, end));
                 pos = end;
@@ -145,13 +142,14 @@ pub fn materialize_lc_inner(
             let mut out = Vec::new();
             for i in 0..num_idx {
                 let idx = read_lc_idx(indexes, i, idx_width);
-                if let Some(&(start, end)) = offsets.get(idx) {
-                    let l = end - start;
-                    encode_varint_to(&mut out, l as u64);
-                    out.extend_from_slice(&dict_data[start..end]);
-                } else {
-                    encode_varint_to(&mut out, 0);
-                }
+                let Some(&(start, end)) = offsets.get(idx) else {
+                    return Err(Error::Protocol(
+                        "LowCardinality dictionary index out of bounds".into(),
+                    ));
+                };
+                let l = end - start;
+                encode_varint_to(&mut out, l as u64);
+                out.extend_from_slice(&dict_data[start..end]);
             }
             Ok(out)
         },
@@ -178,22 +176,52 @@ pub fn materialize_lc_inner(
 fn materialize_lc_fixed(
     dict: &[u8], es: usize, idxs: &[u8], iw: usize, ni: usize,
 ) -> Result<Vec<u8>> {
-    let entries: Vec<_> = dict.chunks(es).collect();
-    let mut out = Vec::with_capacity(ni * es);
+    use crate::error::Error;
+    if ni == 0 || es == 0 {
+        return Ok(Vec::new());
+    }
+    if dict.len() < es {
+        // No complete entry exists, so every index would be out of bounds;
+        // erroring here also bounds the capacity reservation by the input.
+        return Err(Error::Protocol(
+            "LowCardinality dictionary smaller than one entry".into(),
+        ));
+    }
+    let cap = ni
+        .checked_mul(es)
+        .ok_or_else(|| Error::Protocol("LowCardinality materialized size overflow".into()))?;
+    let mut out = Vec::with_capacity(cap);
     for i in 0..ni {
         let idx = read_lc_idx(idxs, i, iw);
-        if let Some(v) = entries.get(idx) {
-            out.extend_from_slice(v);
-        } else {
-            out.extend(vec![0u8; es]);
-        }
+        let start = idx
+            .checked_mul(es)
+            .ok_or_else(|| Error::Protocol("LowCardinality dictionary index overflow".into()))?;
+        let end = start
+            .checked_add(es)
+            .ok_or_else(|| Error::Protocol("LowCardinality dictionary index overflow".into()))?;
+        let Some(entry) = dict.get(start..end) else {
+            return Err(Error::Protocol(
+                "LowCardinality dictionary index out of bounds".into(),
+            ));
+        };
+        out.extend_from_slice(entry);
     }
     Ok(out)
 }
 
+/// Read the `i`-th index from LowCardinality index data.
+///
+/// Lenient by design (returns 0 for out-of-range bytes or unsupported
+/// widths); the strict per-row bounds checks live in the materialization
+/// functions above. All arithmetic is overflow-safe.
 fn read_lc_idx(data: &[u8], i: usize, w: usize) -> usize {
-    let off = i * w;
-    if off + w > data.len() {
+    let Some(off) = i.checked_mul(w) else {
+        return 0;
+    };
+    let Some(end) = off.checked_add(w) else {
+        return 0;
+    };
+    if end > data.len() {
         return 0;
     }
     match w {
@@ -227,22 +255,28 @@ fn encode_varint_to(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn read_varint_bytes(data: &[u8]) -> (u64, usize) {
+/// Read a ClickHouse varint from a byte slice, returning `(value, consumed)`.
+///
+/// Rejects overlong/overflowing encodings (> 10 bytes, or a 10th byte wider
+/// than the single bit that fits at shift 63) and truncated varints.
+fn read_varint_bytes(data: &[u8]) -> Result<(u64, usize)> {
+    use crate::error::Error;
     let mut r = 0u64;
     let mut s = 0;
     let mut c = 0;
     for &b in data {
         c += 1;
+        if s > 63 || (s == 63 && (b & 0x7F) > 1) {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
         r |= ((b & 0x7F) as u64) << s;
         if b & 0x80 == 0 {
-            return (r, c);
+            return Ok((r, c));
         }
         s += 7;
-        if s >= 64 {
-            break;
-        }
     }
-    (r, c)
+    // Continuation bit set on the final byte: the varint is truncated.
+    Err(Error::Protocol("truncated varint".into()))
 }
 
 #[cfg(test)]
@@ -352,7 +386,7 @@ mod tests {
     #[test]
     fn test_read_varint_bytes_tiny() {
         let data = b"\x2a"; // 42
-        let (val, consumed) = read_varint_bytes(data);
+        let (val, consumed) = read_varint_bytes(data).expect("42 parses");
         assert_eq!(val, 42);
         assert_eq!(consumed, 1);
     }
@@ -360,8 +394,116 @@ mod tests {
     #[test]
     fn test_read_varint_bytes_multi() {
         let data = b"\x80\x01"; // 128
-        let (val, consumed) = read_varint_bytes(data);
+        let (val, consumed) = read_varint_bytes(data).expect("128 parses");
         assert_eq!(val, 128);
         assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn test_read_varint_bytes_rejects_overflow() {
+        // 11 continuation bytes: shift would pass 64.
+        assert!(read_varint_bytes(&[0x80u8; 11]).is_err());
+        // 10th byte wider than the single bit that fits at shift 63.
+        assert!(
+            read_varint_bytes(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02])
+                .is_err()
+        );
+        // Truncated: continuation set on the last available byte.
+        assert!(read_varint_bytes(&[0x80u8, 0x80]).is_err());
+    }
+
+    // ── LowCardinality materialization: crafted-data regression tests ──
+
+    #[test]
+    fn lc_materialization_rejects_truncated_index_data() {
+        use crate::protocol::type_parser::ColumnType;
+        // 3 rows claimed, only 1 index byte present.
+        let res = materialize_lc_inner(b"\x01\x02\x03\x04", &ColumnType::UInt32, b"\x00", 1, 3);
+        assert!(res.is_err(), "truncated indexes must error, got {res:?}");
+    }
+
+    #[test]
+    fn lc_materialization_rejects_out_of_bounds_index() {
+        use crate::protocol::type_parser::ColumnType;
+        // Dictionary holds one UInt32 entry; index 5 is out of bounds.
+        let res = materialize_lc_inner(b"\x01\x02\x03\x04", &ColumnType::UInt32, b"\x05", 1, 1);
+        assert!(res.is_err(), "out-of-bounds index must error, got {res:?}");
+    }
+
+    #[test]
+    fn lc_materialization_rejects_huge_row_count_without_panicking() {
+        use crate::protocol::type_parser::ColumnType;
+        // Crafted num_idx far beyond the index bytes: must error, not panic
+        // or attempt an enormous allocation.
+        let res = materialize_lc_inner(
+            b"\x01\x02\x03\x04",
+            &ColumnType::UInt64,
+            b"\x00\x00\x00\x00\x00\x00\x00\x00",
+            8,
+            usize::MAX / 2,
+        );
+        assert!(res.is_err(), "huge num_idx must error, got {res:?}");
+    }
+
+    #[test]
+    fn lc_materialization_rejects_partial_dictionary_entry() {
+        use crate::protocol::type_parser::ColumnType;
+        // 5 bytes is not a whole number of UInt32 entries.
+        let res = materialize_lc_inner(b"\x01\x02\x03\x04\x05", &ColumnType::UInt32, b"\x01", 1, 1);
+        // Index 1 maps to bytes [4..8) which overrun the dictionary.
+        assert!(
+            res.is_err(),
+            "partial dictionary entry must error, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn lc_materialization_rejects_truncated_string_dictionary() {
+        use crate::protocol::type_parser::ColumnType;
+        // Dictionary claims a 10-byte string but only carries 3.
+        let dict = [0x0Au8, b'a', b'b', b'c'];
+        let res = materialize_lc_inner(&dict, &ColumnType::String, b"\x00", 1, 1);
+        assert!(
+            res.is_err(),
+            "truncated string dictionary must error, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn lc_materialization_string_roundtrip_stays_correct() {
+        use crate::protocol::type_parser::ColumnType;
+        // Dictionary: "a", "bb"; indexes 0,1,1,0.
+        let dict = [0x01u8, b'a', 0x02, b'b', b'b'];
+        let idxs = [0u8, 1, 1, 0];
+        let out = materialize_lc_inner(&dict, &ColumnType::String, &idxs, 1, 4)
+            .expect("valid string dictionary materializes");
+        let expect = [0x01, b'a', 0x02, b'b', b'b', 0x02, b'b', b'b', 0x01, b'a'];
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn lc_materialization_date32_uses_four_signed_bytes_per_key() {
+        use crate::protocol::type_parser::ColumnType;
+        let dict = (-1i32)
+            .to_le_bytes()
+            .into_iter()
+            .chain(100_000i32.to_le_bytes())
+            .collect::<Vec<_>>();
+        let out = materialize_lc_inner(&dict, &ColumnType::Date32, &[1, 0], 1, 2)
+            .expect("valid Date32 dictionary materializes");
+        let expected = 100_000i32
+            .to_le_bytes()
+            .into_iter()
+            .chain((-1i32).to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn lc_materialization_fixed_string_zero_width_is_empty() {
+        use crate::protocol::type_parser::ColumnType;
+        let out = materialize_lc_inner(b"", &ColumnType::FixedString(0), b"\x00\x01", 1, 2)
+            .expect("FixedString(0) has zero-width rows");
+        assert!(out.is_empty());
     }
 }

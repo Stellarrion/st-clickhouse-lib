@@ -63,6 +63,9 @@ async fn read_varint_recorded<
         let mut byte = [0u8; 1];
         stream.read_exact(&mut byte).await?;
         out.push(byte[0]);
+        if shift == 63 && (byte[0] & 0x7F) > 1 {
+            return Err(crate::error::Error::Protocol("varint overflow".into()));
+        }
         result |= u64::from(byte[0] & 0x7F) << shift;
         if byte[0] & 0x80 == 0 {
             return Ok(result);

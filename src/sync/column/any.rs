@@ -579,7 +579,7 @@ pub fn read_column_by_type<'a>(
             }))
         },
         LowCardinality(inner) => read_column_by_type(inner, ctx),
-        Date32 => u16::read_column(ctx).map(AnyColumnData::UInt16),
+        Date32 => i32::read_column(ctx).map(AnyColumnData::Int32),
         Nothing => {
             let _ = ctx.read_exact(ctx.rows)?;
             Ok(AnyColumnData::Unknown)

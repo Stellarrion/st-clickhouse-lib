@@ -77,7 +77,7 @@ impl ColumnType {
         Some(match self {
             UInt8 | Int8 | Bool | Enum8 => 1,
             UInt16 | Int16 | Date | Enum16 => 2,
-            UInt32 | Int32 | Float32 | DateTime | IPv4 => 4,
+            UInt32 | Int32 | Float32 | Date32 | DateTime | Time | IPv4 => 4,
             UInt64 | Int64 | Float64 | DateTime64(_) | Time64(_) => 8,
             IPv6 => 16,
             UInt128 | Int128 | UUID => 16,

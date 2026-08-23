@@ -24,6 +24,24 @@ All notable changes to st-clickhouse are documented here.
   `?quota_key=` is now the protocol ClientInfo field (previously it fell through
   to the ClickHouse `settings` map).
 
+### Changed (BREAKING)
+- `PlainColumnData::read_from_bytes` now returns `Result<Self>` and rejects a logical
+  element count that exceeds the backing bytes. This closes a safe-constructor
+  soundness hole that could lead to an out-of-bounds unsafe read.
+- Async `execute()` and `InsertSession::end()` now return ClickHouse server exceptions
+  instead of reporting silent success.
+
+### Fixed
+- Derived rows map fields by column name even when the SELECT order differs, while
+  tuples and existing manual `Row` implementations remain positional. The ordered
+  fast path stays allocation-free.
+- `Date32` consistently uses its signed 32-bit, four-byte wire representation in
+  compressed block parsing, dynamic typed decode, and LowCardinality dictionaries.
+- All native-protocol varint readers reject encodings outside the `u64` range instead
+  of panicking or silently discarding high bits.
+- Malformed LowCardinality dictionaries and indexes now return protocol errors instead
+  of panicking, allocating from unchecked counts, or zero-filling invalid entries.
+
 ## [0.2.0] — 2026-06-21
 
 ### Changed (BREAKING)

@@ -22,6 +22,9 @@ pub fn read_varint<R: std::io::Read>(reader: &mut R) -> Result<u64> {
         }
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
+        if shift == 63 && (byte[0] & 0x7F) > 1 {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
         r |= ((byte[0] & 0x7F) as u64) << shift;
         if byte[0] & 0x80 == 0 {
             return Ok(r);
@@ -126,6 +129,11 @@ pub fn write_bytes<W: std::io::Write>(writer: &mut W, data: &[u8]) -> Result<()>
 // ── Buffer parsing (&[u8], no I/O) ──
 
 /// Parse a ClickHouse varint from a byte buffer, advancing the position.
+///
+/// Rejects overlong/overflowing encodings: a varint is at most 10 bytes and
+/// the 10th byte may only carry the single bit that fits in a `u64`. Anything
+/// longer (or with high payload bits that would be silently shifted out)
+/// returns `Err` instead of panicking or wrapping.
 #[inline]
 pub fn parse_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
     let mut r = 0u64;
@@ -138,6 +146,15 @@ pub fn parse_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
         }
         let byte = buf[*pos];
         *pos += 1;
+        // Shifts are 0, 7, ..., 63 across at most 10 bytes. `shift >= 64`
+        // would panic (or mask) on `<<`; `shift == 63` with a payload wider
+        // than one bit would silently discard the extra bits.
+        if shift > 63 {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
+        if shift == 63 && (byte & 0x7F) > 1 {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
         r |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             return Ok(r);
@@ -263,5 +280,70 @@ mod tests {
         let mut cursor = std::io::Cursor::new([0x80u8; 12]);
         let res = read_varint(&mut cursor);
         assert!(res.is_err(), "overlong varint must error, got {res:?}");
+
+        let overflowing = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02,
+        ];
+        let mut cursor = std::io::Cursor::new(overflowing);
+        let res = read_varint(&mut cursor);
+        assert!(res.is_err(), "10th-byte overflow must error, got {res:?}");
+    }
+
+    #[test]
+    fn test_parse_varint_ten_byte_boundaries() {
+        // u64::MAX is the widest canonical varint: exactly 10 bytes.
+        let mut buf = Vec::new();
+        write_varint(&mut buf, u64::MAX).expect("test operation failed");
+        assert_eq!(buf.len(), 10);
+        let mut pos = 0;
+        let parsed = parse_varint(&buf, &mut pos).expect("u64::MAX must parse");
+        assert_eq!(parsed, u64::MAX);
+        assert_eq!(pos, buf.len());
+
+        // 10th byte 0x02 at shift 63: one payload bit too many.
+        let overflowing = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02,
+        ];
+        let mut pos = 0;
+        let res = parse_varint(&overflowing, &mut pos);
+        assert!(res.is_err(), "silent bit loss must be rejected, got {res:?}");
+
+        // 11th continuation byte: shift would pass 64.
+        let overlong = [0x80u8; 10];
+        let mut pos = 0;
+        let res = parse_varint(&overlong, &mut pos);
+        assert!(res.is_err(), "11-byte varint must be rejected, got {res:?}");
+    }
+
+    #[test]
+    fn test_parse_varint_truncated_is_err() {
+        // Continuation set on every byte but the buffer ends: must error.
+        let truncated = [0x80u8, 0x80, 0x80];
+        let mut pos = 0;
+        assert!(parse_varint(&truncated, &mut pos).is_err());
+        // Empty buffer errors immediately.
+        let mut pos = 0;
+        assert!(parse_varint(&[], &mut pos).is_err());
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn test_parse_varint_max_prefix_nine_bytes() {
+        // A 63-bit value: nine full continuation bytes + one terminator bit.
+        let val = 0x7FFF_FFFF_FFFF_FFFFu64; // 63 one-bits
+        let mut encoded = Vec::new();
+        write_varint(&mut encoded, val).expect("test operation failed");
+        let mut pos = 0;
+        let parsed = parse_varint(&encoded, &mut pos).expect("63-bit value parses");
+        assert_eq!(parsed, val);
+        // The literal nine-continuation prefix plus a 0x00 terminator also
+        // parses to the same value (shift 63 carries the final single bit).
+        let buf = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+        ];
+        let mut pos = 0;
+        let parsed = parse_varint(&buf, &mut pos).expect("9x0xFF + 0x00 parses");
+        assert_eq!(parsed, 0x7FFF_FFFF_FFFF_FFFF);
+        assert_eq!(pos, buf.len());
     }
 }

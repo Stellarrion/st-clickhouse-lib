@@ -64,11 +64,13 @@ fn skip_col_typed(data: &[u8], pos: &mut usize, tn: &str, rows: usize) -> Result
             advance_pos(data, pos, rows)?;
             Ok(())
         },
-        UInt16 | Int16 | Date | Date32 | Enum16 => {
+        UInt16 | Int16 | Date | Enum16 => {
             advance_pos(data, pos, checked_len(rows, 2)?)?;
             Ok(())
         },
-        UInt32 | Int32 | Float32 | DateTime | Time | IPv4 => {
+        // Date32 is Int32 days on the wire (4 bytes) — 2 bytes here would
+        // desync every later column in the block.
+        UInt32 | Int32 | Float32 | Date32 | DateTime | Time | IPv4 => {
             advance_pos(data, pos, checked_len(rows, 4)?)?;
             Ok(())
         },
@@ -913,23 +915,7 @@ async fn read_lc_async<
 // ═══════════════════════════════════════════════
 
 fn parse_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
-    let mut r = 0u64;
-    let mut s = 0;
-    loop {
-        if *pos >= data.len() {
-            return Err(crate::error::Error::Protocol("eof".into()));
-        }
-        let b = data[*pos];
-        *pos += 1;
-        r |= ((b & 0x7F) as u64) << s;
-        if b & 0x80 == 0 {
-            return Ok(r);
-        }
-        s += 7;
-        if s >= 64 {
-            return Err(crate::error::Error::Protocol("varint overflow".into()));
-        }
-    }
+    crate::protocol::wire::parse_varint(data, pos)
 }
 
 #[allow(dead_code)]
@@ -963,4 +949,56 @@ fn parse_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
     let v = i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
     *pos = end;
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_col_typed_date32_advances_four_bytes_per_row() {
+        // Date32 is Int32 days: 3 rows occupy 12 bytes. A 2-byte stride
+        // would leave the stream desynced for every later column.
+        let mut data = Vec::new();
+        for v in [-1i32, 0, 19_000] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.push(7); // one UInt8 row appended after the Date32 column
+        let mut pos = 0;
+        skip_col_typed(&data, &mut pos, "Date32", 3).expect("skip Date32 column");
+        assert_eq!(pos, 12, "Date32 must advance 4 bytes per row");
+        skip_col_typed(&data, &mut pos, "UInt8", 1).expect("skip trailing UInt8 column");
+        assert_eq!(pos, 13);
+    }
+
+    #[test]
+    fn parse_decompressed_block_keeps_columns_after_date32_in_sync() {
+        // One Date32 column followed by one UInt8 column. The Date32
+        // stride decides whether the second column's header lands on bytes
+        // or on garbage.
+        let mut data = Vec::new();
+        data.push(0x00); // BlockInfo: field 0 terminates the info loop
+        data.push(2); // columns
+        data.push(1); // rows
+        // column 1: name "d", type "Date32", custom serialization 0, Int32 payload
+        data.extend_from_slice(&[1, b'd']);
+        data.extend_from_slice(&[6]);
+        data.extend_from_slice(b"Date32");
+        data.push(0);
+        data.extend_from_slice(&19_000i32.to_le_bytes());
+        // column 2: name "f", type "UInt8", custom serialization 0, one byte
+        data.extend_from_slice(&[1, b'f']);
+        data.extend_from_slice(&[5]);
+        data.extend_from_slice(b"UInt8");
+        data.push(0);
+        data.push(7);
+
+        let block =
+            parse_decompressed_block(bytes::Bytes::from(data)).expect("block must parse in sync");
+        assert_eq!(block.rows, 1);
+        assert_eq!(block.columns.len(), 2);
+        assert_eq!(block.columns[0].name, "d");
+        assert_eq!(block.columns[1].name, "f");
+        assert_eq!(&block.columns[1].data[..], &[7]);
+    }
 }
