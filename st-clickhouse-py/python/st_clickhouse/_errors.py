@@ -33,9 +33,9 @@ class ConfigError(ClickHouseError):
     """Configuration error — invalid address, missing feature."""
 
 
-def map_error(exc: Exception) -> ClickHouseError:
-    """Map a native exception to the proper Python error type."""
-    if isinstance(exc, ClickHouseError):
+def map_error(exc: Exception) -> Exception:
+    """Map native failures while preserving Python argument type errors."""
+    if isinstance(exc, (ClickHouseError, TypeError)):
         return exc
     msg = str(exc)
     # Native ServerError mapping must win over word heuristics because a server

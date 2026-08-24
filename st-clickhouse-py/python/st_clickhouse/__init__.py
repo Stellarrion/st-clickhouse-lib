@@ -50,7 +50,6 @@ from ._streams import AsyncInsertStream, InsertStream
 from ._utils import (
     merge_query_params as _merge_query_params,
     parse_connect_args as _parse_connect_args,
-    with_per_query_settings as _with_per_query_settings,
 )
 
 # Import the native Rust extension
@@ -200,7 +199,8 @@ class Client:
 
         Args:
             query: SQL statement to execute (CREATE, ALTER, INSERT, etc.)
-            settings: Per-query ClickHouse settings (applied temporarily).
+            settings: Per-query ClickHouse settings, overlaid on the
+                connection's session settings for this query only.
 
         Raises:
             QueryError: If the server returns an error.
@@ -208,11 +208,12 @@ class Client:
         """
         self._check_open()
         bound_params = _merge_query_params(params, kwargs)
-        _with_per_query_settings(
-            self._client,
-            settings or {},
-            lambda: self._client.execute(query, bound_params, ignored_part_uuids),
-        )
+        try:
+            self._client.execute(
+                query, bound_params, ignored_part_uuids, settings=settings
+            )
+        except Exception as e:
+            raise _map_error(e) from e
 
     def query(
         self,
@@ -238,7 +239,8 @@ class Client:
                 Use ``{name:Type}`` placeholders for server-side parameters:
                 ``query("SELECT {id:UInt64} AS val", params={"id": 42})``
             params: Optional dict mapping parameter names to values.
-            settings: Per-query ClickHouse settings (applied temporarily).
+            settings: Per-query ClickHouse settings, overlaid on the
+                connection's session settings for this query only.
                 Example: ``{"max_threads": "8", "optimize_if_chain_to_multiif": "0"}``
             ignored_part_uuids: Optional iterable of UUIDs to ignore during
                 replicated INSERT deduplication.
@@ -273,11 +275,12 @@ class Client:
         """
         self._check_open()
         bound_params = _merge_query_params(params, kwargs)
-        return _with_per_query_settings(
-            self._client,
-            settings or {},
-            lambda: self._client.query(query, bound_params, ignored_part_uuids),
-        )
+        try:
+            return self._client.query(
+                query, bound_params, ignored_part_uuids, settings=settings
+            )
+        except Exception as e:
+            raise _map_error(e) from e
 
     def query_blocks(
         self,
@@ -290,14 +293,19 @@ class Client:
         """Execute a SELECT query. Returns list of Block objects.
 
         More efficient for large result sets — access columns lazily.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the
+                connection's session settings for this query only.
         """
         self._check_open()
         bound_params = _merge_query_params(params, kwargs)
-        return _with_per_query_settings(
-            self._client,
-            settings or {},
-            lambda: self._client.query_blocks(query, bound_params, ignored_part_uuids),
-        )
+        try:
+            return self._client.query_blocks(
+                query, bound_params, ignored_part_uuids, settings=settings
+            )
+        except Exception as e:
+            raise _map_error(e) from e
 
     def query_tuples(
         self,
@@ -311,14 +319,19 @@ class Client:
 
         This avoids one Python dict allocation per row and is faster than
         :meth:`query` when column names are not needed on every row.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the
+                connection's session settings for this query only.
         """
         self._check_open()
         bound_params = _merge_query_params(params, kwargs)
-        return _with_per_query_settings(
-            self._client,
-            settings or {},
-            lambda: self._client.query_tuples(query, bound_params, ignored_part_uuids),
-        )
+        try:
+            return self._client.query_tuples(
+                query, bound_params, ignored_part_uuids, settings=settings
+            )
+        except Exception as e:
+            raise _map_error(e) from e
 
     def query_columns(
         self,
@@ -333,14 +346,19 @@ class Client:
         This is the fastest fully materialized Python representation. For the
         lowest allocation path, use :meth:`query_blocks` and access columns
         lazily.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the
+                connection's session settings for this query only.
         """
         self._check_open()
         bound_params = _merge_query_params(params, kwargs)
-        return _with_per_query_settings(
-            self._client,
-            settings or {},
-            lambda: self._client.query_columns(query, bound_params, ignored_part_uuids),
-        )
+        try:
+            return self._client.query_columns(
+                query, bound_params, ignored_part_uuids, settings=settings
+            )
+        except Exception as e:
+            raise _map_error(e) from e
 
     def query_stream(self, query: str) -> Iterator[Block]:
         """Stream query results block by block.
@@ -629,18 +647,25 @@ class AsyncClient:
         query: str,
         params: Optional[Dict[str, Any]] = None,
         ignored_part_uuids: Optional[Iterable[Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> None:
         """Execute a DDL/DML query. No result rows.
 
         Acquires a connection from the pool, releases after execution.
         GIL released during TCP I/O.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the acquired
+                connection's session settings for this query only. The
+                settings never persist on the pooled connection and are not
+                sent as query parameters.
         """
         self._check_open()
         loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
         fut = loop.run_in_executor(
-            None, self._sync_execute, query, bound_params, ignored_part_uuids
+            None, self._sync_execute, query, bound_params, ignored_part_uuids, settings
         )
         try:
             await fut
@@ -655,10 +680,11 @@ class AsyncClient:
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
+        settings: Optional[Dict[str, str]],
     ) -> None:
         client = self._pool.acquire()
         try:
-            client.execute(query, params, ignored_part_uuids)
+            client.execute(query, params, ignored_part_uuids, settings=settings)
         finally:
             self._pool.release(client)
 
@@ -667,17 +693,24 @@ class AsyncClient:
         query: str,
         params: Optional[Dict[str, Any]] = None,
         ignored_part_uuids: Optional[Iterable[Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
         """Execute a SELECT query. Returns list of row dicts.
 
         Acquires and releases a connection from the pool.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the acquired
+                connection's session settings for this query only. The
+                settings never persist on the pooled connection and are not
+                sent as query parameters.
         """
         self._check_open()
         loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
         fut = loop.run_in_executor(
-            None, self._sync_query, query, bound_params, ignored_part_uuids
+            None, self._sync_query, query, bound_params, ignored_part_uuids, settings
         )
         try:
             return await fut
@@ -692,10 +725,11 @@ class AsyncClient:
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
+        settings: Optional[Dict[str, str]],
     ) -> List[Dict[str, Any]]:
         client = self._pool.acquire()
         try:
-            return client.query(query, params, ignored_part_uuids)
+            return client.query(query, params, ignored_part_uuids, settings=settings)
         finally:
             self._pool.release(client)
 
@@ -704,14 +738,22 @@ class AsyncClient:
         query: str,
         params: Optional[Dict[str, Any]] = None,
         ignored_part_uuids: Optional[Iterable[Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> List[Tuple[Any, ...]]:
-        """Execute a SELECT query. Returns rows as tuples."""
+        """Execute a SELECT query. Returns rows as tuples.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the acquired
+                connection's session settings for this query only. The
+                settings never persist on the pooled connection and are not
+                sent as query parameters.
+        """
         self._check_open()
         loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
         fut = loop.run_in_executor(
-            None, self._sync_query_tuples, query, bound_params, ignored_part_uuids
+            None, self._sync_query_tuples, query, bound_params, ignored_part_uuids, settings
         )
         try:
             return await fut
@@ -726,10 +768,11 @@ class AsyncClient:
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
+        settings: Optional[Dict[str, str]],
     ) -> List[Tuple[Any, ...]]:
         client = self._pool.acquire()
         try:
-            return client.query_tuples(query, params, ignored_part_uuids)
+            return client.query_tuples(query, params, ignored_part_uuids, settings=settings)
         finally:
             self._pool.release(client)
 
@@ -738,14 +781,22 @@ class AsyncClient:
         query: str,
         params: Optional[Dict[str, Any]] = None,
         ignored_part_uuids: Optional[Iterable[Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> Dict[str, List[Any]]:
-        """Execute a SELECT query. Returns ``{column_name: list[values]}``."""
+        """Execute a SELECT query. Returns ``{column_name: list[values]}``.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the acquired
+                connection's session settings for this query only. The
+                settings never persist on the pooled connection and are not
+                sent as query parameters.
+        """
         self._check_open()
         loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
         fut = loop.run_in_executor(
-            None, self._sync_query_columns, query, bound_params, ignored_part_uuids
+            None, self._sync_query_columns, query, bound_params, ignored_part_uuids, settings
         )
         try:
             return await fut
@@ -760,10 +811,11 @@ class AsyncClient:
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
+        settings: Optional[Dict[str, str]],
     ) -> Dict[str, List[Any]]:
         client = self._pool.acquire()
         try:
-            return client.query_columns(query, params, ignored_part_uuids)
+            return client.query_columns(query, params, ignored_part_uuids, settings=settings)
         finally:
             self._pool.release(client)
 
@@ -772,17 +824,24 @@ class AsyncClient:
         query: str,
         params: Optional[Dict[str, Any]] = None,
         ignored_part_uuids: Optional[Iterable[Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> List[Block]:
         """Execute a SELECT query. Returns list of Block objects.
 
         Acquires and releases a connection from the pool.
+
+        Args:
+            settings: Per-query ClickHouse settings, overlaid on the acquired
+                connection's session settings for this query only. The
+                settings never persist on the pooled connection and are not
+                sent as query parameters.
         """
         self._check_open()
         loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
         fut = loop.run_in_executor(
-            None, self._sync_query_blocks, query, bound_params, ignored_part_uuids
+            None, self._sync_query_blocks, query, bound_params, ignored_part_uuids, settings
         )
         try:
             return await fut
@@ -797,10 +856,11 @@ class AsyncClient:
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
+        settings: Optional[Dict[str, str]],
     ) -> List[Block]:
         client = self._pool.acquire()
         try:
-            return client.query_blocks(query, params, ignored_part_uuids)
+            return client.query_blocks(query, params, ignored_part_uuids, settings=settings)
         finally:
             self._pool.release(client)
 

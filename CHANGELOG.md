@@ -5,6 +5,31 @@ All notable changes to st-clickhouse are documented here.
 ## [Unreleased]
 
 ### Added
+- **True per-query settings overlays**: `SyncClient::{execute,query}_with_settings`,
+  `_{with_params_and_settings}`, and `_{with_params_settings_and_ignored_part_uuids}`
+  build each Query packet from the persistent `ClientConfig.settings` overlaid by a
+  borrowed per-query map. The overlay wins on duplicate keys, automatic
+  JSON/sparse defaults and query-parameter/ignored-part-UUID framing are preserved,
+  and neither the config nor the cached packet template is mutated — so nothing
+  leaks to later queries. An empty overlay keeps the cached-template fast path; the
+  pre-existing methods delegate with an empty overlay and behave unchanged.
+- **Python per-query settings**: the native `_Client.execute/query/query_tuples/
+  query_columns/query_blocks` accept a keyword-only `settings` dict (parsed to owned
+  strings before the GIL is released). Python `Client` passes `settings` straight
+  through, and `AsyncClient.execute/query/query_tuples/query_columns/query_blocks`
+  gained an explicit `settings` parameter threaded through the pool worker, and
+  `AsyncSession.execute/query/query_blocks` route the same overlay on their pinned
+  connection. Async `settings=...` is no longer swallowed by `**kwargs` and merged
+  into query parameters.
+
+### Fixed
+- **Per-query settings no longer leak** (`st_clickhouse`): `with_per_query_settings`
+  mutated the native client's session settings (`set_setting`) for every query and its
+  `finally` restore loop was a no-op, so a per-query setting persisted on the
+  connection forever and keys absent from the constructor baseline could never be
+  restored. Per-query settings are now merged into that query's packet only; the
+  connection baseline is structurally untouched and pooled connections are never
+  reconfigured. The dead helper was removed.
 - **Query timeout**: opt-in hard wall-clock deadline via `Client::with_query_timeout(d)`
   and per-query `QueryBuilder::timeout(d)`. On expiry the query is cancelled server-side
   (`Cancel` packet); the connection is discarded after a timeout so a partial

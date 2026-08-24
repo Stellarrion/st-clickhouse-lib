@@ -3,6 +3,7 @@ use crate::sync::client_info::ClientInfoTemplate;
 use crate::sync::config::ClientConfig;
 use crate::sync::protocol::revision;
 use crate::sync::protocol::wire::{self, encode_varint};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
 static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -13,6 +14,10 @@ pub(super) struct QueryPacketTemplate {
     pub(super) prefix: Vec<u8>,
     pub(super) client_info: Option<ClientInfoTemplate>,
     pub(super) before_query: Vec<u8>,
+    /// Byte length of the serialized settings block at the start of
+    /// `before_query`. The remaining bytes are revision-framed tail
+    /// (interserver fields, stage, compression) reusable by overlay packets.
+    pub(super) settings_len: usize,
     pub(super) select_suffix: Vec<u8>,
     pub(super) insert_suffix: Vec<u8>,
     pub(super) select_capacity: usize,
@@ -31,7 +36,12 @@ pub(super) fn build_query_packet_template(config: &ClientConfig, rev: u64) -> Qu
         .then(|| crate::sync::client_info::build_client_info_template(config, rev));
 
     let mut before_query = Vec::with_capacity(256);
-    write_serialized_settings(config, rev, &mut before_query);
+    let settings_len = write_serialized_settings_overlay(
+        &config.settings,
+        &HashMap::new(),
+        rev,
+        &mut before_query,
+    );
 
     if rev >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES {
         wire::write_string_to_vec(&mut before_query, "");
@@ -63,6 +73,7 @@ pub(super) fn build_query_packet_template(config: &ClientConfig, rev: u64) -> Qu
         prefix,
         client_info,
         before_query,
+        settings_len,
         select_capacity: fixed_capacity + select_suffix.len(),
         insert_capacity: fixed_capacity + insert_suffix.len(),
         select_suffix,
@@ -70,9 +81,23 @@ pub(super) fn build_query_packet_template(config: &ClientConfig, rev: u64) -> Qu
     }
 }
 
-fn write_serialized_settings(config: &ClientConfig, rev: u64, buf: &mut Vec<u8>) {
+/// Serialize the settings block: automatic client defaults, the connection's
+/// session settings, then the per-query overlay, then the empty-name terminator.
+///
+/// `overlay` wins on duplicate keys: a base entry shadowed by the overlay is
+/// emitted once, with the overlay value. Neither map is mutated.
+///
+/// Returns the number of bytes written, so packet builders can splice the
+/// post-settings tail of a cached template after an overlay block.
+pub(super) fn write_serialized_settings_overlay(
+    base: &HashMap<String, String>, overlay: &HashMap<String, String>, rev: u64, buf: &mut Vec<u8>,
+) -> usize {
+    let start = buf.len();
     if rev >= revision::DBMS_MIN_REVISION_WITH_SPARSE_SERIALIZATION
-        && !config.settings.contains_key(
+        && !base.contains_key(
+            crate::sync::protocol::settings::RATIO_OF_DEFAULTS_FOR_SPARSE_SERIALIZATION,
+        )
+        && !overlay.contains_key(
             crate::sync::protocol::settings::RATIO_OF_DEFAULTS_FOR_SPARSE_SERIALIZATION,
         )
     {
@@ -83,9 +108,11 @@ fn write_serialized_settings(config: &ClientConfig, rev: u64, buf: &mut Vec<u8>)
         encode_varint(buf, 0);
         wire::write_string_to_vec(buf, "1");
     }
-    if !config
-        .settings
+    if !base
         .contains_key(crate::sync::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING)
+        && !overlay.contains_key(
+            crate::sync::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING,
+        )
     {
         wire::write_string_to_vec(
             buf,
@@ -94,12 +121,20 @@ fn write_serialized_settings(config: &ClientConfig, rev: u64, buf: &mut Vec<u8>)
         encode_varint(buf, 0);
         wire::write_string_to_vec(buf, "1");
     }
-    for (name, value) in &config.settings {
+    for (name, value) in base {
+        if !overlay.contains_key(name) {
+            wire::write_string_to_vec(buf, name);
+            encode_varint(buf, 0);
+            wire::write_string_to_vec(buf, value);
+        }
+    }
+    for (name, value) in overlay {
         wire::write_string_to_vec(buf, name);
         encode_varint(buf, 0);
         wire::write_string_to_vec(buf, value);
     }
     wire::write_string_to_vec(buf, "");
+    buf.len() - start
 }
 
 pub(super) fn write_empty_data_block_to(buf: &mut Vec<u8>) {
@@ -116,4 +151,149 @@ fn write_empty_block_body_to(buf: &mut Vec<u8>) {
     encode_varint(buf, 0); // BlockInfo dim=0 (terminator)
     encode_varint(buf, 0); // num_columns=0
     encode_varint(buf, 0); // num_rows=0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::protocol::wire;
+    use std::collections::HashMap;
+
+    fn settings_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// Parse a serialized settings block: `name`, flags varint, `value`
+    /// entries until the empty-name terminator.
+    fn parse_settings(bytes: &[u8]) -> Vec<(String, String)> {
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut out = Vec::new();
+        loop {
+            let name = wire::read_string(&mut reader).expect("setting name");
+            if name.is_empty() {
+                return out;
+            }
+            let _flags = wire::read_varint(&mut reader).expect("setting flags");
+            let value = wire::read_string(&mut reader).expect("setting value");
+            out.push((name, value));
+        }
+    }
+
+    fn overlay_settings(
+        base: &[(&str, &str)], overlay: &[(&str, &str)], rev: u64,
+    ) -> Vec<(String, String)> {
+        let base = settings_map(base);
+        let overlay = settings_map(overlay);
+        let mut buf = Vec::new();
+        write_serialized_settings_overlay(&base, &overlay, rev, &mut buf);
+        parse_settings(&buf)
+    }
+
+    #[test]
+    fn overlay_merges_base_and_overlay_with_precedence() {
+        let entries = overlay_settings(
+            &[("max_threads", "4"), ("max_block_size", "1000")],
+            &[("max_threads", "9"), ("max_insert_block_size", "500")],
+            revision::DEFAULT_PROTOCOL_REVISION,
+        );
+        let by_name: HashMap<_, _> = entries.iter().cloned().collect();
+        assert_eq!(
+            by_name.get("max_threads").map(String::as_str),
+            Some("9"),
+            "overlay must win on duplicate keys"
+        );
+        assert_eq!(
+            by_name.get("max_block_size").map(String::as_str),
+            Some("1000"),
+            "unshadowed base entries must survive"
+        );
+        assert_eq!(
+            by_name.get("max_insert_block_size").map(String::as_str),
+            Some("500"),
+            "overlay-only entries must be added"
+        );
+        assert_eq!(
+            entries.iter().filter(|(n, _)| n == "max_threads").count(),
+            1,
+            "duplicate keys must be emitted exactly once"
+        );
+    }
+
+    #[test]
+    fn empty_overlay_matches_template_serialization() {
+        for rev in [
+            revision::MIN_SUPPORTED_PROTOCOL_REVISION,
+            revision::DEFAULT_PROTOCOL_REVISION,
+        ] {
+            let mut config = ClientConfig::default();
+            config.settings = settings_map(&[("max_threads", "4"), ("a", "1")]);
+            let template = build_query_packet_template(&config, rev);
+            let mut overlay_buf = Vec::new();
+            write_serialized_settings_overlay(
+                &config.settings,
+                &HashMap::new(),
+                rev,
+                &mut overlay_buf,
+            );
+            assert_eq!(
+                &template.before_query[..template.settings_len],
+                overlay_buf.as_slice(),
+                "empty overlay must reproduce the cached template settings at rev {rev}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_defaults_suppressed_only_when_overridden() {
+        let json_key = crate::sync::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING;
+        let sparse_key =
+            crate::sync::protocol::settings::RATIO_OF_DEFAULTS_FOR_SPARSE_SERIALIZATION;
+
+        // Nothing overrides: both automatic defaults are serialized.
+        let entries = overlay_settings(&[("x", "1")], &[], revision::DEFAULT_PROTOCOL_REVISION);
+        assert!(entries.iter().any(|(n, v)| n == json_key && v == "1"));
+        assert!(entries.iter().any(|(n, v)| n == sparse_key && v == "1"));
+
+        // Base overrides the sparse default, overlay overrides the JSON default.
+        let entries = overlay_settings(
+            &[(sparse_key, "0.5")],
+            &[(json_key, "0")],
+            revision::DEFAULT_PROTOCOL_REVISION,
+        );
+        assert_eq!(
+            entries.iter().filter(|(n, _)| n == sparse_key).count(),
+            1,
+            "sparse default must not be duplicated"
+        );
+        assert!(entries.iter().any(|(n, v)| n == sparse_key && v == "0.5"));
+        assert_eq!(
+            entries.iter().filter(|(n, _)| n == json_key).count(),
+            1,
+            "JSON default must not be duplicated"
+        );
+        assert!(entries.iter().any(|(n, v)| n == json_key && v == "0"));
+
+        // Old revisions never send the sparse default.
+        let entries = overlay_settings(&[], &[], revision::MIN_SUPPORTED_PROTOCOL_REVISION);
+        assert!(!entries.iter().any(|(n, _)| n == sparse_key));
+        assert!(entries.iter().any(|(n, v)| n == json_key && v == "1"));
+    }
+
+    #[test]
+    fn overlay_serialization_does_not_mutate_inputs() {
+        let base = settings_map(&[("max_threads", "4")]);
+        let overlay = settings_map(&[("max_threads", "9")]);
+        let mut buf = Vec::new();
+        write_serialized_settings_overlay(
+            &base,
+            &overlay,
+            revision::DEFAULT_PROTOCOL_REVISION,
+            &mut buf,
+        );
+        assert_eq!(base, settings_map(&[("max_threads", "4")]));
+        assert_eq!(overlay, settings_map(&[("max_threads", "9")]));
+    }
 }

@@ -120,7 +120,7 @@ rows = client.query(
     params={"id": 1, "name": "hello"},
 )
 
-# With per-query settings (temporary, auto-reverted)
+# With per-query settings (applied to that query only)
 rows = client.query("SELECT * FROM big_table", settings={"max_threads": "8"})
 
 # Tuples — faster than dicts for large results
@@ -324,7 +324,7 @@ for block in client.query_stream("SELECT number FROM system.numbers"):
 client.execute("CREATE TABLE test (x Int32) ENGINE Memory")
 client.insert("INSERT INTO test VALUES", [{"x": 1}, {"x": 2}])
 
-# Per-query settings (auto-reverted)
+# Per-query settings (applied to that query only)
 rows = client.query("SELECT * FROM big_table", settings={"max_threads": "8"})
 
 # Parameterized queries
@@ -611,7 +611,7 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 - ✅ **4 output shapes** — `query()` (dicts), `query_tuples()`, `query_columns()`, `query_blocks()`
 - ✅ **Streaming** — `query_stream()` for large results
 - ✅ **TLS** — `tls=True` with CA file, client cert, skip-verify option
-- ✅ **Per-query settings** — temporary settings via `settings={"key": "val"}`
+- ✅ **Per-query settings** — `settings={"key": "val"}` overlaid per query, never leaking onto the connection
 - ✅ **Server-side parameters** — `params={"id": 42}`
 - ✅ **Connection pool** — health checks, idle reaper, metrics
 - ✅ **Error hierarchy** — `ProtocolError`, `ConnectionError`, `AuthenticationError`, `QueryError`, etc.

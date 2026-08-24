@@ -41,12 +41,15 @@ class AsyncSession:
         self,
         query: str,
         params: Optional[Dict[str, Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> None:
         client = self._require_client()
         loop = asyncio.get_running_loop()
         bound_params = merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(None, lambda: client.execute(query, bound_params))
+        fut = loop.run_in_executor(
+            None, lambda: client.execute(query, bound_params, settings=settings)
+        )
         try:
             await fut
         except asyncio.CancelledError:
@@ -59,12 +62,15 @@ class AsyncSession:
         self,
         query: str,
         params: Optional[Dict[str, Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
         client = self._require_client()
         loop = asyncio.get_running_loop()
         bound_params = merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(None, lambda: client.query(query, bound_params))
+        fut = loop.run_in_executor(
+            None, lambda: client.query(query, bound_params, settings=settings)
+        )
         try:
             return await fut
         except asyncio.CancelledError:
@@ -77,12 +83,15 @@ class AsyncSession:
         self,
         query: str,
         params: Optional[Dict[str, Any]] = None,
+        settings: Optional[Dict[str, str]] = None,
         **kwargs: Any,
     ) -> List[Any]:
         client = self._require_client()
         loop = asyncio.get_running_loop()
         bound_params = merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(None, lambda: client.query_blocks(query, bound_params))
+        fut = loop.run_in_executor(
+            None, lambda: client.query_blocks(query, bound_params, settings=settings)
+        )
         try:
             return await fut
         except asyncio.CancelledError:

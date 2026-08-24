@@ -32,6 +32,18 @@ fn take_buf(capacity: usize) -> Vec<u8> {
     })
 }
 
+/// Upper bound for a merged settings block: varint + bytes per string, plus
+/// flags and the terminator per entry. Used only for buffer pre-sizing.
+fn serialized_settings_capacity(
+    base: &HashMap<String, String>, overlay: &HashMap<String, String>,
+) -> usize {
+    base.iter()
+        .chain(overlay.iter())
+        .map(|(name, value)| name.len() + value.len() + 24)
+        .sum::<usize>()
+        + 24
+}
+
 /// Parse a `host:port` string into (host, port) components.
 /// Handles IPv6 addresses wrapped in brackets.
 pub fn parse_host_port_addr(addr: &str) -> Result<(String, u16)> {
@@ -370,8 +382,40 @@ impl SyncClient {
     pub fn execute_with_params_and_ignored_part_uuids(
         &mut self, query: &str, params: &[QueryParameter], uuids: &[[u8; 16]],
     ) -> Result<()> {
+        self.execute_with_params_settings_and_ignored_part_uuids(
+            query,
+            params,
+            &HashMap::new(),
+            uuids,
+        )
+    }
+
+    /// Execute a DDL/DML with a per-query settings overlay.
+    ///
+    /// The overlay is merged into this query's packet only; the connection's
+    /// session settings (and every later query) are untouched. An empty
+    /// overlay is identical to [`execute`](Self::execute).
+    pub fn execute_with_settings(
+        &mut self, query: &str, settings: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.execute_with_params_and_settings(query, &[], settings)
+    }
+
+    /// Execute a DDL/DML with parameters and a per-query settings overlay.
+    pub fn execute_with_params_and_settings(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.execute_with_params_settings_and_ignored_part_uuids(query, params, settings, &[])
+    }
+
+    /// Execute a DDL/DML with parameters, a per-query settings overlay, and
+    /// ignored-part UUIDs.
+    pub fn execute_with_params_settings_and_ignored_part_uuids(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+        uuids: &[[u8; 16]],
+    ) -> Result<()> {
         self.send_ignored_part_uuids(uuids)?;
-        let pkt = self.build_query_packet_with_params(query, params);
+        let pkt = self.build_query_packet_with_params_and_settings(query, params, settings);
         self.write_packet(&pkt)?;
         self.stream.flush()?;
         self.drain_response()?;
@@ -529,8 +573,40 @@ impl SyncClient {
     pub fn query_with_params_and_ignored_part_uuids(
         &mut self, query: &str, params: &[QueryParameter], uuids: &[[u8; 16]],
     ) -> Result<Vec<Block>> {
+        self.query_with_params_settings_and_ignored_part_uuids(
+            query,
+            params,
+            &HashMap::new(),
+            uuids,
+        )
+    }
+
+    /// Execute a SELECT with a per-query settings overlay.
+    ///
+    /// The overlay is merged into this query's packet only; the connection's
+    /// session settings (and every later query) are untouched. An empty
+    /// overlay is identical to [`query`](Self::query).
+    pub fn query_with_settings(
+        &mut self, query: &str, settings: &HashMap<String, String>,
+    ) -> Result<Vec<Block>> {
+        self.query_with_params_and_settings(query, &[], settings)
+    }
+
+    /// Execute a SELECT with parameters and a per-query settings overlay.
+    pub fn query_with_params_and_settings(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+    ) -> Result<Vec<Block>> {
+        self.query_with_params_settings_and_ignored_part_uuids(query, params, settings, &[])
+    }
+
+    /// Execute a SELECT with parameters, a per-query settings overlay, and
+    /// ignored-part UUIDs.
+    pub fn query_with_params_settings_and_ignored_part_uuids(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+        uuids: &[[u8; 16]],
+    ) -> Result<Vec<Block>> {
         self.send_ignored_part_uuids(uuids)?;
-        let pkt = self.build_query_packet_with_params(query, params);
+        let pkt = self.build_query_packet_with_params_and_settings(query, params, settings);
         self.write_packet(&pkt)?;
         self.stream.flush()?;
         let deadline = std::time::Instant::now() + self.config.query_timeout;
@@ -629,8 +705,17 @@ impl SyncClient {
 
     // ── Packet building ──
 
+    /// Build the wire packet for a query.
+    ///
+    /// `settings` is a borrowed per-query overlay on top of the connection's
+    /// session settings. An empty overlay keeps the fast path: the cached
+    /// template bytes (which already contain the serialized session settings)
+    /// are extended verbatim. A non-empty overlay serializes the merged
+    /// settings block inline — neither `config.settings` nor the cached
+    /// template is mutated.
     fn build_query_packet_inner(
-        &self, query: &str, include_empty_block: bool, params: &[QueryParameter], buf: &mut Vec<u8>,
+        &self, query: &str, include_empty_block: bool, params: &[QueryParameter],
+        settings: &HashMap<String, String>, buf: &mut Vec<u8>,
     ) {
         let mut query_id_buf = [0u8; 22];
         let query_id_len = next_query_id(&mut query_id_buf);
@@ -642,7 +727,19 @@ impl SyncClient {
         if let Some(client_info) = &self.query_template.client_info {
             crate::sync::client_info::write_client_info_from_template(buf, client_info, query_id);
         }
-        buf.extend_from_slice(&self.query_template.before_query);
+        if settings.is_empty() {
+            buf.extend_from_slice(&self.query_template.before_query);
+        } else {
+            crate::sync::query_packet::write_serialized_settings_overlay(
+                &self.config.settings,
+                settings,
+                self.server_info.negotiated_revision,
+                buf,
+            );
+            buf.extend_from_slice(
+                &self.query_template.before_query[self.query_template.settings_len..],
+            );
+        }
         wire::write_string_to_vec(buf, query);
         if params.is_empty() && include_empty_block {
             buf.extend_from_slice(&self.query_template.select_suffix);
@@ -666,7 +763,7 @@ impl SyncClient {
     /// Includes a trailing empty Data block marker (required by CH 26.4+).
     pub fn build_query_packet(&self, query: &str) -> Vec<u8> {
         let mut buf = take_buf(self.query_template.select_capacity + query.len() + 80);
-        self.build_query_packet_inner(query, true, &[], &mut buf);
+        self.build_query_packet_inner(query, true, &[], &HashMap::new(), &mut buf);
         buf
     }
 
@@ -679,13 +776,35 @@ impl SyncClient {
                 + query_parameters_capacity(params)
                 + 80,
         );
-        self.build_query_packet_inner(query, true, params, &mut buf);
+        self.build_query_packet_inner(query, true, params, &HashMap::new(), &mut buf);
+        buf
+    }
+
+    /// Build a SELECT query packet with a per-query settings overlay.
+    pub fn build_query_packet_with_settings(
+        &self, query: &str, settings: &HashMap<String, String>,
+    ) -> Vec<u8> {
+        self.build_query_packet_with_params_and_settings(query, &[], settings)
+    }
+
+    /// Build a SELECT query packet with parameters and a settings overlay.
+    pub fn build_query_packet_with_params_and_settings(
+        &self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+    ) -> Vec<u8> {
+        let mut buf = take_buf(
+            self.query_template.select_capacity
+                + query.len()
+                + query_parameters_capacity(params)
+                + serialized_settings_capacity(&self.config.settings, settings)
+                + 80,
+        );
+        self.build_query_packet_inner(query, true, params, settings, &mut buf);
         buf
     }
 
     pub fn build_insert_query_packet(&self, query: &str) -> Vec<u8> {
         let mut buf = take_buf(self.query_template.insert_capacity + query.len() + 80);
-        self.build_query_packet_inner(query, false, &[], &mut buf);
+        self.build_query_packet_inner(query, false, &[], &HashMap::new(), &mut buf);
         buf
     }
 
@@ -2000,5 +2119,235 @@ mod tests {
                 .expect("test operation failed")
         );
         assert!(choose_chunked_mode("chunked", "notchunked", "recv").is_err());
+    }
+    // ── Per-query settings overlay: server-free packet tests ──────────────
+
+    /// Build a `SyncClient` that never touches the network: packets are
+    /// built from the cached template exactly as after a real handshake.
+    fn offline_client(settings: &[(&str, &str)], rev: u64) -> SyncClient {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let sock = std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test socket");
+        drop(listener.accept().expect("accept test socket").0);
+        let mut config = ClientConfig::default();
+        config.client_revision = rev;
+        for (name, value) in settings {
+            config
+                .settings
+                .insert((*name).to_string(), (*value).to_string());
+        }
+        let server_info = ServerInfo {
+            name: "test-server".to_string(),
+            major: 26,
+            minor: 4,
+            patch: 1,
+            revision: rev,
+            negotiated_revision: rev,
+            timezone: None,
+            display_name: None,
+            server_parallel_replicas_protocol_version: 0,
+            proto_send_chunked_srv: String::new(),
+            proto_recv_chunked_srv: String::new(),
+            use_chunked_send: false,
+            use_chunked_recv: false,
+            password_complexity_rules: Vec::new(),
+            interserver_secret_nonce: None,
+            server_query_plan_serialization_version: None,
+            worker_cluster_function_protocol_version: 0,
+        };
+        SyncClient {
+            stream: crate::sync::transport::Transport::new_plain(sock),
+            server_info,
+            query_template: build_query_packet_template(&config, rev),
+            config,
+            schema_cache: HashMap::new(),
+        }
+    }
+
+    fn read_varint_at(packet: &[u8], pos: usize) -> (usize, usize) {
+        let mut reader = std::io::Cursor::new(&packet[pos..]);
+        let value = wire::read_varint(&mut reader).expect("test varint");
+        (value as usize, reader.position() as usize)
+    }
+
+    /// Byte offset where a query packet's serialized settings block starts.
+    fn settings_offset(client: &SyncClient, packet: &[u8]) -> usize {
+        let mut pos = client.query_template.prefix.len();
+        let (qid_len, n) = read_varint_at(packet, pos);
+        pos += n + qid_len;
+        if let Some(ci) = &client.query_template.client_info {
+            pos += ci.before_initial_query_id.len();
+            let (qid_len, n) = read_varint_at(packet, pos);
+            pos += n + qid_len;
+            pos += ci.after_initial_query_id.len();
+        }
+        pos
+    }
+
+    /// Parse the settings block of a packet. Returns the entries and the
+    /// packet offset just past the empty-name terminator.
+    fn packet_settings(client: &SyncClient, packet: &[u8]) -> (Vec<(String, String)>, usize) {
+        let start = settings_offset(client, packet);
+        let mut reader = std::io::Cursor::new(&packet[start..]);
+        let mut out = Vec::new();
+        loop {
+            let name = wire::read_string(&mut reader).expect("setting name");
+            if name.is_empty() {
+                return (out, start + reader.position() as usize);
+            }
+            let _flags = wire::read_varint(&mut reader).expect("setting flags");
+            let value = wire::read_string(&mut reader).expect("setting value");
+            out.push((name, value));
+        }
+    }
+
+    /// Packet bytes minus the two per-query generated query-id strings, so
+    /// consecutive packets are byte-comparable.
+    fn strip_query_ids(client: &SyncClient, packet: &[u8]) -> Vec<u8> {
+        let mut pos = client.query_template.prefix.len();
+        let (qid_len, n) = read_varint_at(packet, pos);
+        let mut out = packet[..pos].to_vec();
+        pos += n + qid_len;
+        if let Some(ci) = &client.query_template.client_info {
+            out.extend_from_slice(&ci.before_initial_query_id);
+            pos += ci.before_initial_query_id.len();
+            let (qid_len, n) = read_varint_at(packet, pos);
+            pos += n + qid_len;
+            out.extend_from_slice(&ci.after_initial_query_id);
+            pos += ci.after_initial_query_id.len();
+        }
+        out.extend_from_slice(&packet[pos..]);
+        out
+    }
+
+    #[test]
+    fn query_packet_settings_overlay_merges_with_precedence() {
+        let client = offline_client(
+            &[("max_threads", "4"), ("max_block_size", "1000")],
+            revision::DEFAULT_PROTOCOL_REVISION,
+        );
+        let mut overlay = HashMap::new();
+        overlay.insert("max_threads".to_string(), "9".to_string());
+        overlay.insert("max_insert_block_size".to_string(), "500".to_string());
+        let pkt = client.build_query_packet_with_settings("SELECT 1", &overlay);
+
+        assert_eq!(pkt[0], 1, "ClientCode::Query");
+        let (entries, _) = packet_settings(&client, &pkt);
+        let by_name: HashMap<_, _> = entries.iter().cloned().collect();
+        assert_eq!(
+            by_name.get("max_threads").map(String::as_str),
+            Some("9"),
+            "overlay must win on duplicate keys"
+        );
+        assert_eq!(
+            by_name.get("max_block_size").map(String::as_str),
+            Some("1000"),
+            "unshadowed baseline must survive"
+        );
+        assert_eq!(
+            by_name.get("max_insert_block_size").map(String::as_str),
+            Some("500"),
+            "overlay-only keys must be added"
+        );
+        assert_eq!(
+            entries.iter().filter(|(n, _)| n == "max_threads").count(),
+            1,
+            "duplicate keys must be emitted exactly once"
+        );
+        // Automatic defaults are still serialized.
+        assert!(by_name.contains_key(
+            crate::sync::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING
+        ));
+        assert!(by_name.contains_key(
+            crate::sync::protocol::settings::RATIO_OF_DEFAULTS_FOR_SPARSE_SERIALIZATION
+        ));
+    }
+
+    #[test]
+    fn query_packet_settings_overlay_does_not_mutate_state() {
+        let client = offline_client(&[("max_threads", "4")], revision::DEFAULT_PROTOCOL_REVISION);
+        let template_before = client.query_template.before_query.clone();
+        let mut overlay = HashMap::new();
+        overlay.insert("max_threads".to_string(), "9".to_string());
+        let _ = client.build_query_packet_with_settings("SELECT 1", &overlay);
+
+        assert_eq!(
+            client
+                .config
+                .settings
+                .get("max_threads")
+                .map(String::as_str),
+            Some("4"),
+            "config settings must not be mutated"
+        );
+        assert_eq!(
+            client.query_template.before_query, template_before,
+            "cached template must not be mutated"
+        );
+        let (entries, _) = packet_settings(&client, &client.build_query_packet("SELECT 1"));
+        assert!(
+            entries.iter().any(|(n, v)| n == "max_threads" && v == "4"),
+            "next packet must carry the baseline: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(n, v)| n == "max_threads" && v == "9"),
+            "overlay must not leak into later packets: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn query_packet_empty_overlay_equals_fast_path() {
+        for rev in [
+            revision::MIN_SUPPORTED_PROTOCOL_REVISION,
+            revision::DEFAULT_PROTOCOL_REVISION,
+        ] {
+            let client = offline_client(&[("max_threads", "4"), ("x", "y")], rev);
+            let fast = client.build_query_packet("SELECT 42");
+            let overlay = client.build_query_packet_with_settings("SELECT 42", &HashMap::new());
+            assert_eq!(
+                strip_query_ids(&client, &fast),
+                strip_query_ids(&client, &overlay),
+                "empty overlay must keep the cached-template fast path at rev {rev}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_packet_overlay_preserves_params_and_framing() {
+        let client = offline_client(&[("max_threads", "4")], revision::DEFAULT_PROTOCOL_REVISION);
+        let params = vec![
+            QueryParameter::new("id", "42"),
+            QueryParameter::new("name", "o'brien"),
+        ];
+        let query = "SELECT {id:UInt64} AS i, {name:String} AS n";
+        let mut overlay = HashMap::new();
+        overlay.insert("max_threads".to_string(), "9".to_string());
+        let pkt = client.build_query_packet_with_params_and_settings(query, &params, &overlay);
+
+        // Deterministic tail: template post-settings bytes + query text +
+        // parameters (CUSTOM flag framing) + trailing empty Data block.
+        let mut empty_data_block = Vec::new();
+        write_empty_data_block_to(&mut empty_data_block);
+        let mut expected_tail = Vec::new();
+        expected_tail.extend_from_slice(
+            &client.query_template.before_query[client.query_template.settings_len..],
+        );
+        wire::write_string_to_vec(&mut expected_tail, query);
+        write_query_parameters_to_vec(&mut expected_tail, &params);
+        expected_tail.extend_from_slice(&empty_data_block);
+        assert!(
+            pkt.ends_with(&expected_tail),
+            "overlay packet must preserve query/parameter/suffix framing"
+        );
+
+        // The settings block must end exactly where the deterministic tail
+        // begins — well-formed and exactly sized.
+        let (entries, settings_end) = packet_settings(&client, &pkt);
+        assert_eq!(
+            settings_end,
+            pkt.len() - expected_tail.len(),
+            "settings block must end exactly at the framing tail boundary"
+        );
+        assert!(entries.iter().any(|(n, v)| n == "max_threads" && v == "9"));
     }
 }

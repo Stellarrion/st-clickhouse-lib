@@ -21,6 +21,7 @@
 //!
 //! Wraps `st_clickhouse::sync::client::{SyncClient, QueryStream}`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -237,39 +238,55 @@ impl PyClient {
 
     /// Execute a DDL/DML query (no result rows).
     /// GIL is released during the blocking network call.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn execute(
         &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<()> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
+        let settings = py_settings_to_map(settings)?;
         py.detach(|| {
-            self.inner.execute_with_params_and_ignored_part_uuids(
-                query,
-                &params,
-                &ignored_part_uuids,
-            )
+            self.inner
+                .execute_with_params_settings_and_ignored_part_uuids(
+                    query,
+                    &params,
+                    &settings,
+                    &ignored_part_uuids,
+                )
         })
         .map_err(to_py_err)
     }
 
     /// Execute a SELECT query. Returns list of row dicts.
     /// GIL is released during network I/O, re-acquired for Python conversion.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query(
         &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
+        let settings = py_settings_to_map(settings)?;
         let blocks = py
             .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
+                self.inner
+                    .query_with_params_settings_and_ignored_part_uuids(
+                        query,
+                        &params,
+                        &settings,
+                        &ignored_part_uuids,
+                    )
             })
             .map_err(to_py_err)?;
         conversion::blocks_to_py_dicts(&blocks, py)
@@ -278,20 +295,28 @@ impl PyClient {
 
     /// Execute a SELECT query. Returns list of row tuples.
     /// This avoids per-row dict allocation and is faster for large row sets.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query_tuples(
         &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
+        let settings = py_settings_to_map(settings)?;
         let blocks = py
             .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
+                self.inner
+                    .query_with_params_settings_and_ignored_part_uuids(
+                        query,
+                        &params,
+                        &settings,
+                        &ignored_part_uuids,
+                    )
             })
             .map_err(to_py_err)?;
         conversion::blocks_to_py_tuples(&blocks, py)
@@ -300,20 +325,28 @@ impl PyClient {
 
     /// Execute a SELECT query. Returns `{column_name: list[values]}`.
     /// This is the fastest fully materialized Python representation.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query_columns(
         &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
+        let settings = py_settings_to_map(settings)?;
         let blocks = py
             .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
+                self.inner
+                    .query_with_params_settings_and_ignored_part_uuids(
+                        query,
+                        &params,
+                        &settings,
+                        &ignored_part_uuids,
+                    )
             })
             .map_err(to_py_err)?;
         conversion::blocks_to_py_column_map(&blocks, py)
@@ -321,20 +354,28 @@ impl PyClient {
 
     /// Execute a SELECT query. Returns list of Block objects (column-oriented).
     /// GIL is released during network I/O.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query_blocks(
         &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Vec<PyBlock>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
+        let settings = py_settings_to_map(settings)?;
         let blocks = py
             .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
+                self.inner
+                    .query_with_params_settings_and_ignored_part_uuids(
+                        query,
+                        &params,
+                        &settings,
+                        &ignored_part_uuids,
+                    )
             })
             .map_err(to_py_err)?;
         Ok(blocks
@@ -508,6 +549,46 @@ fn py_table_schema(
     let out = PyDict::new(py);
     out.set_item("columns", columns)?;
     Ok(out.into())
+}
+
+/// Extract a per-query settings dict into owned strings.
+///
+/// Runs with the GIL held, before `py.detach`, so the overlay map is fully
+/// owned Rust data by the time the query packet is built.
+fn py_settings_to_map(settings: Option<&Bound<'_, PyDict>>) -> PyResult<HashMap<String, String>> {
+    let Some(settings) = settings else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::with_capacity(settings.len());
+    for item in settings.iter() {
+        let key: String = item
+            .0
+            .extract()
+            .map_err(|e| pyo3::exceptions::PyTypeError::new_err(format!("setting key: {e}")))?;
+        // Values coerce like query-parameter values (bool → "0"/"1", numbers
+        // → decimal text, anything else → `str()`), so the per-query dict
+        // stays as permissive as the historical Python helper that
+        // stringified values with `str(v)`.
+        let value = if let Ok(value) = item.1.extract::<String>() {
+            value
+        } else if let Ok(value) = item.1.extract::<bool>() {
+            if value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        } else if let Ok(value) = item.1.extract::<i64>() {
+            value.to_string()
+        } else if let Ok(value) = item.1.extract::<u64>() {
+            value.to_string()
+        } else if let Ok(value) = item.1.extract::<f64>() {
+            value.to_string()
+        } else {
+            item.1.str()?.to_str()?.to_owned()
+        };
+        out.insert(key, value);
+    }
+    Ok(out)
 }
 
 fn py_params_to_query_parameters(
