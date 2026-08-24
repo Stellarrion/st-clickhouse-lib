@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import threading
+import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Iterator, AsyncIterator, Tuple
 
 from ._errors import (
@@ -46,7 +47,7 @@ from ._errors import (
 )
 from ._pool import ConnectionPool as _ConnectionPool
 from ._session import AsyncSession
-from ._streams import AsyncInsertStream, InsertStream
+from ._streams import AsyncInsertStream, InsertStream, QueryStream
 from ._utils import (
     merge_query_params as _merge_query_params,
     parse_connect_args as _parse_connect_args,
@@ -75,6 +76,7 @@ __all__ = [
     "Client",
     "AsyncClient",
     "AsyncSession",
+    "QueryStream",
     "Block",
     "Column",
     "ClickHouseError",
@@ -88,6 +90,30 @@ __all__ = [
     "blocks_to_dicts",
     "dicts_to_block",
 ]
+
+# ══════════════════════════════════════════════════════════════════════════
+# Cancellation guidance (cancel() fails closed everywhere, like the Rust
+# core's Client::cancel)
+# ══════════════════════════════════════════════════════════════════════════
+
+_CANCEL_MESSAGE_SYNC = (
+    "Client.cancel() cannot cancel a running query: a Cancel packet can only "
+    "be delivered over the connection running the query, and that connection "
+    "is blocked inside the query call (an idle connection would swallow the "
+    "packet and desync on its next query). Use a query deadline "
+    "(Client(..., query_timeout=...)), abandon a query_stream early (break — "
+    "the connection is discarded and the server stops the query), or close "
+    "and reconnect."
+)
+
+_CANCEL_MESSAGE_ASYNC = (
+    "AsyncClient.cancel() cannot cancel a running query: the client owns a "
+    "pool, not the connection running the query. Cancel the awaiting task "
+    "instead — its pooled connection is killed (the server aborts the query) "
+    "and the pool transparently creates a replacement. For streams, break "
+    "the async-for (same effect). For a hard deadline use query_timeout."
+)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # Version
@@ -159,6 +185,7 @@ class Client:
         validate_schema: bool = False,
     ):
         self._closed: bool = True
+        self._discarded: bool = False
         # Build kwargs, filtering out None TLS params
         native_kwargs = dict(
             addr=addr,
@@ -362,14 +389,22 @@ class Client:
         except Exception as e:
             raise _map_error(e) from e
 
-    def query_stream(self, query: str) -> Iterator[Block]:
+    def query_stream(self, query: str) -> QueryStream:
         """Stream query results block by block.
 
         Uses a Rust background reader thread + channel internally.
         The reader thread holds no Python objects — pure Rust I/O.
+
+        Abandoning the iteration early (``break``, exception, or GC) before
+        the response reaches its terminal packet discards the connection:
+        the server stops the query and the client is closed. A client whose
+        stream was abandoned cannot be reused — its socket was killed
+        mid-response. Consume the stream fully (or use a ``query_timeout``)
+        to keep the client usable.
         """
         self._check_open()
-        return self._client.query_stream(query)
+        native = self._client.query_stream(query)
+        return QueryStream(native, owner=self)
 
     def insert(self, query: str, rows: List[Dict[str, Any]]) -> None:
         """Insert rows into a table from a list of dicts.
@@ -416,12 +451,22 @@ class Client:
             raise _map_error(e) from e
 
     def cancel(self) -> None:
-        """Cancel the currently running query."""
+        """Fail closed: this method cannot cancel a running query.
+
+        A Cancel packet can only be delivered over the connection running
+        the query, and that connection is blocked inside the query call
+        (borrowing it raises, and cancelling an idle connection would send a
+        stray packet that desyncs it).
+
+        Use instead:
+
+        - a query deadline: ``Client(..., query_timeout=...)``;
+        - early stream abandonment: ``break`` out of ``query_stream`` — the
+          connection is discarded and the server stops the query;
+        - ``close()`` and reconnect.
+        """
         self._check_open()
-        try:
-            self._client.cancel()
-        except Exception as e:
-            raise _map_error(e) from e
+        raise RuntimeError(_CANCEL_MESSAGE_SYNC)
 
     def tables_status(
         self, tables: Iterable[Tuple[str, str]]
@@ -506,7 +551,30 @@ class Client:
     def __del__(self) -> None:
         self.close()
 
+    def _discard(self) -> None:
+        """Kill the native connection deterministically and close the client.
+
+        Called by :class:`QueryStream` when its response was abandoned
+        before the terminal packet. The server sees the disconnect and stops
+        the query; a fresh :class:`Client` must be created afterwards.
+        """
+        if not getattr(self, "_closed", True):
+            self._discarded = True
+            self._closed = True
+            client = getattr(self, "_client", None)
+            if client is not None:
+                try:
+                    client.discard()
+                except Exception:
+                    pass
+
     def _check_open(self) -> None:
+        if getattr(self, "_discarded", False):
+            raise ConnectionError(
+                "Connection was discarded: its query stream was abandoned "
+                "before the response finished, so the connection was killed. "
+                "Create a new Client."
+            )
         if getattr(self, "_closed", True):
             raise ConnectionError("Connection is closed")
 
@@ -551,10 +619,13 @@ class AsyncClient:
     - Backpressure: Rust mpsc channel (32) → asyncio.Queue (32).
       If consumer is slow, the Rust reader thread blocks on TCP write,
       telling the ClickHouse server to slow down.
-    - Cancellation: ``asyncio.CancelledError`` sets a threading ``Event``,
-      the forwarder thread polls it during backpressure waits, and the
-      stream is cancelled via ``_QueryStream.cancel()``.
-    - ``GeneratorExit`` (from ``async for`` break or GC): same cleanup path.
+    - Cancellation: cancelling a task that awaits a one-shot query kills
+      that query's pooled connection (the server aborts the query) and
+      destroys the slot — the pool creates a replacement on the next
+      acquire, so the task unwinds in O(1).
+    - ``GeneratorExit`` / break on ``query_stream``: same kill + destroy
+      path; a stream that reached its terminal packet releases cleanly.
+    - ``cancel()`` itself fails closed with guidance (see its docstring).
     - Compatible with ``uvloop`` (standard asyncio APIs only).
 
     Args:
@@ -644,6 +715,102 @@ class AsyncClient:
             raise _map_error(e) from e
         self._closed: bool = False
 
+    # ── Pooled one-shot plumbing ────────────────────────────────────
+
+    async def _acquire(self, loop: asyncio.AbstractEventLoop) -> Any:
+        """Acquire a pooled client from the executor thread.
+
+        Cancellation-safe: ``run_in_executor`` futures cannot be cancelled
+        once running, and the asyncio wrapper is cancelled instantly — so
+        the client the worker eventually acquires would be dropped on the
+        floor by asyncio. A reclaim thread recovers it from the worker's
+        holder and releases it, so a cancelled acquire can never leak a
+        lent slot.
+        """
+        holder: Dict[str, Any] = {"done": False}
+
+        def _do_acquire() -> Any:
+            try:
+                holder["client"] = self._pool.acquire()
+                return holder["client"]
+            finally:
+                holder["done"] = True
+
+        fut = loop.run_in_executor(None, _do_acquire)
+
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            # The worker always exits within pool_acquire_timeout (its own
+            # admission deadline), plus slack for factory connection time.
+            deadline = time.monotonic() + self._pool._acquire_timeout + 5.0
+
+            def _reclaim() -> None:
+                # Poll only the WORKER's own terminal marker. The asyncio
+                # wrapper future is cancelled instantly on task cancel even
+                # while the callable still runs, so its done-callback must
+                # never feed this loop. The deadline only guards the
+                # never-started case (executor saturated, cancelled while
+                # PENDING): holder["client"] stays None and nothing needs
+                # releasing.
+                while not holder.get("done"):
+                    if time.monotonic() >= deadline:
+                        return
+                    time.sleep(0.01)
+                client = holder.get("client")
+                if client is not None:
+                    # The wrapped `_run_pooled` call was cancelled before its
+                    # query even started, so nothing can hold this client for
+                    # destruction: recycle it. Destroying here would remove a
+                    # healthy slot whenever the acquire finished after the
+                    # cancel (the observed pool-settle failure).
+                    self._pool.release(client, destroy=False)
+
+            threading.Thread(
+                target=_reclaim, daemon=True, name="ch-pool-acquire-reclaim"
+            ).start()
+            raise
+
+    async def _run_pooled(self, op: Callable[..., Any], *args: Any) -> Any:
+        """Run a one-shot operation on a pooled client, cancellation-safe.
+
+        The operation holds the client for its duration and releases it in
+        its ``finally``. If the awaiting task is cancelled mid-query, the
+        connection is killed deterministically (the server aborts the query,
+        the executor thread unblocks) and the pool slot is destroyed — a
+        replacement is created on the next acquire. Note that the asyncio
+        wrapper future is cancelled *instantly* while the executor work
+        keeps running; the discard therefore cannot rely on ``fut.done()``.
+        """
+        self._check_open()
+        loop = asyncio.get_running_loop()
+        client = await self._acquire(loop)
+        cancelled = threading.Event()
+
+        def _run(client: Any, *call_args: Any) -> Any:
+            try:
+                return op(client, *call_args)
+            finally:
+                # A cancelled caller must not have its connection recycled:
+                # the query was killed mid-flight, so destroy the slot.
+                self._pool.release(client, destroy=cancelled.is_set())
+
+        fut = loop.run_in_executor(None, _run, client, *args)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Skip only when the work observably completed (its release
+            # already happened clean). Otherwise kill now: the wrapper was
+            # cancelled instantly, but the query may still be running — or
+            # may never have started, in which case the lent slot must be
+            # destroyed anyway to avoid a leak.
+            if fut.cancelled() or not fut.done():
+                self._pool.discard(client)
+            raise
+        except Exception as e:
+            raise _map_error(e) from e
+
     # ── One-shot operations ─────────────────────────────────────────
 
     async def execute(
@@ -665,28 +832,19 @@ class AsyncClient:
                 settings never persist on the pooled connection and are not
                 sent as query parameters.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(
-            None, self._sync_execute, query, bound_params, ignored_part_uuids, settings
+        await self._run_pooled(
+            self._sync_execute_on, query, bound_params, ignored_part_uuids, settings
         )
-        try:
-            await fut
-        except asyncio.CancelledError:
-            await self.cancel()
-            raise
-        except Exception as e:
-            raise _map_error(e) from e
 
-    def _sync_execute(
+    def _sync_execute_on(
         self,
+        client: Any,
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> None:
-        client = self._pool.acquire()
         try:
             client.execute(query, params, ignored_part_uuids, settings=settings)
         finally:
@@ -710,28 +868,19 @@ class AsyncClient:
                 settings never persist on the pooled connection and are not
                 sent as query parameters.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(
-            None, self._sync_query, query, bound_params, ignored_part_uuids, settings
+        return await self._run_pooled(
+            self._sync_query_on, query, bound_params, ignored_part_uuids, settings
         )
-        try:
-            return await fut
-        except asyncio.CancelledError:
-            await self.cancel()
-            raise
-        except Exception as e:
-            raise _map_error(e) from e
 
-    def _sync_query(
+    def _sync_query_on(
         self,
+        client: Any,
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> List[Dict[str, Any]]:
-        client = self._pool.acquire()
         try:
             return client.query(query, params, ignored_part_uuids, settings=settings)
         finally:
@@ -753,28 +902,19 @@ class AsyncClient:
                 settings never persist on the pooled connection and are not
                 sent as query parameters.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(
-            None, self._sync_query_tuples, query, bound_params, ignored_part_uuids, settings
+        return await self._run_pooled(
+            self._sync_query_tuples_on, query, bound_params, ignored_part_uuids, settings
         )
-        try:
-            return await fut
-        except asyncio.CancelledError:
-            await self.cancel()
-            raise
-        except Exception as e:
-            raise _map_error(e) from e
 
-    def _sync_query_tuples(
+    def _sync_query_tuples_on(
         self,
+        client: Any,
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> List[Tuple[Any, ...]]:
-        client = self._pool.acquire()
         try:
             return client.query_tuples(query, params, ignored_part_uuids, settings=settings)
         finally:
@@ -796,28 +936,19 @@ class AsyncClient:
                 settings never persist on the pooled connection and are not
                 sent as query parameters.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(
-            None, self._sync_query_columns, query, bound_params, ignored_part_uuids, settings
+        return await self._run_pooled(
+            self._sync_query_columns_on, query, bound_params, ignored_part_uuids, settings
         )
-        try:
-            return await fut
-        except asyncio.CancelledError:
-            await self.cancel()
-            raise
-        except Exception as e:
-            raise _map_error(e) from e
 
-    def _sync_query_columns(
+    def _sync_query_columns_on(
         self,
+        client: Any,
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> Dict[str, List[Any]]:
-        client = self._pool.acquire()
         try:
             return client.query_columns(query, params, ignored_part_uuids, settings=settings)
         finally:
@@ -841,28 +972,19 @@ class AsyncClient:
                 settings never persist on the pooled connection and are not
                 sent as query parameters.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
         bound_params = _merge_query_params(params, kwargs)
-        fut = loop.run_in_executor(
-            None, self._sync_query_blocks, query, bound_params, ignored_part_uuids, settings
+        return await self._run_pooled(
+            self._sync_query_blocks_on, query, bound_params, ignored_part_uuids, settings
         )
-        try:
-            return await fut
-        except asyncio.CancelledError:
-            await self.cancel()
-            raise
-        except Exception as e:
-            raise _map_error(e) from e
 
-    def _sync_query_blocks(
+    def _sync_query_blocks_on(
         self,
+        client: Any,
         query: str,
         params: Dict[str, Any],
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> List[Block]:
-        client = self._pool.acquire()
         try:
             return client.query_blocks(query, params, ignored_part_uuids, settings=settings)
         finally:
@@ -902,23 +1024,11 @@ class AsyncClient:
 
         Acquires and releases a connection from the pool.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
-        fut = loop.run_in_executor(
-            None, self._sync_insert_blocks, query, table_name, blocks
-        )
-        try:
-            await fut
-        except asyncio.CancelledError:
-            await self.cancel()
-            raise
-        except Exception as e:
-            raise _map_error(e) from e
+        await self._run_pooled(self._sync_insert_blocks_on, query, table_name, blocks)
 
-    def _sync_insert_blocks(
-        self, query: str, table_name: str, blocks: List[Block]
+    def _sync_insert_blocks_on(
+        self, client: Any, query: str, table_name: str, blocks: List[Block]
     ) -> None:
-        client = self._pool.acquire()
         try:
             client.insert(query, table_name, blocks)
         finally:
@@ -929,59 +1039,43 @@ class AsyncClient:
 
         Acquires and releases a connection from the pool.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(None, self._sync_ping)
-        except Exception as e:
-            raise _map_error(e) from e
+        return await self._run_pooled(self._sync_ping_on)
 
-    def _sync_ping(self) -> bool:
-        client = self._pool.acquire()
+    def _sync_ping_on(self, client: Any) -> bool:
         try:
             return client.ping()
         finally:
             self._pool.release(client)
 
     async def cancel(self) -> None:
-        """Cancel the currently running query on all pool connections.
+        """Fail closed: this method cannot cancel a running query.
 
-        Sends cancel to each connection. The pool is NOT released
-        during cancel (pool management is independent).
+        The client owns a connection pool, not the connection running any
+        particular query — iterating the pool would send stray Cancel
+        packets to idle connections (which desync them) and cannot reach the
+        busy one anyway.
+
+        Use instead:
+
+        - cancel the awaiting task: its pooled connection is killed, the
+          server aborts the query, and the pool replaces the connection on
+          the next acquire;
+        - break out of ``query_stream``: same effect;
+        - a query deadline: ``AsyncClient(..., query_timeout=...)``.
         """
         self._check_open()
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, self._sync_cancel_all)
-        except Exception as e:
-            raise _map_error(e) from e
-
-    def _sync_cancel_all(self) -> None:
-        """Send cancel on all pool connections (by iterating allocated clients)."""
-        for pc in self._pool._all[:]:
-            try:
-                pc.client.cancel()
-            except Exception:
-                pass  # Best-effort cancel
+        raise RuntimeError(_CANCEL_MESSAGE_ASYNC)
 
     async def tables_status(
         self, tables: Iterable[Tuple[str, str]]
     ) -> Dict[Tuple[str, str], Dict[str, Any]]:
         """Get replication/read-only status for tables."""
-        self._check_open()
-        loop = asyncio.get_running_loop()
         table_list = list(tables)
-        try:
-            return await loop.run_in_executor(
-                None, self._sync_tables_status, table_list
-            )
-        except Exception as e:
-            raise _map_error(e) from e
+        return await self._run_pooled(self._sync_tables_status_on, table_list)
 
-    def _sync_tables_status(
-        self, tables: List[Tuple[str, str]]
+    def _sync_tables_status_on(
+        self, client: Any, tables: List[Tuple[str, str]]
     ) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        client = self._pool.acquire()
         try:
             return client.tables_status(tables)
         finally:
@@ -991,19 +1085,11 @@ class AsyncClient:
         self, database: str, table: str
     ) -> Optional[Dict[str, Any]]:
         """Get replication/read-only status for one table."""
-        self._check_open()
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(
-                None, self._sync_table_status, database, table
-            )
-        except Exception as e:
-            raise _map_error(e) from e
+        return await self._run_pooled(self._sync_table_status_on, database, table)
 
-    def _sync_table_status(
-        self, database: str, table: str
+    def _sync_table_status_on(
+        self, client: Any, database: str, table: str
     ) -> Optional[Dict[str, Any]]:
-        client = self._pool.acquire()
         try:
             return client.table_status(database, table)
         finally:
@@ -1011,15 +1097,9 @@ class AsyncClient:
 
     async def schema_for_table(self, table: str) -> Dict[str, Any]:
         """Return cached table schema metadata from one pool connection."""
-        self._check_open()
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(None, self._sync_schema_for_table, table)
-        except Exception as e:
-            raise _map_error(e) from e
+        return await self._run_pooled(self._sync_schema_for_table_on, table)
 
-    def _sync_schema_for_table(self, table: str) -> Dict[str, Any]:
-        client = self._pool.acquire()
+    def _sync_schema_for_table_on(self, client: Any, table: str) -> Dict[str, Any]:
         try:
             return client.schema_for_table(table)
         finally:
@@ -1027,15 +1107,9 @@ class AsyncClient:
 
     async def refresh_schema_for_table(self, table: str) -> Dict[str, Any]:
         """Refresh table schema metadata on one pool connection."""
-        self._check_open()
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(None, self._sync_refresh_schema_for_table, table)
-        except Exception as e:
-            raise _map_error(e) from e
+        return await self._run_pooled(self._sync_refresh_schema_for_table_on, table)
 
-    def _sync_refresh_schema_for_table(self, table: str) -> Dict[str, Any]:
-        client = self._pool.acquire()
+    def _sync_refresh_schema_for_table_on(self, client: Any, table: str) -> Dict[str, Any]:
         try:
             return client.refresh_schema_for_table(table)
         finally:
@@ -1067,15 +1141,9 @@ class AsyncClient:
         Note: settings are per-connection. This sets on one connection
         from the pool.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, self._sync_set_setting, name, value)
-        except Exception as e:
-            raise _map_error(e) from e
+        await self._run_pooled(self._sync_set_setting_on, name, value)
 
-    def _sync_set_setting(self, name: str, value: str) -> None:
-        client = self._pool.acquire()
+    def _sync_set_setting_on(self, client: Any, name: str, value: str) -> None:
         try:
             client.set_setting(name, value)
         finally:
@@ -1088,15 +1156,9 @@ class AsyncClient:
             Dict with keys: ``name``, ``version_major``, ``version_minor``,
             ``revision``, ``timezone``, ``display_name``.
         """
-        self._check_open()
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(None, self._sync_server_info)
-        except Exception as e:
-            raise _map_error(e) from e
+        return await self._run_pooled(self._sync_server_info_on)
 
-    def _sync_server_info(self) -> Dict[str, Any]:
-        client = self._pool.acquire()
+    def _sync_server_info_on(self, client: Any) -> Dict[str, Any]:
         try:
             return client.server_info()
         finally:
@@ -1118,13 +1180,15 @@ class AsyncClient:
         self._check_open()
         loop = asyncio.get_running_loop()
         # Acquire a connection and start the insert stream
-        client = await loop.run_in_executor(None, self._pool.acquire)
+        client = await self._acquire(loop)
         try:
             await loop.run_in_executor(
                 None, lambda: client.begin_insert_stream(query)
             )
         except BaseException:
-            self._pool.release(client)
+            # A failed or cancelled begin leaves the connection mid-INSERT:
+            # destroy it instead of recycling a desynced socket.
+            self._pool.release(client, destroy=True)
             raise
         return AsyncInsertStream(self, client, query, table_name)
 
@@ -1142,8 +1206,14 @@ class AsyncClient:
         3. A single Python forwarder thread reads from the channel and
            pushes to ``asyncio.Queue`` via ``run_coroutine_threadsafe``
         4. The async generator yields from the queue
-        5. On any exit (normal end, break, CancelledError, GeneratorExit,
-           exception), the connection is returned to the pool
+        5. On normal end (terminal packet seen — EndOfStream or server
+           exception) the connection is returned to the pool clean.
+        6. On ANY other exit (break, CancelledError, GeneratorExit,
+           exception) the connection is killed first — the server stops the
+           query — and its pool slot is destroyed instead of recycled:
+           a replacement is created on the next acquire. Recycling a
+           connection whose response was not fully consumed would desync
+           the next query on it.
 
         Args:
             query: SELECT SQL statement.
@@ -1160,7 +1230,7 @@ class AsyncClient:
         loop = asyncio.get_running_loop()
 
         # Acquire a connection from pool — HELD until stream ends
-        client = await loop.run_in_executor(None, self._pool.acquire)
+        client = await self._acquire(loop)
 
         # Start the stream (Rust reader thread + channel)
         try:
@@ -1176,6 +1246,29 @@ class AsyncClient:
         queue: asyncio.Queue = asyncio.Queue(maxsize=32)
         cancel_event = threading.Event()
         forwarder_exc: list[BaseException] = []
+
+        abandoned = False
+
+        def _abandon() -> None:
+            """Kill the stream's connection NOW (idempotent).
+
+            The socket shutdown unblocks the Rust reader thread wherever it
+            is (including a blocking read on a slow server query), makes the
+            server abort the query, and lets the forwarder finish and destroy
+            the pool slot. O(1): never waits for the server.
+
+            The ``eos`` check can still lose a race with a reader that is
+            finishing from already-buffered data — that is fine: the
+            connection is killed, ``client.discarded`` is set, and the
+            forwarder destroys the slot instead of recycling it.
+            """
+            nonlocal abandoned
+            cancel_event.set()
+            if abandoned:
+                return
+            abandoned = True
+            if not stream.eos:
+                client.discard()
 
         def _forwarder() -> None:
             """Dedicated forwarder thread.
@@ -1213,8 +1306,16 @@ class AsyncClient:
                     ).result(timeout=5)
                 except BaseException:
                     pass
-                # Return connection to pool
-                self._pool.release(client)
+                # Release the connection. Only a stream whose reader saw the
+                # terminal packet (EoS / server exception) AND whose
+                # connection was never killed leaves it clean; everything
+                # else (abandon, cancel, I/O error) destroys the slot — the
+                # pool replaces it lazily. Checking ``client.discarded`` too
+                # closes the race where the reader finished from buffered
+                # data after an abandon already killed the socket.
+                self._pool.release(
+                    client, destroy=client.discarded or not stream.eos
+                )
 
         thread = threading.Thread(target=_forwarder, daemon=True)
         thread.start()
@@ -1232,22 +1333,20 @@ class AsyncClient:
                 raise forwarder_exc[0]
 
         except GeneratorExit:
-            # async for break / early return / GC — clean up
-            cancel_event.set()
-            stream.cancel()
+            # async for break / early return / GC — kill the connection
+            _abandon()
             raise
 
         except asyncio.CancelledError:
-            cancel_event.set()
-            stream.cancel()
+            _abandon()
             raise
 
         finally:
-            # Safety net: ensure cleanup on ANY exit path
-            if not cancel_event.is_set():
-                cancel_event.set()
-                stream.cancel()
-            # stream.__del__() cleans up the Rust reader thread
+            # Safety net: ensure cleanup on ANY exit path. If the terminal
+            # packet was seen this is a no-op for the connection; the
+            # forwarder releases it (clean or destroy) either way.
+            _abandon()
+            # stream.__del__() kills the reader thread if it is still stuck
 
     # ── Lifecycle ────────────────────────────────────────────────────
 

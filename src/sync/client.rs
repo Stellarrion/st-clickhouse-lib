@@ -900,6 +900,17 @@ impl SyncClient {
         Ok(())
     }
 
+    /// Duplicate the underlying TCP socket for out-of-band teardown.
+    ///
+    /// The duplicate shares the same socket: [`TcpStream::shutdown`] on it
+    /// from any thread aborts in-flight blocking I/O on this client
+    /// deterministically (the peer sees the disconnect and stops the query).
+    /// The duplicate is read-only in spirit — callers must only use it to
+    /// shut the socket down, never for protocol traffic.
+    pub fn socket_shutdown_handle(&self) -> std::io::Result<TcpStream> {
+        self.stream.raw_tcp().try_clone()
+    }
+
     // ── Raw stream access for INSERT ──
 
     /// Get a mutable reference to the underlying transport stream.
@@ -1851,6 +1862,16 @@ pub struct QueryStream {
 }
 
 impl QueryStream {
+    /// Duplicate the underlying TCP socket for out-of-band teardown.
+    ///
+    /// The stream's transport is a duplicate of the owning client's socket,
+    /// so shutting this handle down kills the shared connection and unblocks
+    /// a reader stuck in a blocking read. See
+    /// [`SyncClient::socket_shutdown_handle`].
+    pub fn shutdown_handle(&self) -> std::io::Result<std::net::TcpStream> {
+        self.stream.raw_tcp().try_clone()
+    }
+
     pub fn read_next_block(&mut self) -> Result<Option<Block>> {
         if self.done {
             return Ok(None);

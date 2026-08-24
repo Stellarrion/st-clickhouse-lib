@@ -37,6 +37,21 @@ from typing import Any, Callable, Dict, Optional
 from ._errors import ConnectionError
 
 
+def _kill(client: Any) -> None:
+    """Best-effort deterministic kill of a native client.
+
+    Idempotent, never raises, and tolerant of fake clients without a
+    ``discard`` method (unit tests) — the slot removal in ``release`` is the
+    authoritative part of destruction.
+    """
+    discard = getattr(client, "discard", None)
+    if callable(discard):
+        try:
+            discard()
+        except Exception:
+            pass
+
+
 class PooledConnection:
     """A connection slot in the pool with metadata.
 
@@ -163,19 +178,42 @@ class ConnectionPool:
             return self._grow()
         return self._hand_out(pc)
 
-    def release(self, client: Any) -> None:
+    def release(self, client: Any, *, destroy: bool = False) -> None:
         """Return a connection to the pool.
+
+        With ``destroy=False`` the connection is recycled: it becomes
+        available for the next acquire. With ``destroy=True`` the connection
+        is killed and its slot removed: capacity is freed immediately, the
+        next acquire transparently creates a replacement through the
+        factory, and the metrics reflect the removal. Destroy is the correct
+        release for any connection whose response was not fully consumed
+        (cancelled query, abandoned stream) — recycling such a connection
+        would desync the next query on it.
 
         Idempotent and safe on a closed pool: unknown clients, double
         releases, and releases after ``close()`` are silently ignored and
         never mutate pool accounting.
         """
+        if destroy:
+            _kill(client)
         with self._cond:
             if self._closed:
                 return
             for pc in self._all:
                 if pc.client is client:
-                    if pc in self._lent:
+                    if destroy:
+                        self._lent.discard(pc)
+                        try:
+                            self._available.remove(pc)
+                        except ValueError:
+                            pass
+                        try:
+                            self._all.remove(pc)
+                        except ValueError:
+                            pass
+                        # Freed capacity: blocked acquires may grow now.
+                        self._cond.notify_all()
+                    elif pc in self._lent:
                         self._lent.discard(pc)
                         pc.last_used = time.monotonic()
                         self._available.append(pc)
@@ -183,6 +221,18 @@ class ConnectionPool:
                     # else: double release — the slot is already available.
                     return
             # Unknown client — ignore.
+
+    def discard(self, client: Any) -> None:
+        """Destroy a lent connection: kill it and free its slot now.
+
+        Used when a task is cancelled while a query runs on ``client`` (the
+        executor thread keeps running and cannot be interrupted): the socket
+        is shut down deterministically so the server aborts the query, the
+        executor thread unblocks, and its later ``release`` call becomes a
+        no-op for this already-removed slot. The freed capacity lets the
+        next acquire create a fresh connection.
+        """
+        self.release(client, destroy=True)
 
     def close(self) -> None:
         """Close the pool. All pending and future acquires will fail.

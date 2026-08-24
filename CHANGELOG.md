@@ -4,6 +4,44 @@ All notable changes to st-clickhouse are documented here.
 
 ## [Unreleased]
 
+### Changed (BREAKING, Python bindings)
+- **Python `cancel()` is now fail-closed** (`st_clickhouse`): `Client.cancel()`,
+  `AsyncClient.cancel()`, and `AsyncSession.cancel()` always raise `RuntimeError`
+  with guidance. The old implementations could not cancel anything: the native
+  `_Client.cancel` borrows the client mutably, so it raised "Already borrowed"
+  while a query was running (swallowed by the async wrapper), and idle pooled
+  connections received stray no-op `Cancel` packets. `AsyncClient.cancel`
+  additionally iterated the pool issuing per-client cancels — borrowed clients
+  raised (cancelled nothing), idle ones got poisoned. This mirrors the Rust
+  core's fail-closed `Client::cancel`.
+- **Cancelling a task now stops its server-side query** (`st_clickhouse`): the
+  dead `await self.cancel()` in every `CancelledError` handler is replaced by a
+  deterministic kill. New native `_Client.discard()` is borrow-free (frozen
+  pyclass + duplicated socket fd): it shuts the connection down from any thread
+  in O(1), which unblocks the executor thread mid-query, makes the server abort
+  the query (previously `SELECT sleep(3)` ran to completion as a zombie), and
+  marks the client dead for any later use. The pool slot is destroyed and
+  transparently replaced by the next acquire; pool capacity and metrics stay
+  truthful. Acquire and query are now separate executor steps so the wrapper
+  knows which pooled client to kill, and an acquire interrupted by cancellation
+  can no longer leak its connection.
+- **Abandoning a stream no longer desyncs the pool** (`st_clickhouse`):
+  breaking out of `query_stream` (async or sync) previously returned the
+  connection to the pool while the server was still streaming the old
+  response — the next query on that connection failed with
+  `unknown packet type: 0`. The native `_QueryStream` now tracks whether the
+  response reached a terminal packet (EndOfStream or server exception,
+  exposed as `.eos`); on any other exit the connection is killed (server
+  aborts the query) and the async pool destroys the slot instead of
+  recycling it. Fully-consumed streams still release cleanly. The sync
+  `Client.query_stream` returns a new `QueryStream` wrapper implementing the
+  same contract: early abandon closes the client (recreate it); server-error
+  streams leave the client usable; dropping a mid-response stream kills its
+  reader thread deterministically. `AsyncSession` cancellation destroys the
+  pinned connection (the session must be reopened), and a cancelled
+  `AsyncInsertStream.send`/`close` destroys its connection instead of
+  recycling a socket left mid-INSERT.
+
 ### Security
 - **Capped server-controlled item counts (P0)**: server-controlled list and
   block dimensions are now validated against generous internal caps in
