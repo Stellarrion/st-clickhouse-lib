@@ -78,6 +78,15 @@ All notable changes to st-clickhouse are documented here.
   to the ClickHouse `settings` map).
 - `QueryBuilder::blocks()` returns every non-empty result block while preserving
   server block boundaries and moving, rather than copying, column payloads.
+- **Query-ID collisions between sync and async clients**: the sync
+  (`crate::sync`) and tokio (`crate::connection`) packet builders each owned a
+  `st-ch-` counter, so a sync query and an async query issued from the same
+  process minted identical IDs and ClickHouse rejected one with
+  `QUERY_WITH_SAME_ID_IS_ALREADY_RUNNING` (216). Standard `st-ch-` IDs now come
+  from one process-wide generator in `crate::query_id` used by both builders;
+  the wire format is unchanged and the Query packet's ClientInfo still repeats
+  the same ID by design. Batch IDs keep their distinct `st-b-` prefix and
+  their own counter.
 
 ### Changed (BREAKING)
 - `PlainColumnData::read_from_bytes` now returns `Result<Self>` and rejects a logical

@@ -3,13 +3,13 @@ use crate::connection::block_reader::read_column_async;
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::query_packet::{
     build_query_packet, build_query_packet_from_template, build_query_packet_template,
-    next_query_id,
 };
 use crate::connection::raw_block_reader::read_column_raw_recorded;
 use crate::connection::tcp::Client;
 use crate::protocol::parameters::QueryParameter;
 use crate::protocol::revision;
 use crate::protocol::wire;
+use crate::query_id::next_query_id;
 use crate::runtime::io::AsyncWriteExt;
 use crate::runtime::sync::RwLock;
 use std::collections::HashMap;

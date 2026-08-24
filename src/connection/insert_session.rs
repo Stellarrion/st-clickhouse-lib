@@ -1,11 +1,12 @@
 use crate::compression::CompressionMethod;
 use crate::connection::io::{compression_flag, ping_stream};
-use crate::connection::query_packet::{build_query_packet_from_cached_or_revision, next_query_id};
+use crate::connection::query_packet::build_query_packet_from_cached_or_revision;
 use crate::connection::response_wait::{drain_response, read_table_structure};
 use crate::connection::tcp::Client;
 use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::block::Block;
+use crate::query_id::next_query_id;
 use crate::runtime::io::AsyncWriteExt;
 use crate::schema::{TableSchema, quote_identifier_path};
 use std::time::Duration;

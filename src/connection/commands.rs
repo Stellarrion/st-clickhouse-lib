@@ -1,5 +1,5 @@
 use crate::connection::io::{compression_flag, ping_stream};
-use crate::connection::query_packet::{build_query_packet_from_cached_or_revision, next_query_id};
+use crate::connection::query_packet::build_query_packet_from_cached_or_revision;
 use crate::connection::response_wait::drain_response;
 use crate::connection::server_packets::write_ignored_part_uuids_if_any;
 use crate::connection::tcp::Client;
@@ -7,6 +7,7 @@ use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::packet::ClientPacket;
 use crate::protocol::parameters::QueryParameter;
+use crate::query_id::next_query_id;
 use crate::runtime::io::AsyncWriteExt;
 use crate::schema::query_may_change_schema;
 use tracing::{Instrument, info_span};

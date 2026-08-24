@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
 static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-static QUERY_ID_PROCESS_PREFIX: AtomicU64 = AtomicU64::new(0);
 
 // ═══════════════════════════════════════════════
 // BatchBuilder
@@ -313,7 +312,7 @@ fn write_batch_query_packet_from_template(
 }
 
 fn next_query_id(buf: &mut [u8; 22]) -> usize {
-    next_query_id_with_prefix(buf, b"st-b-", &QUERY_ID_PROCESS_PREFIX, &QUERY_ID_COUNTER)
+    next_query_id_with_prefix(buf, b"st-b-", &QUERY_ID_COUNTER)
 }
 
 #[cfg(test)]

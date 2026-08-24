@@ -62,13 +62,14 @@ pub fn parse_host_port_addr(addr: &str) -> Result<(String, u16)> {
         )))
     }
 }
+use crate::query_id::next_query_id;
 use crate::sync::protocol::handshake::{self, ServerInfo};
 use crate::sync::protocol::response::{parse_block, parse_block_body};
 use crate::sync::protocol::revision;
 use crate::sync::protocol::table_status::{QualifiedTableName, TableStatus, TablesStatusResponse};
 use crate::sync::protocol::wire;
 use crate::sync::query_packet::{
-    QueryPacketTemplate, build_query_packet_template, next_query_id, write_empty_data_block_to,
+    QueryPacketTemplate, build_query_packet_template, write_empty_data_block_to,
 };
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};

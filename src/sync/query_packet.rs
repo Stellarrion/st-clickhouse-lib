@@ -1,13 +1,8 @@
-use crate::query_id::next_query_id_with_prefix;
 use crate::sync::client_info::ClientInfoTemplate;
 use crate::sync::config::ClientConfig;
 use crate::sync::protocol::revision;
 use crate::sync::protocol::wire::{self, encode_varint};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
-
-static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-static QUERY_ID_PROCESS_PREFIX: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub(super) struct QueryPacketTemplate {
@@ -22,10 +17,6 @@ pub(super) struct QueryPacketTemplate {
     pub(super) insert_suffix: Vec<u8>,
     pub(super) select_capacity: usize,
     pub(super) insert_capacity: usize,
-}
-
-pub(super) fn next_query_id(buf: &mut [u8; 22]) -> usize {
-    next_query_id_with_prefix(buf, b"st-ch-", &QUERY_ID_PROCESS_PREFIX, &QUERY_ID_COUNTER)
 }
 
 pub(super) fn build_query_packet_template(config: &ClientConfig, rev: u64) -> QueryPacketTemplate {
