@@ -182,6 +182,10 @@ All notable changes to st-clickhouse are documented here.
   to the ClickHouse `settings` map).
 - `QueryBuilder::blocks()` returns every non-empty result block while preserving
   server block boundaries and moving, rather than copying, column payloads.
+- **Sync `QueryStream` chunked refill**: the chunked-transport receive path in
+  `SyncClient::start_stream` now rejects a server-claimed chunk length above
+  the shared 64 MiB transport cap before resizing its buffer (previously an
+  eager zeroed allocation of up to 4 GiB-1 from a 4-byte header).
 - **Query-ID collisions between sync and async clients**: the sync
   (`crate::sync`) and tokio (`crate::connection`) packet builders each owned a
   `st-ch-` counter, so a sync query and an async query issued from the same
