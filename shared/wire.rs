@@ -163,6 +163,13 @@ pub fn parse_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
     }
 }
 
+/// Parse raw ClickHouse string bytes from a buffer, advancing the position.
+#[inline]
+pub fn parse_string_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
+    let len = checked_string_len(parse_varint(buf, pos)?)?;
+    parse_bytes(buf, pos, len)
+}
+
 /// Parse a ClickHouse string from a byte buffer, advancing the position.
 #[inline]
 pub fn parse_string<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a str> {

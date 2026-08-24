@@ -14,6 +14,15 @@ pub enum Error {
     Compression(String),
     /// Authentication failure.
     Authentication(String),
+    /// Server returned an exception for the query.
+    ServerError {
+        /// ClickHouse error code (e.g. 46 for `UNKNOWN_FUNCTION`).
+        code: i32,
+        /// Exception name (e.g. `DB::Exception`).
+        name: String,
+        /// Root message plus any nested exception chain.
+        message: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -23,6 +32,11 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Compression(msg) => write!(f, "compression error: {msg}"),
             Error::Authentication(msg) => write!(f, "authentication error: {msg}"),
+            Error::ServerError {
+                code,
+                name,
+                message,
+            } => write!(f, "server error (code={code}, name={name}): {message}"),
         }
     }
 }
@@ -39,5 +53,31 @@ impl std::error::Error for Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
+    }
+}
+
+impl Error {
+    /// Returns `true` if the server returned an exception for the query.
+    pub fn is_server_error(&self) -> bool {
+        matches!(self, Error::ServerError { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_error_display_includes_code_name_and_message() {
+        let err = Error::ServerError {
+            code: 60,
+            name: "DB::Exception".into(),
+            message: "unknown function xyz".into(),
+        };
+        assert!(err.is_server_error());
+        assert_eq!(
+            err.to_string(),
+            "server error (code=60, name=DB::Exception): unknown function xyz"
+        );
     }
 }

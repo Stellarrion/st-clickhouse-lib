@@ -14,6 +14,7 @@ use crate::sync::protocol::block::{Block, BlockView};
 use crate::sync::protocol::parameters::{
     QueryParameter, query_parameters_capacity, write_query_parameters_to_vec,
 };
+use crate::sync::protocol::response_packets::parse_exception_chain;
 use crate::sync::schema::{
     TableColumn, TableSchema, query_may_change_schema, quote_identifier_path,
 };
@@ -558,11 +559,18 @@ impl SyncClient {
         Ok(blocks)
     }
 
+    /// Consume the response to EndOfStream, surfacing every failure.
+    ///
+    /// Server exceptions and protocol/parse errors are returned as `Err`; a
+    /// failed DDL/DML must never report success. After a server exception the
+    /// connection framing is intact and the client stays usable; after a
+    /// protocol error the stream position is unknown and the connection must
+    /// be dropped.
     pub fn drain_response(&mut self) -> Result<()> {
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
         let mut blocks = Vec::new();
-        let res = if self.server_info.use_chunked_recv {
+        if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
             read_response_blocks(
@@ -581,11 +589,6 @@ impl SyncClient {
                 rev,
                 self.server_info.use_chunked_send,
             )
-        };
-        match res {
-            Ok(_) => Ok(()),
-            Err(Error::Protocol(_)) => Ok(()), // swallow protocol errors in drain
-            Err(e) => Err(e),
         }
     }
 
@@ -1222,8 +1225,15 @@ fn checked_len(count: usize, elem_size: usize, what: &str) -> Result<usize> {
 }
 
 #[cold]
+/// Read an Exception packet (type 2) body into a structured error.
+///
+/// A fully parsed chain yields [`Error::ServerError`] with the root
+/// exception's code/name and the whole nested chain in `message`. Any read or
+/// parse failure inside the packet is returned as-is so malformed protocol
+/// stays distinguishable from a terminal server exception.
 fn read_exception_packet<R: std::io::Read>(reader: &mut R) -> Error {
-    let mut parts = Vec::new();
+    let mut messages = Vec::new();
+    let mut root: Option<(i32, String)> = None;
     loop {
         let code = match wire::read_bytes(reader, 4) {
             Ok(bytes) => {
@@ -1233,17 +1243,39 @@ fn read_exception_packet<R: std::io::Read>(reader: &mut R) -> Error {
             },
             Err(e) => return e,
         };
-        let name = wire::read_string(reader).unwrap_or_else(|_| "unknown".to_string());
-        let msg = wire::read_string(reader).unwrap_or_default();
-        let _stack = wire::read_string(reader);
-        parts.push(format!("{name} (code {code}): {msg}"));
+        // Lossy decode: a server exception must surface even if its message
+        // contains bytes that are not valid UTF-8.
+        let name = match read_string_lossy(reader) {
+            Ok(name) => name,
+            Err(e) => return e,
+        };
+        let msg = match read_string_lossy(reader) {
+            Ok(msg) => msg,
+            Err(e) => return e,
+        };
+        if let Err(e) = wire::read_string_bytes(reader) {
+            return e; // stack trace still frames the packet; it must parse
+        }
+        messages.push(format!("{name} (code {code}): {msg}"));
+        if root.is_none() {
+            root = Some((code, name));
+        }
         match wire::read_bytes(reader, 1) {
             Ok(flag) if flag.first().copied().unwrap_or(0) != 0 => {},
             Ok(_) => break,
             Err(e) => return e,
         }
     }
-    Error::Protocol(format!("server error: {}", parts.join(" | nested: ")))
+    let (code, name) = root.unwrap_or((0, "unknown".to_string()));
+    Error::ServerError {
+        code,
+        name,
+        message: messages.join(" | nested: "),
+    }
+}
+
+fn read_string_lossy<R: std::io::Read>(reader: &mut R) -> Result<String> {
+    wire::read_string_bytes(reader).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn skip_progress_packet<R: std::io::Read>(reader: &mut R, rev: u64) -> Result<()> {
@@ -1522,30 +1554,28 @@ impl QueryStream {
                         self.done = true;
                         return Ok(None);
                     },
-                    2 => {
-                        let code = match wire::parse_i32(&self.buffer, &mut self.pos) {
-                            Ok(v) => v,
-                            Err(Error::Protocol(_)) => {
-                                self.pos = saved_pos;
-                                self.fill_buffer()?;
-                                continue;
-                            },
-                            Err(e) => return Err(e),
-                        };
-                        let name = wire::parse_string(&self.buffer, &mut self.pos)
-                            .unwrap_or("unknown")
-                            .to_owned();
-                        let msg = wire::parse_string(&self.buffer, &mut self.pos)
-                            .unwrap_or("")
-                            .to_owned();
-                        let _ = wire::parse_string(&self.buffer, &mut self.pos);
-                        if self.pos < self.buffer.len() {
-                            self.pos += 1;
-                        }
-                        self.done = true;
-                        return Err(Error::Protocol(format!(
-                            "server error (code={code}, name={name}): {msg}"
-                        )));
+                    2 => match parse_exception_chain(&self.buffer, &mut self.pos) {
+                        Ok((code, name, message)) => {
+                            self.done = true;
+                            return Err(Error::ServerError {
+                                code,
+                                name,
+                                message,
+                            });
+                        },
+                        Err(Error::Protocol(_)) => {
+                            self.pos = saved_pos;
+                            let buffered = self.buffer.len();
+                            self.fill_buffer()?;
+                            if self.buffer.len() == buffered {
+                                self.done = true;
+                                return Err(Error::Protocol(
+                                    "truncated exception packet in query stream".into(),
+                                ));
+                            }
+                            continue;
+                        },
+                        Err(e) => return Err(e),
                     },
                     3 => {
                         let fields = 3
@@ -1762,6 +1792,179 @@ impl QueryStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        wire::write_varint(buf, s.len() as u64).expect("test operation failed");
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// Body of an Exception packet (after the type varint) for one exception.
+    fn exception_body(code: i32, name: &str, msg: &str, nested: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&code.to_le_bytes());
+        put_string(&mut buf, name);
+        put_string(&mut buf, msg);
+        put_string(&mut buf, ""); // stack trace
+        buf.push(u8::from(nested)); // has_nested
+        buf
+    }
+
+    #[test]
+    fn read_exception_packet_parses_chain_into_server_error() {
+        let mut body = exception_body(60, "DB::Exception", "unknown function xyz", true);
+        body.extend(exception_body(48, "DB::Exception", "inner cause", false));
+        let err = read_exception_packet(&mut std::io::Cursor::new(body));
+        match &err {
+            Error::ServerError {
+                code,
+                name,
+                message,
+            } => {
+                assert_eq!(*code, 60, "root code must be reported");
+                assert_eq!(name, "DB::Exception");
+                assert!(
+                    message.contains("unknown function xyz") && message.contains("inner cause"),
+                    "message must carry the whole chain: {message}"
+                );
+            },
+            _other => unreachable!("expected ServerError, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn read_exception_packet_distinguishes_malformed_body() {
+        let mut body = exception_body(60, "DB::Exception", "unknown function xyz", false);
+        body.truncate(body.len() - 2); // cut the has_nested flag
+        let err = read_exception_packet(&mut std::io::Cursor::new(body));
+        assert!(
+            matches!(err, Error::Protocol(_) | Error::Io(_)),
+            "truncated exception body must not become ServerError, got {err:?}"
+        );
+    }
+
+    fn query_stream_with_buffer(buffer: Vec<u8>) -> (QueryStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test socket");
+        let (server, _) = listener.accept().expect("accept test socket");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .expect("set test timeout");
+        (
+            QueryStream {
+                buffer,
+                pos: 0,
+                stream: crate::sync::transport::Transport::new_plain(client),
+                read_buffer_size: 8192,
+                compression: None,
+                negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
+                chunked_recv: false,
+                chunked_send: false,
+                done: false,
+            },
+            server,
+        )
+    }
+
+    #[test]
+    fn query_stream_refills_and_parses_nested_exception_chain() {
+        let mut packet = vec![2];
+        packet.extend(exception_body(1000, "DB::Exception", "outer", true));
+        packet.extend(exception_body(48, "DB::Exception", "inner", false));
+        let split = 9;
+        let (mut stream, mut server) = query_stream_with_buffer(packet[..split].to_vec());
+        server
+            .write_all(&packet[split..])
+            .expect("write remainder of split exception");
+
+        let err = stream
+            .read_next_block()
+            .err()
+            .expect("exception stream must return an error");
+        let Error::ServerError {
+            code,
+            name,
+            message,
+        } = err
+        else {
+            unreachable!("expected ServerError");
+        };
+        assert_eq!(code, 1000);
+        assert_eq!(name, "DB::Exception");
+        assert!(message.contains("outer") && message.contains("inner"));
+    }
+
+    #[test]
+    fn query_stream_truncated_exception_terminates_as_protocol_error() {
+        let mut packet = vec![2];
+        packet.extend_from_slice(&46i32.to_le_bytes());
+        let (mut stream, server) = query_stream_with_buffer(packet);
+        server
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close server write side");
+
+        let err = stream
+            .read_next_block()
+            .err()
+            .expect("truncated exception must return an error");
+        assert!(
+            matches!(err, Error::Protocol(ref message) if message.contains("truncated exception")),
+            "expected truncated Protocol error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_response_blocks_surfaces_server_exception() {
+        let mut wire_bytes = Vec::new();
+        wire::write_varint(&mut wire_bytes, 2).expect("test operation failed");
+        wire_bytes.extend(exception_body(
+            60,
+            "DB::Exception",
+            "unknown function xyz",
+            false,
+        ));
+
+        let mut reader = std::io::Cursor::new(wire_bytes);
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+        )
+        .expect_err("server exception must surface");
+        assert!(err.is_server_error(), "expected ServerError, got {err:?}");
+    }
+
+    #[test]
+    fn read_response_blocks_end_of_stream_is_ok_and_unknown_packet_is_err() {
+        let mut reader = std::io::Cursor::new(vec![5u8]);
+        let mut blocks = Vec::new();
+        read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+        )
+        .expect("EndOfStream drains to Ok");
+
+        let mut reader = std::io::Cursor::new(vec![99u8, 5]);
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+        )
+        .expect_err("unknown packet type must surface");
+        assert!(
+            matches!(err, Error::Protocol(ref msg) if msg.contains("unknown packet type")),
+            "expected protocol error, got {err:?}"
+        );
+    }
 
     #[test]
     fn chunked_reader_removes_native_chunk_markers() {

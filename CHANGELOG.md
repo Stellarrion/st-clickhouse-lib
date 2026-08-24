@@ -33,6 +33,12 @@ All notable changes to st-clickhouse are documented here.
   soundness hole that could lead to an out-of-bounds unsafe read.
 - Async `execute()` and `InsertSession::end()` now return ClickHouse server exceptions
   instead of reporting silent success.
+- Sync `drain_response()` (backing `SyncClient::execute*` and `end_insert`) no longer
+  swallows protocol errors: a failed DDL/DML response is always `Err`. The sync error
+  model gained a structured `Error::ServerError { code, name, message }` populated by
+  the native Exception parser (root code/name plus the nested chain in `message`),
+  with malformed/truncated packets still reported as protocol or I/O errors. The
+  Python binding maps it to `QueryError`.
 - `.block()` and `fetch::<Block>()` now require exactly one non-empty server block and
   return an error on multi-block results instead of silently dropping later rows. Use
   `.blocks()` when the result can span blocks.

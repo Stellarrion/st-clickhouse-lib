@@ -377,6 +377,39 @@ class TestTypeConversion:
 # ══════════════════════════════════════════════════════════════════════════
 
 class TestErrors:
+    def test_server_error_mapping_is_query_error(self):
+        """Native ServerError text maps to QueryError, not ProtocolError.
+
+        Server-free unit test for the _native → _errors mapping: the native
+        to_py_err raises ValueError with a "ClickHouse server error (code=..."
+        prefix; map_error must classify it as QueryError even when the server
+        message itself contains words like "protocol" or "compression".
+        """
+        from st_clickhouse._errors import QueryError, map_error
+
+        exc = ValueError(
+            "ClickHouse server error (code=60, name=DB::Exception): "
+            "unknown function protocol_compression_xyz"
+        )
+        mapped = map_error(exc)
+        assert isinstance(mapped, QueryError)
+        assert isinstance(mapped, ClickHouseError)
+
+        auth_flavored = map_error(
+            ValueError(
+                "ClickHouse server error (code=516, name=DB::Exception): "
+                "Authentication failed"
+            )
+        )
+        assert isinstance(auth_flavored, QueryError)
+
+    def test_protocol_error_mapping_unchanged(self):
+        """Plain protocol ValueError still maps to ProtocolError."""
+        from st_clickhouse._errors import ProtocolError, map_error
+
+        mapped = map_error(ValueError("ClickHouse protocol error: unknown packet type: 99"))
+        assert isinstance(mapped, ProtocolError)
+
     def test_query_error(self, client: Client):
         """Invalid SQL raises ClickHouseError."""
         with pytest.raises(ClickHouseError):

@@ -38,6 +38,10 @@ def map_error(exc: Exception) -> ClickHouseError:
     if isinstance(exc, ClickHouseError):
         return exc
     msg = str(exc)
+    # Native ServerError mapping must win over word heuristics because a server
+    # message can itself contain words like "authentication" or "compression".
+    if isinstance(exc, ValueError) and msg.startswith("ClickHouse server error (code="):
+        return QueryError(msg)
     if "authentication" in msg.lower():
         return AuthenticationError(msg)
     if isinstance(exc, ConnectionError):

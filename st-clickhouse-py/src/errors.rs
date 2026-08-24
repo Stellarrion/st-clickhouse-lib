@@ -22,5 +22,16 @@ pub fn to_py_err(err: st_clickhouse::sync::error::Error) -> PyErr {
             // Auth errors → ConnectionError with clear message
             PyConnectionError::new_err(format!("ClickHouse authentication error: {msg}"))
         },
+        st_clickhouse::sync::error::Error::ServerError {
+            code,
+            name,
+            message,
+        } => {
+            // Server exceptions → ValueError whose text `_errors.map_error`
+            // recognises as a query failure (QueryError on the Python side).
+            PyValueError::new_err(format!(
+                "ClickHouse server error (code={code}, name={name}): {message}"
+            ))
+        },
     }
 }
