@@ -55,18 +55,25 @@ impl Client {
         let metric_guard = QueryMetricGuard::new(self.metrics(), 1);
         let mut guard = self.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
+        let mut query_id_buf = [0u8; 22];
+        let query_id = query_id_bytes(None, &mut query_id_buf);
+        let pkt = build_query_packet_from_cached_or_revision(
+            &self.query_template,
+            &self.settings,
+            rev,
+            query,
+            query_id,
+            true,
+            &[],
+        );
+        // Mark in-flight before the first packet that can leave a response
+        // pending (the optional pre-query Ping; otherwise the query write).
+        // The BlockStream clears the mark at its clean terminal points
+        // (EndOfStream / server exception); everything else already discards
+        // the socket, so a dropped future in between cannot return a
+        // mid-response stream.
+        guard.mark_response_in_flight();
         {
-            let mut query_id_buf = [0u8; 22];
-            let query_id = query_id_bytes(None, &mut query_id_buf);
-            let pkt = build_query_packet_from_cached_or_revision(
-                &self.query_template,
-                &self.settings,
-                rev,
-                query,
-                query_id,
-                true,
-                &[],
-            );
             let stream = guard.stream_mut();
             if self.ping_before_query {
                 ping_stream(stream).await?;
@@ -155,7 +162,10 @@ impl BlockStream<'_> {
                 },
                 2 => {
                     let err = read_exception(stream).await?;
+                    // A server exception terminates the response: the
+                    // connection stays clean and reusable.
                     self.done = true;
+                    self.guard.clear_response_in_flight();
                     return Err(err);
                 },
                 3 => {
@@ -164,6 +174,9 @@ impl BlockStream<'_> {
                 4 => {},
                 5 => {
                     self.done = true;
+                    // EndOfStream: the response cycle is complete, so the
+                    // pooled connection stays reusable after the stream drops.
+                    self.guard.clear_response_in_flight();
                     return Ok(None);
                 },
                 6 => {

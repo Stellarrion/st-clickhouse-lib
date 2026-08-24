@@ -364,23 +364,32 @@ async fn test_cancel_during_progress() {
         on_part_uuids: None,
     };
 
-    // Spawn a long-running query in the background
+    // Client::cancel is fail-closed: it cannot reach the connection running
+    // the query, so it must return Error::Config without opening or touching
+    // any pooled connection. The heavy query below runs on a different client
+    // and finishes (or errors) on its own.
     let client_for_cancel = connect().await;
     let cancel_handle = tokio::spawn(async move {
         // Give the query a moment to start sending progress
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = client_for_cancel.cancel().await;
+        #[allow(deprecated)]
+        let result = client_for_cancel.cancel().await;
+        matches!(result, Err(st_clickhouse::error::Error::Config(_)))
     });
 
-    // Run a heavy query — will be cancelled
+    // Run a heavy query — unaffected by the (fail-closed) cancel
     let result = client
         .query("SELECT number FROM system.numbers LIMIT 500000000")
         .with_callbacks(callbacks)
         .block()
         .await;
 
-    // Wait for cancel to complete
-    let _ = cancel_handle.await;
+    // Wait for cancel to complete and prove it failed closed.
+    let cancelled_config_error = cancel_handle.await.expect("cancel task must not panic");
+    assert!(
+        cancelled_config_error,
+        "Client::cancel must fail closed with Error::Config"
+    );
 
     match result {
         Ok(block) => {

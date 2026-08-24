@@ -47,19 +47,26 @@ impl Client {
             true,
             &[],
         );
-        let stream = guard.stream_mut();
-        if self.ping_before_query {
-            ping_stream(stream).await?;
-        }
-        stream.write_packet(&pkt).await?;
-        stream.flush().await?;
         let response_compressed = compression_flag(self.compression) == 1;
         let deadline = self
             .query_timeout
             .map(|t| crate::runtime::time::Instant::now() + t);
-        let block_result =
-            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await;
-        guard.invalidate_on_err(&block_result);
+        // Mark in-flight before the first packet that can leave a response
+        // pending (the optional pre-query Ping; otherwise the INSERT write): a
+        // future dropped between here and the session's terminal packet must
+        // not hand a mid-response socket back to the pool. Once the session
+        // exists, its `active` flag governs; PoolGuard::drop covers the gap.
+        guard.mark_response_in_flight();
+        let block_result = {
+            let stream = guard.stream_mut();
+            if self.ping_before_query {
+                ping_stream(stream).await?;
+            }
+            stream.write_packet(&pkt).await?;
+            stream.flush().await?;
+            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await
+        };
+        guard.finish_response(&block_result);
         let block = block_result?;
         metric_guard.succeed();
         Ok(InsertSession {
@@ -142,7 +149,7 @@ impl InsertSession<'_> {
         if result.is_ok() {
             self.active = false;
         }
-        self.guard.invalidate_on_err(&result);
+        self.guard.finish_response(&result);
         result
     }
 }

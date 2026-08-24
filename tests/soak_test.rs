@@ -229,7 +229,9 @@ async fn large_insert_100k() {
     );
 }
 
-/// Cancellation under load — spawn queries, cancel mid-flight.
+/// Cancellation under load — spawn queries, abort mid-flight. Aborting drops
+/// the execute future at an await point; the in-flight pool state must turn
+/// that into a clean reconnect instead of poisoning the slot.
 #[tokio::test]
 #[ignore]
 async fn cancellation_under_load() {
@@ -245,12 +247,17 @@ async fn cancellation_under_load() {
         // Give it a moment to start
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Cancel it
-        client.cancel().await.unwrap_or_else(|e| {
-            eprintln!("  cancel {i} result: {e} (expected if query already finished)");
-        });
-
+        // Abort it: Client::cancel is fail-closed (it cannot reach the
+        // connection running the query), so dropping the future is the
+        // supported way to stop it.
+        handle.abort();
         let _ = handle.await;
+
+        // The pool must stay usable immediately after each abort.
+        client
+            .execute("SELECT toUInt8(1)")
+            .await
+            .expect("pool unusable after abort");
         eprintln!("  cancel test {}/{} done", i + 1, n_cancels);
     }
     eprintln!("  all {n_cancels} cancellation tests done");

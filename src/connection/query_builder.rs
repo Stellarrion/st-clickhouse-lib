@@ -288,8 +288,15 @@ impl<'a> QueryBuilder<'a> {
                 &self.params,
             )
         };
+        // Mark in-flight before the first packet that can leave a response
+        // pending (the optional pre-query Ping; otherwise the query write): a
+        // future dropped between here and the terminal packet must not hand a
+        // mid-response socket back to the pool (PoolGuard::drop discards it).
+        guard.mark_response_in_flight();
         // Send phase: scope the stream borrow so the connection can be
         // invalidated on a write/flush failure rather than returned broken.
+        // The pre-query ping and part-UUID packets drain their own responses
+        // before the query write goes out.
         let send: Result<()> = async {
             let stream = guard.stream_mut();
             if self.client.ping_before_query {
@@ -347,7 +354,7 @@ impl<'a> QueryBuilder<'a> {
             FirstBlockHandler::default(),
         )
         .await;
-        guard.invalidate_on_err(&result);
+        guard.finish_response(&result);
         result
     }
 
@@ -367,7 +374,7 @@ impl<'a> QueryBuilder<'a> {
             BlocksHandler::default(),
         )
         .await;
-        guard.invalidate_on_err(&result);
+        guard.finish_response(&result);
         result
     }
 
@@ -484,7 +491,7 @@ impl<'a> QueryBuilder<'a> {
             RowCountHandler::default(),
         )
         .await;
-        guard.invalidate_on_err(&result);
+        guard.finish_response(&result);
         result
     }
 
@@ -504,7 +511,7 @@ impl<'a> QueryBuilder<'a> {
             AllRowsHandler::<T>::default(),
         )
         .await;
-        guard.invalidate_on_err(&result);
+        guard.finish_response(&result);
         result
     }
 
@@ -524,7 +531,7 @@ impl<'a> QueryBuilder<'a> {
             RawBlocksHandler::default(),
         )
         .await;
-        guard.invalidate_on_err(&result);
+        guard.finish_response(&result);
         let blocks = result?;
         metric_guard.succeed();
         Ok(blocks)

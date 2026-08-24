@@ -115,16 +115,26 @@ async fn test_two_queries_sequentially() {
 #[tokio::test]
 async fn test_cancel_query() {
     let client = common::connect_client().await;
-    // Cancel is harmless on an idle connection (packet type 3)
-    client.cancel().await.expect("test operation failed");
-    // Connection should still be usable after cancel
+    // Client::cancel is fail-closed: it owns a pool, not the connection
+    // running a query, so it must return Error::Config without touching any
+    // pooled connection.
+    #[allow(deprecated)]
+    let cancelled = client.cancel().await;
+    match &cancelled {
+        Err(st_clickhouse::error::Error::Config(msg)) => assert!(
+            msg.contains("query timeout") && msg.contains("BlockStream::cancel"),
+            "cancel error must point at the alternatives: {msg}"
+        ),
+        other => unreachable!("expected Error::Config, got {other:?}"),
+    }
+    // The connection is untouched and stays usable.
     let block = client
         .query("SELECT 1")
         .block()
         .await
         .expect("test operation failed");
     assert_eq!(block.row_count(), 1);
-    eprintln!("SUCCESS: cancel then query works!");
+    eprintln!("SUCCESS: fail-closed cancel keeps the client usable!");
 }
 
 #[tokio::test]

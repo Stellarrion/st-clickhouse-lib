@@ -143,6 +143,13 @@ impl<'a> BatchBuilder<'a> {
             write_batch_query_packet_from_template(&mut all_packets, &template, sql, query_id);
         }
 
+        // Mark in-flight before the first packet that can leave a response
+        // pending (the optional pre-query Ping; otherwise the pipelined query
+        // writes): a future dropped before take_stream() must not hand a
+        // mid-response socket back to the pool. Taking the stream below moves
+        // the connection out of the pool entirely, so the mark stops mattering
+        // once the reader task owns the socket.
+        guard.mark_response_in_flight();
         let stream = guard.stream_mut();
         if self.client.ping_before_query {
             ping_stream(stream).await?;
@@ -150,7 +157,11 @@ impl<'a> BatchBuilder<'a> {
         stream.write_packet(&all_packets).await?;
         stream.flush().await?;
 
-        // Take the stream and spawn a reader task
+        // Take the stream and spawn a reader task. Clear the in-flight mark
+        // first: the reader task now owns the socket outright, so dropping
+        // this future must not also discard (an empty take would be a no-op,
+        // but the flag would survive on a `None` slot semantics audit).
+        guard.clear_response_in_flight();
         let stream = guard
             .take_stream()
             .ok_or_else(|| crate::error::Error::Protocol("connection stream taken".into()))?;

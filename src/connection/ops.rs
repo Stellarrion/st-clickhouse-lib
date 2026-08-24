@@ -7,18 +7,26 @@ impl Client {
     /// Ping the server to verify the connection is alive.
     pub async fn ping(&self) -> Result<()> {
         let mut guard = self.pool.get().await?;
-        let stream = guard.stream_mut();
-        stream.write_packet(&[ClientPacket::Ping as u8]).await?;
-        stream.flush().await?;
-        let mut pkt = [0u8; 1];
-        stream.read_exact(&mut pkt).await?;
-        if pkt[0] != 4 {
-            return Err(crate::error::Error::Protocol(format!(
-                "expected Pong (4), got {}",
-                pkt[0]
-            )));
+        // Mark in-flight before the Ping: a future dropped before the Pong
+        // must not return a socket with a stray reply pending to the pool.
+        guard.mark_response_in_flight();
+        let result = async {
+            let stream = guard.stream_mut();
+            stream.write_packet(&[ClientPacket::Ping as u8]).await?;
+            stream.flush().await?;
+            let mut pkt = [0u8; 1];
+            stream.read_exact(&mut pkt).await?;
+            if pkt[0] != 4 {
+                return Err(crate::error::Error::Protocol(format!(
+                    "expected Pong (4), got {}",
+                    pkt[0]
+                )));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        guard.finish_response(&result);
+        result
     }
 
     /// Execute a SELECT and return only the number of rows in Data packets.

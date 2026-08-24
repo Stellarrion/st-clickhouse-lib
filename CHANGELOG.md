@@ -154,6 +154,31 @@ All notable changes to st-clickhouse are documented here.
   into query parameters.
 
 ### Fixed
+- **Dropping a query future no longer poisons the pool** (`st_clickhouse`, async
+  engine): every pooled connection now carries an in-flight response mark, set before
+  the first response-triggering packet write (query, pre-query Ping, TablesStatus,
+  batch) and cleared after the terminal packet (EndOfStream / end of an Exception
+  chain) or a resolved response cycle. When a future is dropped at an await point
+  mid-response (timeout wrapper, `tokio::spawn` + `abort`, `select!`), the guard now
+  discards that socket so the next `pool.get()` makes exactly one clean reconnect —
+  previously the mid-response socket returned to the pool and the next user hit a
+  bogus `Protocol` error that kept the slot poisoned until an idle Ping eventually
+  failed. The mark is owned by the task holding the guard, so there is no
+  cross-task race; the clear window can at worst cause one needless reconnect.
+  `BlockStream`/`InsertSession` keep their own session-level discard and clear the
+  mark at their clean terminal points.
+- **`SimplePool::drop` no longer writes an unframed Cancel byte through chunked or
+  TLS transports**: the best-effort raw `try_write(Cancel)` is now sent only when the
+  transport is plain TCP with chunked sending off — the only case where a single raw
+  byte is wire-correct. Chunked and TLS connections are simply closed instead of
+  emitting protocol garbage.
+- **Chunked-receive reentrancy** (async engine): a poll that returned `Pending`
+  between reading a chunk's 4-byte length and its payload made the next poll serve
+  the zero-fill bytes of the resized buffer (and re-read a length from payload
+  bytes). The chunked reader now serves only received bytes (`chunk_fill`) and
+  resumes the in-progress chunk instead of restarting the frame. Found by the new
+  chunked-transport pool-drop regression test, whose mock writes frame parts in
+  separate TCP segments — exactly the split a real server or proxy can produce.
 - **Per-query settings no longer leak** (`st_clickhouse`): `with_per_query_settings`
   mutated the native client's session settings (`set_setting`) for every query and its
   `finally` restore loop was a no-op, so a per-query setting persisted on the
@@ -197,6 +222,16 @@ All notable changes to st-clickhouse are documented here.
   their own counter.
 
 ### Changed (BREAKING)
+- **Async `Client::cancel()` is now fail-closed** (`st_clickhouse`): it used to grab an
+  arbitrary idle pooled connection and send `Cancel` there — the stray packet was
+  silently swallowed by the server (cancelling nothing), and with a busy single-slot
+  pool it blocked until the query finished. A `Client` owns a pool, not the connection
+  running your query, so `cancel()` now returns `Error::Config` explaining the
+  query-scoped alternatives without touching any connection, and is marked
+  `#[deprecated]` (signature unchanged). Use a query deadline
+  (`Client::with_query_timeout` / `QueryBuilder::timeout`), `BlockStream::cancel()` on
+  a `begin_select` stream, or drop the `RowCursor` returned by `QueryBuilder::rows()`.
+  The sync engine's `SyncClient::cancel` is unchanged.
 - `PlainColumnData::read_from_bytes` now returns `Result<Self>` and rejects a logical
   element count that exceeds the backing bytes. This closes a safe-constructor
   soundness hole that could lead to an out-of-bounds unsafe read.
