@@ -44,6 +44,19 @@ All notable changes to st-clickhouse are documented here.
   `.blocks()` when the result can span blocks.
 
 ### Fixed
+- **Python connection pool correctness** (`st_clickhouse._pool`): the pool now runs an
+  explicit lending state machine (`_all` / `_available` / `_lent` / `_creating`). Fixes
+  double-lending of freshly grown connections (the new client was both returned and left
+  available), duplicate deque entries from double `release()`, slot resurrection after
+  `close()` cleared state outside the lock (releases and in-flight health checks could
+  re-add slots; the reaper could then "reap" a lent connection), and zombie slots when a
+  health-check replacement failed. Factory calls and pings now run outside the condition
+  lock (a slow health check no longer blocks other acquires), concurrent growth can never
+  exceed `max_size` and discards its client if the pool closes mid-create, `release()`
+  is idempotent and a no-op on a closed pool, and pool metrics gained a truthful
+  `in_use` plus a new `creating` counter for in-progress growth calls (in-progress
+  creates are excluded from `total`/`in_use` until they commit). Pool size/time
+  configuration is validated at construction. No public API change.
 - Derived rows map fields by column name even when the SELECT order differs, while
   tuples and existing manual `Row` implementations remain positional. The ordered
   fast path stays allocation-free.
