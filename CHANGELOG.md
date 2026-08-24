@@ -33,6 +33,46 @@ All notable changes to st-clickhouse are documented here.
   - Deterministic server-free regressions added for all of the above with
     `u64::MAX` and cap+1 counts (asserting `Protocol` errors, never panics),
     plus boundary (exact-cap) and within-cap happy paths.
+- **Bounded server-controlled column byte lengths, nested totals, and
+  count-derived eager allocations (P0)**: every inbound native-protocol column
+  parser in both engines now validates server-controlled byte lengths and
+  nested element counts against shared internal caps in `src/limits.rs`
+  *before* any `resize`/`reserve`/`with_capacity` or read loop is sized from
+  them: `MAX_STRING_BYTES` (16 MiB - 1, unchanged clickhouse-cpp wire limit)
+  per String/JSON column value, and `MAX_COLUMN_BYTES` (64 MiB) per column for
+  accumulated string values, fixed-width/offset/LowCardinality-index buffers,
+  raw-capture arenas, and LowCardinality materialization. Array and Map
+  offsets must be non-decreasing (cumulative prefix sums) and their last
+  value — the inner element row count — is capped at 10,000,000 before the
+  inner column is read. LowCardinality raw readers now require the index
+  count to equal the outer row count (as the native format guarantees, and as
+  the materialized readers already did); Variant compact-mode granules may
+  carry at most the outer row count of the single non-empty variant (zero is
+  legal for all-NULL granules, so equality is deliberately not enforced).
+  Trusted outbound inserts are untouched. Previously a hostile or compromised
+  server could drive multi-TiB eager allocations from a few bytes of wire
+  (a varint string length, an 8-byte Array/Map offset of 2^60, a
+  `rows * width` product, a LowCardinality index count, a Variant compact row
+  count, or dictionary expansion that repeats one 16 MiB entry across 10M
+  rows); it now gets a deterministic `Error::Protocol` naming the field, the
+  received value, and the limit.
+  - Covered paths: async `read_string_column_with_prefixes`, the streamed and
+    decompressed-buffer block readers (read/skip), `read_offsets_column`,
+    materialized and discard column readers, the raw-capture reader (per
+    column byte budget incl. state prefixes), LowCardinality materialization
+    (async and sync), and the sync buffer, streamed, view, raw, and discard
+    readers. Compressed and plain payloads share the same column-level caps.
+  - Compatibility: a single column whose wire data (or materialized output)
+    exceeds 64 MiB now fails deterministically instead of allocating; blocks
+    up to 10M rows remain accepted when each column stays within the budget.
+    Non-monotonic Array/Map offsets are rejected (valid servers always emit
+    cumulative prefix sums).
+  - Deterministic server-free regressions added for lying string/JSON lengths
+    (`2^40`, `u64::MAX`), cumulative column cap + 1, `2^60` Array/Map offsets,
+    decreasing offsets, fixed-width and LowCardinality index buffers at
+    cap + 1, LowCardinality index-count mismatch and `u64::MAX`, and Variant
+    compact row claims — all asserting `Protocol` errors before allocation or
+    read, with boundary (equality and within-cap) paths retained.
 - **Bounded transport chunk and compression-frame allocations (P0)**: all
   server-controlled chunk and compression-frame lengths are now validated
   against shared internal caps (`64 MiB`) before any buffer is sized, in both

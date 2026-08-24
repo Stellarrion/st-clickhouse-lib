@@ -114,7 +114,8 @@ async fn capture_raw_column(type_name: &str, rows: usize, wire_data: &[u8]) -> V
     drop(writer);
 
     let mut out = Vec::new();
-    read_column_raw_recorded(&mut reader, type_name, rows, &mut out)
+    let mut budget = crate::limits::MAX_COLUMN_BYTES;
+    read_column_raw_recorded(&mut reader, type_name, rows, &mut out, &mut budget)
         .await
         .expect("test operation failed");
     out

@@ -1,5 +1,6 @@
 use crate::connection::io::{
-    checked_count, checked_len, checked_usize, encode_varint, lc_idx_width, read_block_header,
+    checked_column_bytes, checked_column_len, checked_count, checked_len, checked_monotonic_offset,
+    checked_string_len, checked_usize, encode_varint, lc_idx_width, read_block_header,
     read_offsets_column, read_string_async, read_string_column_with_prefixes, read_varint_async,
 };
 use crate::connection::raw_block_reader::{
@@ -23,8 +24,7 @@ fn skip_col_typed(data: &[u8], pos: &mut usize, tn: &str, rows: usize) -> Result
         Ok(c) => c,
         Err(_) => {
             for _ in 0..rows {
-                let l = usize::try_from(parse_varint(data, pos)?)
-                    .map_err(|_| crate::error::Error::Protocol("string too large".into()))?;
+                let l = checked_string_len(parse_varint(data, pos)?, "string value length")?;
                 advance_pos(data, pos, l)?;
             }
             return Ok(());
@@ -89,8 +89,7 @@ fn skip_col_typed(data: &[u8], pos: &mut usize, tn: &str, rows: usize) -> Result
                 if *pos >= data.len() {
                     break;
                 }
-                let l = usize::try_from(parse_varint(data, pos)?)
-                    .map_err(|_| crate::error::Error::Protocol("string too large".into()))?;
+                let l = checked_string_len(parse_varint(data, pos)?, "string value length")?;
                 advance_pos(data, pos, l)?;
             }
             Ok(())
@@ -608,8 +607,12 @@ pub(super) async fn read_column_async<
         Ok(c) => c,
         Err(_) => {
             let mut data = Vec::new();
+            let mut total = 0usize;
             for _ in 0..rows {
-                let l = checked_usize(read_varint_async(stream).await?, "string value length")?;
+                let l =
+                    checked_string_len(read_varint_async(stream).await?, "string value length")?;
+                // Cumulative per-column cap on the claim, before resize/read.
+                total = checked_column_bytes(total, l, "string value length")?;
                 encode_varint(&mut data, l as u64);
                 let start = data.len();
                 let end = start.checked_add(l).ok_or_else(|| {
@@ -683,7 +686,8 @@ pub(super) async fn read_column_async<
         },
         Dynamic => {
             let mut data = Vec::new();
-            read_column_raw_recorded(stream, type_name, rows, &mut data).await?;
+            let mut budget = crate::limits::MAX_COLUMN_BYTES;
+            read_column_raw_recorded(stream, type_name, rows, &mut data, &mut budget).await?;
             Ok(data)
         },
         AggregateFunction | SimpleAggregateFunction => Err(crate::error::Error::Protocol(
@@ -691,16 +695,25 @@ pub(super) async fn read_column_async<
         )),
         Variant(types) => {
             let mut data = Vec::new();
-            let state = read_column_state_prefix_recorded(stream, &ct, &mut data).await?;
-            read_variant_body_raw_recorded(stream, types, variant_states(&state), rows, &mut data)
-                .await?;
+            let mut budget = crate::limits::MAX_COLUMN_BYTES;
+            let state =
+                read_column_state_prefix_recorded(stream, &ct, &mut data, &mut budget).await?;
+            read_variant_body_raw_recorded(
+                stream,
+                types,
+                variant_states(&state),
+                rows,
+                &mut data,
+                &mut budget,
+            )
+            .await?;
             Ok(data)
         },
         String | Other(_) => {
             read_string_column_with_prefixes(stream, rows, "string value length").await
         },
         FixedString(n) => {
-            let mut data = vec![0u8; checked_len(rows, *n)?];
+            let mut data = vec![0u8; checked_column_len(rows, *n, "FixedString column")?];
             stream.read_exact(&mut data).await?;
             Ok(data)
         },
@@ -708,7 +721,7 @@ pub(super) async fn read_column_async<
             let w = ct
                 .fixed_width()
                 .ok_or_else(|| crate::error::Error::Protocol(format!("unknown type {ct}")))?;
-            let mut data = vec![0u8; checked_len(rows, w)?];
+            let mut data = vec![0u8; checked_column_len(rows, w, "fixed-width column")?];
             stream.read_exact(&mut data).await?;
             Ok(data)
         },
@@ -729,7 +742,8 @@ async fn discard_column_async<
         Ok(c) => c,
         Err(_) => {
             for _ in 0..rows {
-                let len = checked_usize(read_varint_async(stream).await?, "string value length")?;
+                let len =
+                    checked_string_len(read_varint_async(stream).await?, "string value length")?;
                 discard_exact_async(stream, len).await?;
             }
             return Ok(());
@@ -762,7 +776,8 @@ async fn discard_column_async<
         },
         String => {
             for _ in 0..rows {
-                let len = checked_usize(read_varint_async(stream).await?, "string value length")?;
+                let len =
+                    checked_string_len(read_varint_async(stream).await?, "string value length")?;
                 discard_exact_async(stream, len).await?;
             }
         },
@@ -778,7 +793,8 @@ async fn discard_column_async<
                 )));
             }
             for _ in 0..rows {
-                let len = checked_usize(read_varint_async(stream).await?, "JSON string length")?;
+                let len =
+                    checked_string_len(read_varint_async(stream).await?, "JSON string length")?;
                 discard_exact_async(stream, len).await?;
             }
         },
@@ -850,7 +866,11 @@ async fn discard_lc_async<
             "LowCardinality index count {indexes} does not match row count {rows}"
         )));
     }
-    discard_exact_async(stream, checked_len(indexes, idx_width)?).await
+    discard_exact_async(
+        stream,
+        checked_column_len(indexes, idx_width, "LowCardinality index")?,
+    )
+    .await
 }
 
 async fn discard_offsets_async<
@@ -859,10 +879,15 @@ async fn discard_offsets_async<
     stream: &mut S, rows: usize, name: &str,
 ) -> Result<usize> {
     let mut offset = [0u8; 8];
+    let mut total = 0usize;
     for _ in 0..rows {
         stream.read_exact(&mut offset).await?;
+        // Cumulative prefix sums must be non-decreasing; the last offset is
+        // the inner element count, capped at MAX_BLOCK_ROWS before the inner
+        // column is read or skipped.
+        total = checked_monotonic_offset(total, u64::from_le_bytes(offset), name)?;
     }
-    checked_usize(u64::from_le_bytes(offset), name)
+    Ok(total)
 }
 
 async fn discard_exact_async<
@@ -918,7 +943,7 @@ async fn read_lc_async<
             "LowCardinality index count {ni} does not match row count {rows}"
         )));
     }
-    let mut indexes = vec![0u8; checked_len(ni, idx_width)?];
+    let mut indexes = vec![0u8; checked_column_len(ni, idx_width, "LowCardinality index")?];
     if ni > 0 {
         stream.read_exact(&mut indexes).await?;
     }
@@ -972,6 +997,7 @@ fn parse_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::wire;
     use crate::runtime::io::AsyncWriteExt as _;
 
     /// An LZ4 frame header (method byte matched) whose compressed_size is
@@ -1205,6 +1231,85 @@ mod tests {
             },
             other => unreachable!("expected Protocol error, got {other:?}"),
         }
+    }
+
+    // ── Server-controlled byte-length cap tests ───────────────────────────
+
+    #[tokio::test]
+    async fn discard_string_value_length_u64_max_is_rejected() {
+        let mut wire_bytes = Vec::new();
+        wire::write_varint(&mut wire_bytes, 0).expect("test write"); // table
+        wire_bytes.push(0x00); // BlockInfo terminator
+        wire::write_varint(&mut wire_bytes, 1).expect("test write"); // columns
+        wire::write_varint(&mut wire_bytes, 1).expect("test write"); // rows
+        wire::write_string(&mut wire_bytes, "c").expect("test write");
+        wire::write_string(&mut wire_bytes, "String").expect("test write");
+        wire_bytes.push(0); // custom serialization
+        wire::write_varint(&mut wire_bytes, u64::MAX).expect("test write");
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire_bytes).await.expect("seed block");
+
+        let err = discard_data_block(&mut rx)
+            .await
+            .expect_err("discard path must reject a lying string length");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg == "string value length 18446744073709551615 exceeds limit 16777215"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_low_cardinality_index_buffer_cap_is_enforced() {
+        // rows = 8,388,609 with 8-byte indexes claims 64 MiB + 8 bytes of
+        // index buffer; the cap must fire before the vec is allocated.
+        let rows = crate::limits::MAX_COLUMN_BYTES / 8 + 1;
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&1u64.to_le_bytes()); // key serialization version
+        wire_bytes.extend_from_slice(&((1u64 << 9) | 3).to_le_bytes()); // 8-byte indexes
+        wire_bytes.extend_from_slice(&0u64.to_le_bytes()); // no dictionary keys
+        wire_bytes.extend_from_slice(&(rows as u64).to_le_bytes()); // indexes == rows
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire_bytes).await.expect("seed column");
+
+        let err = read_column_async(&mut rx, "LowCardinality(String)", rows)
+            .await
+            .expect_err("oversized LowCardinality index buffer must be rejected");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg == "LowCardinality index byte length 67108872 exceeds limit 67108864"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_variant_compact_rows_claim_is_rejected() {
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&1u64.to_le_bytes()); // mode = COMPACT
+        wire_bytes.extend_from_slice(&0u64.to_le_bytes()); // discriminator (UInt8)
+        wire_bytes.extend_from_slice(&(1u64 << 60).to_le_bytes()); // rows claim
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire_bytes).await.expect("seed column");
+
+        let err = read_column_async(&mut rx, "Variant(UInt8, String)", 1)
+            .await
+            .expect_err("huge Variant compact rows claim must be rejected");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg == "Variant compact rows 1152921504606846976 exceeds row count 1"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_width_cap_plus_one_is_rejected_before_allocation() {
+        // UInt256 rows*32 = 64 MiB + 32 must fail before the buffer allocates.
+        let rows = crate::limits::MAX_COLUMN_BYTES / 32 + 1;
+        let (_tx, mut rx) = tokio::io::duplex(64);
+        let err = read_column_async(&mut rx, "UInt256", rows)
+            .await
+            .expect_err("fixed-width cap + 1 must be rejected");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg == "fixed-width column byte length 67108896 exceeds limit 67108864"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

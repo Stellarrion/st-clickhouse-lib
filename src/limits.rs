@@ -53,6 +53,97 @@ pub(crate) const MAX_BLOCK_ROWS: usize = 10_000_000;
 /// Maximum accepted PartUUID count in an ignored PartUUIDs packet.
 pub(crate) const MAX_PART_UUIDS: usize = 1_048_576;
 
+// ─── Server-controlled byte-length caps ─────────────────────────────────────
+//
+// Native column payloads are also sized from server-controlled values: every
+// String/JSON column value is prefixed by a varint length, fixed-width /
+// offset / LowCardinality-index buffers are `rows * width` products, Array and
+// Map columns carry an 8-byte little-endian offset whose last value becomes
+// the inner element row count, and string values accumulate one column at a
+// time. Before any of these lengths feeds a `resize`/`reserve`/`with_capacity`
+// or bounds a read loop, they are validated against the constants below so a
+// small crafted header cannot trigger a multi-hundred-MiB eager allocation.
+
+/// Maximum accepted byte length of a single inbound string value (String and
+/// JSON columns, protocol strings). Retains the historical clickhouse-cpp
+/// wire limit (16 MiB - 1) for compatibility.
+pub(crate) const MAX_STRING_BYTES: usize = 0x00FF_FFFF;
+
+/// Maximum accepted total byte length of a single inbound column's wire data
+/// (accumulated string values, fixed-width / offset / index buffers, and
+/// LowCardinality materialized output). Bounds one column only; a streamed
+/// response may legally deliver many columns and many blocks.
+pub(crate) const MAX_COLUMN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validates a server-controlled per-value string length (String/JSON column
+/// value) against [`MAX_STRING_BYTES`] before it sizes any buffer.
+pub(crate) fn checked_string_len(value: u64, what: &str) -> Result<usize, String> {
+    let value = usize::try_from(value)
+        .map_err(|_| format!("{what} {value} exceeds limit {MAX_STRING_BYTES}"))?;
+    if value > MAX_STRING_BYTES {
+        return Err(format!("{what} {value} exceeds limit {MAX_STRING_BYTES}"));
+    }
+    Ok(value)
+}
+
+/// Adds `add` claimed bytes to a column's running total with checked addition
+/// and the [`MAX_COLUMN_BYTES`] cap. Callers invoke this before the matching
+/// `reserve`/`resize`/read so a lying length fails with a deterministic
+/// protocol error instead of allocating.
+pub(crate) fn checked_column_bytes(acc: usize, add: usize, what: &str) -> Result<usize, String> {
+    let total = acc
+        .checked_add(add)
+        .ok_or_else(|| format!("{what} cumulative byte length overflow"))?;
+    if total > MAX_COLUMN_BYTES {
+        return Err(format!(
+            "{what} cumulative byte length {total} exceeds limit {MAX_COLUMN_BYTES}"
+        ));
+    }
+    Ok(total)
+}
+
+/// Validates a `rows * width` fixed-width / offset / index buffer byte length
+/// with checked multiplication and the [`MAX_COLUMN_BYTES`] cap, before any
+/// `Vec::with_capacity`/`resize` sized from it.
+pub(crate) fn checked_column_len(rows: usize, width: usize, what: &str) -> Result<usize, String> {
+    let len = rows
+        .checked_mul(width)
+        .ok_or_else(|| format!("{what} byte length overflow"))?;
+    if len > MAX_COLUMN_BYTES {
+        return Err(format!(
+            "{what} byte length {len} exceeds limit {MAX_COLUMN_BYTES}"
+        ));
+    }
+    Ok(len)
+}
+
+/// Validates a nested inner element total (the last Array/Map offset) against
+/// [`MAX_BLOCK_ROWS`], before it becomes an inner column row count.
+pub(crate) fn checked_nested_total(value: u64, what: &str) -> Result<usize, String> {
+    let value = usize::try_from(value)
+        .map_err(|_| format!("{what} total {value} exceeds limit {MAX_BLOCK_ROWS}"))?;
+    if value > MAX_BLOCK_ROWS {
+        return Err(format!(
+            "{what} total {value} exceeds limit {MAX_BLOCK_ROWS}"
+        ));
+    }
+    Ok(value)
+}
+
+/// Validates one Array/Map offset against the previous offset and the nested
+/// element cap. ClickHouse offsets are cumulative prefix sums, so they must be
+/// non-decreasing, and the running maximum (the last offset) is the inner
+/// element row count bounded by [`MAX_BLOCK_ROWS`].
+pub(crate) fn checked_monotonic_offset(
+    prev: usize, value: u64, what: &str,
+) -> Result<usize, String> {
+    let value = checked_nested_total(value, what)?;
+    if value < prev {
+        return Err(format!("{what} decreased from {prev} to {value}"));
+    }
+    Ok(value)
+}
+
 /// Validates a server-controlled item count before it sizes any allocation or
 /// bounds any loop.
 ///
@@ -98,5 +189,128 @@ mod count_tests {
     fn u64_max_is_rejected() {
         let err = checked_count(u64::MAX, "item", 65_536).expect_err("u64::MAX rejected");
         assert_eq!(err, "item count 18446744073709551615 exceeds limit 65536");
+    }
+}
+
+#[cfg(test)]
+mod byte_limit_tests {
+    use super::{
+        MAX_COLUMN_BYTES, MAX_STRING_BYTES, checked_column_bytes, checked_column_len,
+        checked_monotonic_offset, checked_nested_total, checked_string_len,
+    };
+
+    #[test]
+    fn string_len_boundary_passes() {
+        assert_eq!(
+            checked_string_len(MAX_STRING_BYTES as u64, "string value length").expect("cap passes"),
+            MAX_STRING_BYTES
+        );
+    }
+
+    #[test]
+    fn string_len_cap_plus_one_is_rejected() {
+        let err = checked_string_len(MAX_STRING_BYTES as u64 + 1, "string value length")
+            .expect_err("cap + 1");
+        assert_eq!(err, "string value length 16777216 exceeds limit 16777215");
+    }
+
+    #[test]
+    fn string_len_u64_max_and_2_pow_40_are_rejected() {
+        for hostile in [1u64 << 40, u64::MAX] {
+            let err = checked_string_len(hostile, "string value length")
+                .expect_err("hostile string length must be rejected");
+            assert_eq!(
+                err,
+                format!("string value length {hostile} exceeds limit 16777215")
+            );
+        }
+    }
+
+    #[test]
+    fn column_bytes_accumulate_to_cap() {
+        let mut acc = 0usize;
+        for _ in 0..4 {
+            acc = checked_column_bytes(acc, 16 * 1024 * 1024, "string value")
+                .expect("four 16 MiB values fit the 64 MiB column cap");
+        }
+        assert_eq!(acc, MAX_COLUMN_BYTES);
+    }
+
+    #[test]
+    fn column_bytes_cap_plus_one_is_rejected() {
+        let err = checked_column_bytes(MAX_COLUMN_BYTES, 1, "string value")
+            .expect_err("cap + 1 cumulative claim must be rejected");
+        assert_eq!(
+            err,
+            "string value cumulative byte length 67108865 exceeds limit 67108864"
+        );
+    }
+
+    #[test]
+    fn column_bytes_overflow_is_rejected() {
+        assert!(checked_column_bytes(usize::MAX, 1, "string value").is_err());
+    }
+
+    #[test]
+    fn column_len_boundary_passes_and_cap_plus_one_is_rejected() {
+        let rows = MAX_COLUMN_BYTES / 32;
+        assert_eq!(
+            checked_column_len(rows, 32, "fixed-width").expect("exact cap passes"),
+            MAX_COLUMN_BYTES
+        );
+        let err = checked_column_len(rows + 1, 32, "fixed-width").expect_err("cap + 1 rejected");
+        assert_eq!(
+            err,
+            "fixed-width byte length 67108896 exceeds limit 67108864"
+        );
+    }
+
+    #[test]
+    fn column_len_multiplication_overflow_is_rejected() {
+        assert!(checked_column_len(usize::MAX, usize::MAX, "fixed-width").is_err());
+    }
+
+    #[test]
+    fn nested_total_boundary_passes_and_cap_plus_one_is_rejected() {
+        assert_eq!(
+            checked_nested_total(super::MAX_BLOCK_ROWS as u64, "array offset")
+                .expect("exact cap passes"),
+            super::MAX_BLOCK_ROWS
+        );
+        let err = checked_nested_total(super::MAX_BLOCK_ROWS as u64 + 1, "array offset")
+            .expect_err("cap + 1 rejected");
+        assert_eq!(err, "array offset total 10000001 exceeds limit 10000000");
+    }
+
+    #[test]
+    fn nested_total_u64_max_is_rejected() {
+        let err = checked_nested_total(u64::MAX, "array offset").expect_err("u64::MAX rejected");
+        assert_eq!(
+            err,
+            "array offset total 18446744073709551615 exceeds limit 10000000"
+        );
+    }
+
+    #[test]
+    fn monotonic_offset_accepts_non_decreasing_and_rejects_decrease() {
+        let mut prev = 0usize;
+        for value in [0u64, 2, 5, 5, 9] {
+            prev = checked_monotonic_offset(prev, value, "array offset")
+                .expect("non-decreasing offsets pass");
+        }
+        assert_eq!(prev, 9);
+        let err =
+            checked_monotonic_offset(9, 7, "array offset").expect_err("decreasing offset rejected");
+        assert_eq!(err, "array offset decreased from 9 to 7");
+    }
+
+    #[test]
+    fn monotonic_offset_rejects_huge_value() {
+        let err = checked_monotonic_offset(0, 1u64 << 60, "array offset")
+            .expect_err("2^60 offset rejected");
+        assert_eq!(
+            err,
+            "array offset total 1152921504606846976 exceeds limit 10000000"
+        );
     }
 }

@@ -2078,6 +2078,14 @@ impl QueryStream {
                         if len == 0 {
                             continue;
                         }
+                        // The chunk length is server-controlled: reject an
+                        // oversized claim before the eager zeroed resize.
+                        if len > crate::limits::MAX_CHUNK_LEN {
+                            return Err(Error::Protocol(format!(
+                                "chunk length {len} exceeds maximum {}",
+                                crate::limits::MAX_CHUNK_LEN
+                            )));
+                        }
                         let start = self.buffer.len();
                         self.buffer.resize(start + len, 0);
                         self.stream.read_exact(&mut self.buffer[start..])?;
@@ -2166,6 +2174,49 @@ mod tests {
         assert!(
             matches!(err, Error::Protocol(_) | Error::Io(_)),
             "truncated exception body must not become ServerError, got {err:?}"
+        );
+    }
+
+    fn query_stream_chunked() -> (QueryStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test socket");
+        let (server, _) = listener.accept().expect("accept test socket");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .expect("set test timeout");
+        (
+            QueryStream {
+                buffer: Vec::new(),
+                pos: 0,
+                stream: crate::sync::transport::Transport::new_plain(client),
+                read_buffer_size: 8192,
+                compression: None,
+                negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
+                chunked_recv: true,
+                chunked_send: false,
+                done: false,
+            },
+            server,
+        )
+    }
+
+    /// A hostile chunked-transport chunk header must be rejected before the
+    /// eager zeroed buffer resize (previously up to 4 GiB).
+    #[test]
+    fn query_stream_chunked_refill_rejects_oversized_chunk() {
+        let (mut stream, mut server) = query_stream_chunked();
+        server
+            .write_all(&u32::MAX.to_le_bytes())
+            .expect("send hostile chunk header");
+
+        let err = stream
+            .read_next_block()
+            .err()
+            .expect("oversized chunk must be rejected (Block lacks Debug; expect_err needs it)");
+        assert!(
+            matches!(&err, Error::Protocol(msg) if msg.contains("chunk length")),
+            "expected chunk length Protocol error, got: {err:?}"
         );
     }
 

@@ -6,8 +6,9 @@
 
 // Shared wire helpers expect Error and Result in the including module scope.
 
-// Matches clickhouse-cpp WireFormat::ReadString.
-const MAX_STRING_BYTES: usize = 0x00FF_FFFF;
+// Matches clickhouse-cpp WireFormat::ReadString; shared via `crate::limits`
+// so every reader enforces one identical per-string cap.
+use crate::limits::MAX_STRING_BYTES;
 
 // ── Sync I/O (std::io::Read/Write) ──
 

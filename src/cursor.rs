@@ -140,6 +140,7 @@ pub fn materialize_lc_inner(
                 pos = end;
             }
             let mut out = Vec::new();
+            let mut total = 0usize;
             for i in 0..num_idx {
                 let idx = read_lc_idx(indexes, i, idx_width);
                 let Some(&(start, end)) = offsets.get(idx) else {
@@ -148,6 +149,15 @@ pub fn materialize_lc_inner(
                     ));
                 };
                 let l = end - start;
+                // Dictionary expansion repeats wire entries per row; cap the
+                // materialized bytes so a tiny dictionary cannot amplify to a
+                // huge output (e.g. 10M rows x a 16 MiB entry).
+                total = crate::limits::checked_column_bytes(
+                    total,
+                    l,
+                    "LowCardinality materialized column",
+                )
+                .map_err(Error::Protocol)?;
                 encode_varint_to(&mut out, l as u64);
                 out.extend_from_slice(&dict_data[start..end]);
             }
@@ -190,6 +200,12 @@ fn materialize_lc_fixed(
     let cap = ni
         .checked_mul(es)
         .ok_or_else(|| Error::Protocol("LowCardinality materialized size overflow".into()))?;
+    if cap > crate::limits::MAX_COLUMN_BYTES {
+        return Err(Error::Protocol(format!(
+            "LowCardinality materialized column byte length {cap} exceeds limit {}",
+            crate::limits::MAX_COLUMN_BYTES
+        )));
+    }
     let mut out = Vec::with_capacity(cap);
     for i in 0..ni {
         let idx = read_lc_idx(idxs, i, iw);

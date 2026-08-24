@@ -239,7 +239,8 @@ where
 
         let ct = parse_column_type(&type_name)?;
         let start = arena.len();
-        read_column_data_into(reader, &ct, num_rows, &mut arena)?;
+        let mut budget = crate::limits::MAX_COLUMN_BYTES;
+        read_column_data_into(reader, &ct, num_rows, &mut arena, &mut budget)?;
         let end = arena.len();
 
         pending.push(PendingColumn {
@@ -343,7 +344,8 @@ pub(crate) fn read_block_body<R: Read>(reader: &mut R) -> Result<Block> {
 
         let ct = parse_column_type(&type_name)?;
         let start = arena.len();
-        read_column_data_into(reader, &ct, num_rows, &mut arena)?;
+        let mut budget = crate::limits::MAX_COLUMN_BYTES;
+        read_column_data_into(reader, &ct, num_rows, &mut arena, &mut budget)?;
         let end = arena.len();
 
         pending.push(PendingColumn {
@@ -392,7 +394,7 @@ fn skip_block_info_from_reader<R: Read>(reader: &mut R) -> Result<()> {
 }
 
 fn read_column_data_into<R: Read>(
-    reader: &mut R, ct: &ColumnType, rows: usize, data: &mut Vec<u8>,
+    reader: &mut R, ct: &ColumnType, rows: usize, data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     if rows == 0 {
         return Ok(());
@@ -400,30 +402,76 @@ fn read_column_data_into<R: Read>(
 
     use ColumnType::*;
     match ct {
-        UInt8 | Int8 | Bool | Enum8 => read_exact_into(reader, data, rows)?,
-        UInt16 | Int16 | Date | Enum16 => read_exact_into(reader, data, checked_len(rows, 2)?)?,
-        UInt32 | Int32 | Float32 | Date32 | DateTime | Time | IPv4 => {
-            read_exact_into(reader, data, checked_len(rows, 4)?)?
-        },
-        UInt64 | Int64 | Float64 | DateTime64(_) | Time64(_) => {
-            read_exact_into(reader, data, checked_len(rows, 8)?)?
-        },
-        UInt128 | Int128 | UUID | IPv6 => read_exact_into(reader, data, checked_len(rows, 16)?)?,
-        UInt256 | Int256 => read_exact_into(reader, data, checked_len(rows, 32)?)?,
-        Decimal(1..=9, _) => read_exact_into(reader, data, checked_len(rows, 4)?)?,
-        Decimal(10..=18, _) => read_exact_into(reader, data, checked_len(rows, 8)?)?,
-        Decimal(19..=38, _) => read_exact_into(reader, data, checked_len(rows, 16)?)?,
-        Decimal(39..=76, _) => read_exact_into(reader, data, checked_len(rows, 32)?)?,
+        UInt8 | Int8 | Bool | Enum8 => read_exact_into(reader, data, rows, budget)?,
+        UInt16 | Int16 | Date | Enum16 => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 2, "fixed-width column")?,
+            budget,
+        )?,
+        UInt32 | Int32 | Float32 | Date32 | DateTime | Time | IPv4 => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 4, "fixed-width column")?,
+            budget,
+        )?,
+        UInt64 | Int64 | Float64 | DateTime64(_) | Time64(_) => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 8, "fixed-width column")?,
+            budget,
+        )?,
+        UInt128 | Int128 | UUID | IPv6 => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 16, "fixed-width column")?,
+            budget,
+        )?,
+        UInt256 | Int256 => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 32, "fixed-width column")?,
+            budget,
+        )?,
+        Decimal(1..=9, _) => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 4, "fixed-width column")?,
+            budget,
+        )?,
+        Decimal(10..=18, _) => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 8, "fixed-width column")?,
+            budget,
+        )?,
+        Decimal(19..=38, _) => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 16, "fixed-width column")?,
+            budget,
+        )?,
+        Decimal(39..=76, _) => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, 32, "fixed-width column")?,
+            budget,
+        )?,
         Decimal(precision, _) => {
             return Err(crate::sync::error::Error::Protocol(format!(
                 "unsupported Decimal precision {precision}"
             )));
         },
-        Nothing => read_exact_into(reader, data, rows)?,
+        Nothing => read_exact_into(reader, data, rows, budget)?,
         String => {
             for _ in 0..rows {
-                let len = checked_usize(read_varint_into(reader, data)?, "string value length")?;
-                read_exact_into(reader, data, len)?;
+                let len = checked_string_len(
+                    read_varint_into(reader, data, budget)?,
+                    "string value length",
+                )?;
+                // read_exact_into charges the budget before reserving, so a
+                // lying length fails before this value is allocated or read.
+                read_exact_into(reader, data, len, budget)?;
             }
         },
         JSON => {
@@ -438,67 +486,57 @@ fn read_column_data_into<R: Read>(
                 )));
             }
             for _ in 0..rows {
-                let len = checked_usize(read_varint_into(reader, data)?, "JSON string length")?;
-                read_exact_into(reader, data, len)?;
+                let len = checked_string_len(
+                    read_varint_into(reader, data, budget)?,
+                    "JSON string length",
+                )?;
+                read_exact_into(reader, data, len, budget)?;
             }
         },
-        FixedString(n) => read_exact_into(reader, data, checked_len(rows, *n)?)?,
+        FixedString(n) => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, *n, "FixedString column")?,
+            budget,
+        )?,
         Nullable(inner) => {
-            read_exact_into(reader, data, rows)?;
-            read_column_data_into(reader, inner, rows, data)?;
+            read_exact_into(reader, data, rows, budget)?;
+            read_column_data_into(reader, inner, rows, data, budget)?;
         },
         Array(inner) => {
-            read_exact_into(reader, data, checked_len(rows, 8)?)?;
-            let elem_rows = if rows > 0 {
-                let start = data.len() - 8;
-                let mut offset_bytes = [0u8; 8];
-                offset_bytes.copy_from_slice(&data[start..start + 8]);
-                usize::try_from(u64::from_le_bytes(offset_bytes)).map_err(|_| {
-                    crate::sync::error::Error::Protocol("array offset too large".into())
-                })?
-            } else {
-                0
-            };
-            read_column_data_into(reader, inner, elem_rows, data)?;
+            let elem_rows = read_offsets_into(reader, data, rows, "array offset", budget)?;
+            read_column_data_into(reader, inner, elem_rows, data, budget)?;
         },
         Map(k, v) => {
-            read_exact_into(reader, data, checked_len(rows, 8)?)?;
-            let elem_rows = if rows > 0 {
-                let start = data.len() - 8;
-                let mut offset_bytes = [0u8; 8];
-                offset_bytes.copy_from_slice(&data[start..start + 8]);
-                usize::try_from(u64::from_le_bytes(offset_bytes)).map_err(|_| {
-                    crate::sync::error::Error::Protocol("map offset too large".into())
-                })?
-            } else {
-                0
-            };
-            read_column_data_into(reader, k, elem_rows, data)?;
-            read_column_data_into(reader, v, elem_rows, data)?;
+            let elem_rows = read_offsets_into(reader, data, rows, "map offset", budget)?;
+            read_column_data_into(reader, k, elem_rows, data, budget)?;
+            read_column_data_into(reader, v, elem_rows, data, budget)?;
         },
         Tuple(elems) => {
             for elem in elems {
-                read_column_data_into(reader, elem, rows, data)?;
+                read_column_data_into(reader, elem, rows, data, budget)?;
             }
         },
-        LowCardinality(inner) => read_low_cardinality_into(reader, inner, rows, data)?,
+        LowCardinality(inner) => read_low_cardinality_into(reader, inner, rows, data, budget)?,
         Point => {
-            read_column_data_into(reader, &Float64, rows, data)?;
-            read_column_data_into(reader, &Float64, rows, data)?;
+            read_column_data_into(reader, &Float64, rows, data, budget)?;
+            read_column_data_into(reader, &Float64, rows, data, budget)?;
         },
-        Ring => read_column_data_into(reader, &Array(Box::new(Point)), rows, data)?,
-        Polygon => read_column_data_into(reader, &Array(Box::new(Ring)), rows, data)?,
-        MultiPolygon => read_column_data_into(reader, &Array(Box::new(Polygon)), rows, data)?,
+        Ring => read_column_data_into(reader, &Array(Box::new(Point)), rows, data, budget)?,
+        Polygon => read_column_data_into(reader, &Array(Box::new(Ring)), rows, data, budget)?,
+        MultiPolygon => {
+            read_column_data_into(reader, &Array(Box::new(Polygon)), rows, data, budget)?
+        },
         Dynamic => {
-            let state = read_dynamic_state_prefix_into(reader, data)?;
-            read_dynamic_body_into(reader, &state, rows, data)?;
+            let state = read_dynamic_state_prefix_into(reader, data, budget)?;
+            read_dynamic_body_into(reader, &state, rows, data, budget)?;
         },
         Variant(types) => {
             let mut states = Vec::with_capacity(types.len());
             for typ in types {
-                states.push(read_column_state_prefix_into(reader, typ, data)?);
+                states.push(read_column_state_prefix_into(reader, typ, data, budget)?);
             }
-            read_variant_body_into(reader, types, &states, rows, data)?;
+            read_variant_body_into(reader, types, &states, rows, data, budget)?;
         },
         _ => {
             return Err(crate::sync::error::Error::Protocol(format!(
@@ -536,77 +574,98 @@ struct JsonRawState {
 }
 
 fn read_column_state_prefix_into<R: Read>(
-    reader: &mut R, ct: &ColumnType, data: &mut Vec<u8>,
+    reader: &mut R, ct: &ColumnType, data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<RawColumnState> {
     use ColumnType::*;
     match ct {
         Nullable(inner) => Ok(RawColumnState::Nullable(Box::new(
-            read_column_state_prefix_into(reader, inner, data)?,
+            read_column_state_prefix_into(reader, inner, data, budget)?,
         ))),
         Array(inner) => Ok(RawColumnState::Array(Box::new(
-            read_column_state_prefix_into(reader, inner, data)?,
+            read_column_state_prefix_into(reader, inner, data, budget)?,
         ))),
         Map(key, value) => Ok(RawColumnState::Map(
-            Box::new(read_column_state_prefix_into(reader, key, data)?),
-            Box::new(read_column_state_prefix_into(reader, value, data)?),
+            Box::new(read_column_state_prefix_into(reader, key, data, budget)?),
+            Box::new(read_column_state_prefix_into(reader, value, data, budget)?),
         )),
         Tuple(elems) => {
             let mut states = Vec::with_capacity(elems.len());
             for elem in elems {
-                states.push(read_column_state_prefix_into(reader, elem, data)?);
+                states.push(read_column_state_prefix_into(reader, elem, data, budget)?);
             }
             Ok(RawColumnState::Tuple(states))
         },
         LowCardinality(inner) => Ok(RawColumnState::LowCardinality(Box::new(
-            read_column_state_prefix_into(reader, inner, data)?,
+            read_column_state_prefix_into(reader, inner, data, budget)?,
         ))),
         Variant(types) => {
             let mut states = Vec::with_capacity(types.len());
             for typ in types {
-                states.push(read_column_state_prefix_into(reader, typ, data)?);
+                states.push(read_column_state_prefix_into(reader, typ, data, budget)?);
             }
             Ok(RawColumnState::Variant(states))
         },
-        Dynamic => read_dynamic_state_prefix_into(reader, data).map(RawColumnState::Dynamic),
-        JSON => read_json_state_prefix_into(reader, data).map(RawColumnState::Json),
+        Dynamic => {
+            read_dynamic_state_prefix_into(reader, data, budget).map(RawColumnState::Dynamic)
+        },
+        JSON => read_json_state_prefix_into(reader, data, budget).map(RawColumnState::Json),
         _ => Ok(RawColumnState::None),
     }
 }
 
+/// Read `rows` little-endian u64 Array/Map offsets into the arena, validating
+/// that they are non-decreasing (cumulative prefix sums) and that the last
+/// offset — the inner element row count — stays within MAX_BLOCK_ROWS.
+/// Returns the inner element row count.
+fn read_offsets_into<R: Read>(
+    reader: &mut R, data: &mut Vec<u8>, rows: usize, name: &str, budget: &mut usize,
+) -> Result<usize> {
+    let nbytes = checked_column_len(rows, 8, name)?;
+    let start = data.len();
+    read_exact_into(reader, data, nbytes, budget)?;
+    let mut total = 0usize;
+    for chunk in data[start..].chunks_exact(8) {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(chunk);
+        total = checked_monotonic_offset(total, u64::from_le_bytes(b), name)?;
+    }
+    Ok(total)
+}
+
 fn read_json_state_prefix_into<R: Read>(
-    reader: &mut R, data: &mut Vec<u8>,
+    reader: &mut R, data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<JsonRawState> {
-    let version = read_u64_into(reader, data)?;
+    let version = read_u64_into(reader, data, budget)?;
     let mut dynamic_paths = Vec::new();
     match version {
         1 | 4 => {},
         3 => {
             let paths_count = checked_count(
-                read_varint_into(reader, data)?,
+                read_varint_into(reader, data, budget)?,
                 "JSON path",
                 crate::limits::MAX_JSON_DYNAMIC_ITEMS,
             )?;
             for _ in 0..paths_count {
-                let _path = read_string_into(reader, data, "JSON path length")?;
+                let _path = read_string_into(reader, data, "JSON path length", budget)?;
             }
             dynamic_paths.reserve(paths_count);
             for _ in 0..paths_count {
-                dynamic_paths.push(read_dynamic_state_prefix_into(reader, data)?);
+                dynamic_paths.push(read_dynamic_state_prefix_into(reader, data, budget)?);
             }
         },
         0 => {
-            let _max_dynamic_paths = read_varint_into(reader, data)?;
+            let _max_dynamic_paths = read_varint_into(reader, data, budget)?;
             let paths_count = checked_count(
-                read_varint_into(reader, data)?,
+                read_varint_into(reader, data, budget)?,
                 "JSON path",
                 crate::limits::MAX_JSON_DYNAMIC_ITEMS,
             )?;
             for _ in 0..paths_count {
-                let _path = read_string_into(reader, data, "JSON path length")?;
+                let _path = read_string_into(reader, data, "JSON path length", budget)?;
             }
             dynamic_paths.reserve(paths_count);
             for _ in 0..paths_count {
-                dynamic_paths.push(read_dynamic_state_prefix_into(reader, data)?);
+                dynamic_paths.push(read_dynamic_state_prefix_into(reader, data, budget)?);
             }
         },
         other => {
@@ -622,25 +681,33 @@ fn read_json_state_prefix_into<R: Read>(
 }
 
 fn read_json_body_into<R: Read>(
-    reader: &mut R, state: &JsonRawState, rows: usize, data: &mut Vec<u8>,
+    reader: &mut R, state: &JsonRawState, rows: usize, data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     match state.version {
         1 | 4 => {
             for _ in 0..rows {
-                let len = checked_usize(read_varint_into(reader, data)?, "JSON string length")?;
-                read_exact_into(reader, data, len)?;
+                let len = checked_string_len(
+                    read_varint_into(reader, data, budget)?,
+                    "JSON string length",
+                )?;
+                read_exact_into(reader, data, len, budget)?;
             }
         },
         3 => {
             for dynamic in &state.dynamic_paths {
-                read_dynamic_body_into(reader, dynamic, rows, data)?;
+                read_dynamic_body_into(reader, dynamic, rows, data, budget)?;
             }
         },
         0 => {
             for dynamic in &state.dynamic_paths {
-                read_dynamic_body_into(reader, dynamic, rows, data)?;
+                read_dynamic_body_into(reader, dynamic, rows, data, budget)?;
             }
-            read_exact_into(reader, data, checked_len(rows, 8)?)?;
+            read_exact_into(
+                reader,
+                data,
+                checked_column_len(rows, 8, "JSON offsets")?,
+                budget,
+            )?;
         },
         other => {
             return Err(crate::sync::error::Error::Protocol(format!(
@@ -652,20 +719,22 @@ fn read_json_body_into<R: Read>(
 }
 
 fn read_dynamic_state_prefix_into<R: Read>(
-    reader: &mut R, data: &mut Vec<u8>,
+    reader: &mut R, data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<DynamicRawState> {
-    let version = read_u64_into(reader, data)?;
+    let version = read_u64_into(reader, data, budget)?;
     let mut type_names = Vec::new();
     let mut type_states = Vec::new();
     match version {
         0 => {},
         1 => {
-            let _max_types = read_varint_into(reader, data)?;
-            type_names = read_dynamic_type_names_into(reader, data, "dynamic subcolumn types")?;
-            let _variant_version = read_u64_into(reader, data)?;
+            let _max_types = read_varint_into(reader, data, budget)?;
+            type_names =
+                read_dynamic_type_names_into(reader, data, "dynamic subcolumn types", budget)?;
+            let _variant_version = read_u64_into(reader, data, budget)?;
         },
         2 | 3 => {
-            type_names = read_dynamic_type_names_into(reader, data, "dynamic subcolumn types")?;
+            type_names =
+                read_dynamic_type_names_into(reader, data, "dynamic subcolumn types", budget)?;
         },
         other => {
             return Err(crate::sync::error::Error::Protocol(format!(
@@ -678,7 +747,7 @@ fn read_dynamic_state_prefix_into<R: Read>(
         let ct = crate::sync::protocol::type_parser::parse_type(type_name).map_err(|e| {
             crate::sync::error::Error::Protocol(format!("bad dynamic type '{type_name}': {e}"))
         })?;
-        type_states.push(read_column_state_prefix_into(reader, &ct, data)?);
+        type_states.push(read_column_state_prefix_into(reader, &ct, data, budget)?);
     }
     Ok(DynamicRawState {
         version,
@@ -688,7 +757,7 @@ fn read_dynamic_state_prefix_into<R: Read>(
 }
 
 fn read_dynamic_body_into<R: Read>(
-    reader: &mut R, state: &DynamicRawState, rows: usize, data: &mut Vec<u8>,
+    reader: &mut R, state: &DynamicRawState, rows: usize, data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     match state.version {
         0 => Ok(()),
@@ -698,6 +767,7 @@ fn read_dynamic_body_into<R: Read>(
             &state.type_states,
             rows,
             data,
+            budget,
         ),
         2 | 3 => read_flattened_dynamic_values_into(
             reader,
@@ -705,6 +775,7 @@ fn read_dynamic_body_into<R: Read>(
             &state.type_states,
             rows,
             data,
+            budget,
         ),
         other => Err(crate::sync::error::Error::Protocol(format!(
             "unknown Dynamic serialization version {other}"
@@ -714,13 +785,13 @@ fn read_dynamic_body_into<R: Read>(
 
 fn read_deprecated_dynamic_values_into<R: Read>(
     reader: &mut R, type_names: &[String], type_states: &[RawColumnState], rows: usize,
-    data: &mut Vec<u8>,
+    data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     if rows == 0 || type_names.is_empty() {
         return Ok(());
     }
     let start = data.len();
-    read_exact_into(reader, data, rows)?;
+    read_exact_into(reader, data, rows, budget)?;
     let mut counts = vec![0usize; type_names.len()];
     for &discriminator in &data[start..start + rows] {
         let idx = usize::from(discriminator);
@@ -733,20 +804,20 @@ fn read_deprecated_dynamic_values_into<R: Read>(
             )));
         }
     }
-    read_dynamic_subcolumns_into(reader, type_names, type_states, &counts, data)
+    read_dynamic_subcolumns_into(reader, type_names, type_states, &counts, data, budget)
 }
 
 fn read_flattened_dynamic_values_into<R: Read>(
     reader: &mut R, type_names: &[String], type_states: &[RawColumnState], rows: usize,
-    data: &mut Vec<u8>,
+    data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     if rows == 0 || type_names.is_empty() {
         return Ok(());
     }
     let width = dynamic_discriminator_width(type_names.len());
-    let len = checked_len(rows, width)?;
+    let len = checked_column_len(rows, width, "Dynamic discriminators")?;
     let start = data.len();
-    read_exact_into(reader, data, len)?;
+    read_exact_into(reader, data, len, budget)?;
     let mut counts = vec![0usize; type_names.len()];
     for chunk in data[start..start + len].chunks_exact(width) {
         let idx = decode_dynamic_discriminator(chunk)?;
@@ -759,12 +830,12 @@ fn read_flattened_dynamic_values_into<R: Read>(
             )));
         }
     }
-    read_dynamic_subcolumns_into(reader, type_names, type_states, &counts, data)
+    read_dynamic_subcolumns_into(reader, type_names, type_states, &counts, data, budget)
 }
 
 fn read_dynamic_subcolumns_into<R: Read>(
     reader: &mut R, type_names: &[String], type_states: &[RawColumnState], counts: &[usize],
-    data: &mut Vec<u8>,
+    data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     for (idx, (type_name, count)) in type_names.iter().zip(counts).enumerate() {
         if *count == 0 {
@@ -774,31 +845,31 @@ fn read_dynamic_subcolumns_into<R: Read>(
             crate::sync::error::Error::Protocol(format!("bad dynamic type '{type_name}': {e}"))
         })?;
         let state = type_states.get(idx).unwrap_or(&RawColumnState::None);
-        read_column_body_raw_into(reader, &ct, state, *count, data)?;
+        read_column_body_raw_into(reader, &ct, state, *count, data, budget)?;
     }
     Ok(())
 }
 
 fn read_variant_body_into<R: Read>(
     reader: &mut R, types: &[ColumnType], type_states: &[RawColumnState], rows: usize,
-    data: &mut Vec<u8>,
+    data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     let type_names = types.iter().map(ToString::to_string).collect::<Vec<_>>();
-    read_variant_types_body_into(reader, &type_names, type_states, rows, data, false)
+    read_variant_types_body_into(reader, &type_names, type_states, rows, data, false, budget)
 }
 
 fn read_variant_types_body_into<R: Read>(
     reader: &mut R, type_names: &[String], type_states: &[RawColumnState], rows: usize,
-    data: &mut Vec<u8>, one_based_discriminators: bool,
+    data: &mut Vec<u8>, one_based_discriminators: bool, budget: &mut usize,
 ) -> Result<()> {
-    let mode = read_u64_into(reader, data)?;
+    let mode = read_u64_into(reader, data, budget)?;
     if rows == 0 || type_names.is_empty() {
         return Ok(());
     }
     match mode {
         0 => {
             let start = data.len();
-            read_exact_into(reader, data, rows)?;
+            read_exact_into(reader, data, rows, budget)?;
             let mut counts = vec![0usize; type_names.len()];
             for &discriminator in &data[start..start + rows] {
                 let idx = if one_based_discriminators {
@@ -812,11 +883,11 @@ fn read_variant_types_body_into<R: Read>(
                     }
                 }
             }
-            read_dynamic_subcolumns_into(reader, type_names, type_states, &counts, data)
+            read_dynamic_subcolumns_into(reader, type_names, type_states, &counts, data, budget)
         },
         1 => {
             let discriminator = checked_usize(
-                read_u64_into(reader, data)?,
+                read_u64_into(reader, data, budget)?,
                 "Variant compact discriminator",
             )?;
             let discriminator = if one_based_discriminators {
@@ -824,7 +895,15 @@ fn read_variant_types_body_into<R: Read>(
             } else {
                 discriminator
             };
-            let compact_rows = checked_usize(read_u64_into(reader, data)?, "Variant compact rows")?;
+            let compact_rows =
+                checked_usize(read_u64_into(reader, data, budget)?, "Variant compact rows")?;
+            // A compact granule carries one non-empty variant for at most the
+            // outer row count (all-NULL granules legally carry zero rows).
+            if compact_rows > rows {
+                return Err(crate::sync::error::Error::Protocol(format!(
+                    "Variant compact rows {compact_rows} exceeds row count {rows}"
+                )));
+            }
             if discriminator < type_names.len() && compact_rows > 0 {
                 let ct = crate::sync::protocol::type_parser::parse_type(&type_names[discriminator])
                     .map_err(|e| {
@@ -836,7 +915,7 @@ fn read_variant_types_body_into<R: Read>(
                 let state = type_states
                     .get(discriminator)
                     .unwrap_or(&RawColumnState::None);
-                read_column_body_raw_into(reader, &ct, state, compact_rows, data)?;
+                read_column_body_raw_into(reader, &ct, state, compact_rows, data, budget)?;
             }
             Ok(())
         },
@@ -848,6 +927,7 @@ fn read_variant_types_body_into<R: Read>(
 
 fn read_column_body_raw_into<R: Read>(
     reader: &mut R, ct: &ColumnType, state: &RawColumnState, rows: usize, data: &mut Vec<u8>,
+    budget: &mut usize,
 ) -> Result<()> {
     if rows == 0 {
         return Ok(());
@@ -856,33 +936,36 @@ fn read_column_body_raw_into<R: Read>(
     use ColumnType::*;
     match ct {
         Nullable(inner) => {
-            read_exact_into(reader, data, rows)?;
+            read_exact_into(reader, data, rows, budget)?;
             let inner_state = match state {
                 RawColumnState::Nullable(inner_state) => inner_state.as_ref(),
                 _ => &RawColumnState::None,
             };
-            read_column_body_raw_into(reader, inner, inner_state, rows, data)
+            read_column_body_raw_into(reader, inner, inner_state, rows, data, budget)
         },
         Array(inner) => {
             let mut total = 0usize;
             for _ in 0..rows {
-                let offset = read_u64_into(reader, data)?;
-                total = total.max(checked_usize(offset, "array offset")?);
+                let offset = read_u64_into(reader, data, budget)?;
+                // Offsets are cumulative prefix sums: non-decreasing, and the
+                // running maximum is the inner row count, capped at
+                // MAX_BLOCK_ROWS before the inner column is read.
+                total = checked_monotonic_offset(total, offset, "array offset")?;
             }
             if total > 0 {
                 let inner_state = match state {
                     RawColumnState::Array(inner_state) => inner_state.as_ref(),
                     _ => &RawColumnState::None,
                 };
-                read_column_body_raw_into(reader, inner, inner_state, total, data)?;
+                read_column_body_raw_into(reader, inner, inner_state, total, data, budget)?;
             }
             Ok(())
         },
         Map(key, value) => {
             let mut total = 0usize;
             for _ in 0..rows {
-                let offset = read_u64_into(reader, data)?;
-                total = total.max(checked_usize(offset, "map offset")?);
+                let offset = read_u64_into(reader, data, budget)?;
+                total = checked_monotonic_offset(total, offset, "map offset")?;
             }
             if total > 0 {
                 let (key_state, value_state) = match state {
@@ -891,8 +974,8 @@ fn read_column_body_raw_into<R: Read>(
                     },
                     _ => (&RawColumnState::None, &RawColumnState::None),
                 };
-                read_column_body_raw_into(reader, key, key_state, total, data)?;
-                read_column_body_raw_into(reader, value, value_state, total, data)?;
+                read_column_body_raw_into(reader, key, key_state, total, data, budget)?;
+                read_column_body_raw_into(reader, value, value_state, total, data, budget)?;
             }
             Ok(())
         },
@@ -903,7 +986,7 @@ fn read_column_body_raw_into<R: Read>(
             };
             for (idx, elem) in elems.iter().enumerate() {
                 let elem_state = states.get(idx).unwrap_or(&RawColumnState::None);
-                read_column_body_raw_into(reader, elem, elem_state, rows, data)?;
+                read_column_body_raw_into(reader, elem, elem_state, rows, data, budget)?;
             }
             Ok(())
         },
@@ -912,7 +995,7 @@ fn read_column_body_raw_into<R: Read>(
                 RawColumnState::LowCardinality(inner_state) => inner_state.as_ref(),
                 _ => &RawColumnState::None,
             };
-            read_lc_body_raw_into(reader, inner, inner_state, data)
+            read_lc_body_raw_into(reader, inner, inner_state, rows, data, budget)
         },
         JSON => {
             let json_state = match state {
@@ -923,7 +1006,7 @@ fn read_column_body_raw_into<R: Read>(
                     ));
                 },
             };
-            read_json_body_into(reader, json_state, rows, data)
+            read_json_body_into(reader, json_state, rows, data, budget)
         },
         Dynamic => {
             let dynamic_state = match state {
@@ -934,18 +1017,18 @@ fn read_column_body_raw_into<R: Read>(
                     ));
                 },
             };
-            read_dynamic_body_into(reader, dynamic_state, rows, data)
+            read_dynamic_body_into(reader, dynamic_state, rows, data, budget)
         },
         Variant(types) => {
             let states = match state {
                 RawColumnState::Variant(states) => states.as_slice(),
                 _ => &[],
             };
-            read_variant_body_into(reader, types, states, rows, data)
+            read_variant_body_into(reader, types, states, rows, data, budget)
         },
         Point => {
-            read_column_body_raw_into(reader, &Float64, &RawColumnState::None, rows, data)?;
-            read_column_body_raw_into(reader, &Float64, &RawColumnState::None, rows, data)
+            read_column_body_raw_into(reader, &Float64, &RawColumnState::None, rows, data, budget)?;
+            read_column_body_raw_into(reader, &Float64, &RawColumnState::None, rows, data, budget)
         },
         Ring => read_column_body_raw_into(
             reader,
@@ -953,6 +1036,7 @@ fn read_column_body_raw_into<R: Read>(
             &RawColumnState::None,
             rows,
             data,
+            budget,
         ),
         Polygon => read_column_body_raw_into(
             reader,
@@ -960,6 +1044,7 @@ fn read_column_body_raw_into<R: Read>(
             &RawColumnState::None,
             rows,
             data,
+            budget,
         ),
         MultiPolygon => read_column_body_raw_into(
             reader,
@@ -967,15 +1052,24 @@ fn read_column_body_raw_into<R: Read>(
             &RawColumnState::None,
             rows,
             data,
+            budget,
         ),
         String | Other(_) => {
             for _ in 0..rows {
-                let len = checked_usize(read_varint_into(reader, data)?, "string value length")?;
-                read_exact_into(reader, data, len)?;
+                let len = checked_string_len(
+                    read_varint_into(reader, data, budget)?,
+                    "string value length",
+                )?;
+                read_exact_into(reader, data, len, budget)?;
             }
             Ok(())
         },
-        FixedString(n) => read_exact_into(reader, data, checked_len(rows, *n)?),
+        FixedString(n) => read_exact_into(
+            reader,
+            data,
+            checked_column_len(rows, *n, "FixedString column")?,
+            budget,
+        ),
         AggregateFunction | SimpleAggregateFunction => Err(crate::sync::error::Error::Protocol(
             format!("raw capture does not support type {ct}"),
         )),
@@ -983,16 +1077,22 @@ fn read_column_body_raw_into<R: Read>(
             let width = ct
                 .fixed_width()
                 .ok_or_else(|| crate::sync::error::Error::Protocol(format!("unknown type {ct}")))?;
-            read_exact_into(reader, data, checked_len(rows, width)?)
+            read_exact_into(
+                reader,
+                data,
+                checked_column_len(rows, width, "fixed-width column")?,
+                budget,
+            )
         },
     }
 }
 
 fn read_lc_body_raw_into<R: Read>(
-    reader: &mut R, inner: &ColumnType, inner_state: &RawColumnState, data: &mut Vec<u8>,
+    reader: &mut R, inner: &ColumnType, inner_state: &RawColumnState, rows: usize,
+    data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     let start = data.len();
-    read_exact_into(reader, data, 24)?;
+    read_exact_into(reader, data, 24, budget)?;
     let version = u64::from_le_bytes(data[start..start + 8].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality version length mismatch".into())
     })?);
@@ -1013,39 +1113,61 @@ fn read_lc_body_raw_into<R: Read>(
     )?;
     let idx_width = 1usize << (serial_type & 0x3);
     if num_keys > 0 {
-        read_column_body_raw_into(reader, inner, inner_state, num_keys, data)?;
+        read_column_body_raw_into(reader, inner, inner_state, num_keys, data, budget)?;
     }
-    let indexes = checked_usize(read_u64_into(reader, data)?, "LowCardinality indexes")?;
-    read_exact_into(reader, data, checked_len(indexes, idx_width)?)
+    let indexes = checked_usize(
+        read_u64_into(reader, data, budget)?,
+        "LowCardinality indexes",
+    )?;
+    // The native format writes exactly one index per row of the granule; a
+    // different count can only be a malformed or hostile payload.
+    if indexes != rows {
+        return Err(crate::sync::error::Error::Protocol(format!(
+            "LowCardinality index count {indexes} does not match row count {rows}"
+        )));
+    }
+    read_exact_into(
+        reader,
+        data,
+        checked_column_len(indexes, idx_width, "LowCardinality index")?,
+        budget,
+    )
 }
 
 fn read_dynamic_type_names_into<R: Read>(
-    reader: &mut R, data: &mut Vec<u8>, count_name: &str,
+    reader: &mut R, data: &mut Vec<u8>, count_name: &str, budget: &mut usize,
 ) -> Result<Vec<String>> {
     let type_count = checked_count(
-        read_varint_into(reader, data)?,
+        read_varint_into(reader, data, budget)?,
         count_name,
         crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     let mut type_names = Vec::with_capacity(type_count);
     for _ in 0..type_count {
-        type_names.push(read_string_into(reader, data, "dynamic type length")?);
+        type_names.push(read_string_into(
+            reader,
+            data,
+            "dynamic type length",
+            budget,
+        )?);
     }
     Ok(type_names)
 }
 
-fn read_string_into<R: Read>(reader: &mut R, data: &mut Vec<u8>, name: &str) -> Result<String> {
-    let len = checked_usize(read_varint_into(reader, data)?, name)?;
+fn read_string_into<R: Read>(
+    reader: &mut R, data: &mut Vec<u8>, name: &str, budget: &mut usize,
+) -> Result<String> {
+    let len = checked_string_len(read_varint_into(reader, data, budget)?, name)?;
     let start = data.len();
-    read_exact_into(reader, data, len)?;
+    read_exact_into(reader, data, len, budget)?;
     std::str::from_utf8(&data[start..start + len])
         .map(str::to_owned)
         .map_err(|e| crate::sync::error::Error::Protocol(format!("invalid UTF-8 string: {e}")))
 }
 
-fn read_u64_into<R: Read>(reader: &mut R, data: &mut Vec<u8>) -> Result<u64> {
+fn read_u64_into<R: Read>(reader: &mut R, data: &mut Vec<u8>, budget: &mut usize) -> Result<u64> {
     let start = data.len();
-    read_exact_into(reader, data, 8)?;
+    read_exact_into(reader, data, 8, budget)?;
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&data[start..start + 8]);
     Ok(u64::from_le_bytes(bytes))
@@ -1081,7 +1203,7 @@ fn decode_dynamic_discriminator(bytes: &[u8]) -> Result<usize> {
 }
 
 fn read_low_cardinality_into<R: Read>(
-    reader: &mut R, inner: &ColumnType, rows: usize, data: &mut Vec<u8>,
+    reader: &mut R, inner: &ColumnType, rows: usize, data: &mut Vec<u8>, budget: &mut usize,
 ) -> Result<()> {
     let mut meta = [0u8; 24];
     reader.read_exact(&mut meta)?;
@@ -1100,7 +1222,8 @@ fn read_low_cardinality_into<R: Read>(
         crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     let mut dict_data = Vec::new();
-    read_column_data_into(reader, inner, num_keys, &mut dict_data)?;
+    let mut dict_budget = crate::limits::MAX_COLUMN_BYTES;
+    read_column_data_into(reader, inner, num_keys, &mut dict_data, &mut dict_budget)?;
     let mut count = [0u8; 8];
     reader.read_exact(&mut count)?;
     let indexes = checked_usize(u64::from_le_bytes(count), "LowCardinality indexes")?;
@@ -1109,7 +1232,9 @@ fn read_low_cardinality_into<R: Read>(
             "LowCardinality index count {indexes} does not match row count {rows}"
         )));
     }
-    let mut index_data = vec![0u8; checked_len(indexes, idx_width)?];
+    let index_len = checked_column_len(indexes, idx_width, "LowCardinality index")?;
+    charge_budget(budget, index_len, "column")?;
+    let mut index_data = vec![0u8; index_len];
     reader.read_exact(&mut index_data)?;
     let materialized =
         materialize_low_cardinality_inner(&dict_data, inner, &index_data, idx_width, indexes)?;
@@ -1150,15 +1275,31 @@ fn read_low_cardinality_from_buffer(
             "LowCardinality index count {indexes} does not match row count {rows}"
         )));
     }
-    let index_data = parse_bytes(buf, pos, checked_len(indexes, idx_width)?)?;
+    let index_data = parse_bytes(
+        buf,
+        pos,
+        checked_column_len(indexes, idx_width, "LowCardinality index")?,
+    )?;
     materialize_low_cardinality_inner(dict_data, inner, index_data, idx_width, indexes)
 }
 
-fn read_exact_into<R: Read>(reader: &mut R, data: &mut Vec<u8>, len: usize) -> Result<()> {
+fn read_exact_into<R: Read>(
+    reader: &mut R, data: &mut Vec<u8>, len: usize, budget: &mut usize,
+) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
 
+    // Single-read backstop: no individual claim may exceed one column's byte
+    // budget, and the charge happens before the reserve below so lying
+    // lengths fail without allocating.
+    if len > crate::limits::MAX_COLUMN_BYTES {
+        return Err(crate::sync::error::Error::Protocol(format!(
+            "column byte length {len} exceeds limit {}",
+            crate::limits::MAX_COLUMN_BYTES
+        )));
+    }
+    charge_budget(budget, len, "column")?;
     let start = data.len();
     let end = start.checked_add(len).ok_or_else(|| {
         crate::sync::error::Error::Protocol("column buffer length overflow".into())
@@ -1185,19 +1326,33 @@ fn discard_column_data<R: Read>(reader: &mut R, ct: &ColumnType, rows: usize) ->
     use ColumnType::*;
     match ct {
         UInt8 | Int8 | Bool | Enum8 => discard_exact(reader, rows)?,
-        UInt16 | Int16 | Date | Enum16 => discard_exact(reader, checked_len(rows, 2)?)?,
+        UInt16 | Int16 | Date | Enum16 => {
+            discard_exact(reader, checked_column_len(rows, 2, "fixed-width column")?)?
+        },
         UInt32 | Int32 | Float32 | Date32 | DateTime | Time | IPv4 => {
-            discard_exact(reader, checked_len(rows, 4)?)?
+            discard_exact(reader, checked_column_len(rows, 4, "fixed-width column")?)?
         },
         UInt64 | Int64 | Float64 | DateTime64(_) | Time64(_) => {
-            discard_exact(reader, checked_len(rows, 8)?)?
+            discard_exact(reader, checked_column_len(rows, 8, "fixed-width column")?)?
         },
-        UInt128 | Int128 | UUID | IPv6 => discard_exact(reader, checked_len(rows, 16)?)?,
-        UInt256 | Int256 => discard_exact(reader, checked_len(rows, 32)?)?,
-        Decimal(1..=9, _) => discard_exact(reader, checked_len(rows, 4)?)?,
-        Decimal(10..=18, _) => discard_exact(reader, checked_len(rows, 8)?)?,
-        Decimal(19..=38, _) => discard_exact(reader, checked_len(rows, 16)?)?,
-        Decimal(39..=76, _) => discard_exact(reader, checked_len(rows, 32)?)?,
+        UInt128 | Int128 | UUID | IPv6 => {
+            discard_exact(reader, checked_column_len(rows, 16, "fixed-width column")?)?
+        },
+        UInt256 | Int256 => {
+            discard_exact(reader, checked_column_len(rows, 32, "fixed-width column")?)?
+        },
+        Decimal(1..=9, _) => {
+            discard_exact(reader, checked_column_len(rows, 4, "fixed-width column")?)?
+        },
+        Decimal(10..=18, _) => {
+            discard_exact(reader, checked_column_len(rows, 8, "fixed-width column")?)?
+        },
+        Decimal(19..=38, _) => {
+            discard_exact(reader, checked_column_len(rows, 16, "fixed-width column")?)?
+        },
+        Decimal(39..=76, _) => {
+            discard_exact(reader, checked_column_len(rows, 32, "fixed-width column")?)?
+        },
         Decimal(precision, _) => {
             return Err(crate::sync::error::Error::Protocol(format!(
                 "unsupported Decimal precision {precision}"
@@ -1205,7 +1360,7 @@ fn discard_column_data<R: Read>(reader: &mut R, ct: &ColumnType, rows: usize) ->
         },
         String => {
             for _ in 0..rows {
-                let len = checked_usize(wire::read_varint(reader)?, "string value length")?;
+                let len = checked_string_len(wire::read_varint(reader)?, "string value length")?;
                 discard_exact(reader, len)?;
             }
         },
@@ -1221,11 +1376,13 @@ fn discard_column_data<R: Read>(reader: &mut R, ct: &ColumnType, rows: usize) ->
                 )));
             }
             for _ in 0..rows {
-                let len = checked_usize(wire::read_varint(reader)?, "JSON string length")?;
+                let len = checked_string_len(wire::read_varint(reader)?, "JSON string length")?;
                 discard_exact(reader, len)?;
             }
         },
-        FixedString(n) => discard_exact(reader, checked_len(rows, *n)?)?,
+        FixedString(n) => {
+            discard_exact(reader, checked_column_len(rows, *n, "FixedString column")?)?
+        },
         Nullable(inner) => {
             discard_exact(reader, rows)?;
             discard_column_data(reader, inner, rows)?;
@@ -1291,15 +1448,22 @@ fn discard_low_cardinality<R: Read>(reader: &mut R, inner: &ColumnType, rows: us
             "LowCardinality index count {indexes} does not match row count {rows}"
         )));
     }
-    discard_exact(reader, checked_len(indexes, idx_width)?)
+    discard_exact(
+        reader,
+        checked_column_len(indexes, idx_width, "LowCardinality index")?,
+    )
 }
 
 fn discard_offsets<R: Read>(reader: &mut R, rows: usize, name: &str) -> Result<usize> {
     let mut offset = [0u8; 8];
+    let mut total = 0usize;
     for _ in 0..rows {
         reader.read_exact(&mut offset)?;
+        // Cumulative prefix sums must be non-decreasing; the last offset is
+        // the inner element count, capped at MAX_BLOCK_ROWS.
+        total = checked_monotonic_offset(total, u64::from_le_bytes(offset), name)?;
     }
-    checked_usize(u64::from_le_bytes(offset), name)
+    Ok(total)
 }
 
 fn discard_exact<R: Read>(reader: &mut R, mut len: usize) -> Result<()> {
@@ -1345,7 +1509,11 @@ fn materialize_low_cardinality_inner(
 fn materialize_lc_fixed(
     dict: &[u8], width: usize, indexes: &[u8], idx_width: usize, num_idx: usize,
 ) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(checked_len(num_idx, width)?);
+    let mut out = Vec::with_capacity(checked_column_len(
+        num_idx,
+        width,
+        "LowCardinality materialized column",
+    )?);
     for row in 0..num_idx {
         let idx = read_lc_index(indexes, row, idx_width)?;
         let start = idx.checked_mul(width).ok_or_else(|| {
@@ -1385,6 +1553,7 @@ fn materialize_lc_string(
     }
 
     let mut out = Vec::new();
+    let mut total = 0usize;
     for row in 0..num_idx {
         let idx = read_lc_index(indexes, row, idx_width)?;
         let range = entries.get(idx).ok_or_else(|| {
@@ -1392,6 +1561,10 @@ fn materialize_lc_string(
                 "LowCardinality dictionary index out of bounds".into(),
             )
         })?;
+        // Dictionary expansion repeats wire entries per row; cap the
+        // materialized bytes so a tiny dictionary cannot amplify to a huge
+        // output (e.g. 10M rows x a 16 MiB entry).
+        total = checked_column_bytes(total, range.len(), "LowCardinality materialized column")?;
         out.extend_from_slice(&dict[range.clone()]);
     }
     Ok(out)
@@ -1406,7 +1579,11 @@ fn materialize_lc_nullable(
     let values_start = pos;
     let value_dict = &dict[values_start..];
     let values = materialize_low_cardinality_inner(value_dict, inner, indexes, idx_width, num_idx)?;
-    let mut out = Vec::with_capacity(num_idx.saturating_add(values.len()));
+    let mut out = Vec::with_capacity(checked_column_bytes(
+        num_idx,
+        values.len(),
+        "LowCardinality materialized column",
+    )?);
     for row in 0..num_idx {
         let idx = read_lc_index(indexes, row, idx_width)?;
         out.push(*nulls.get(idx).ok_or_else(|| {
@@ -1466,6 +1643,45 @@ fn checked_len(rows: usize, width: usize) -> Result<usize> {
         .ok_or_else(|| crate::sync::error::Error::Protocol("column byte length overflow".into()))
 }
 
+/// Validate a server-controlled per-value string length against the shared
+/// 16 MiB wire limit before it sizes any buffer.
+fn checked_string_len(value: u64, what: &str) -> Result<usize> {
+    crate::limits::checked_string_len(value, what).map_err(crate::sync::error::Error::Protocol)
+}
+
+/// Validate a column's running byte total (checked add + 64 MiB cap) before a
+/// value-driven reserve/resize.
+fn checked_column_bytes(acc: usize, add: usize, what: &str) -> Result<usize> {
+    crate::limits::checked_column_bytes(acc, add, what).map_err(crate::sync::error::Error::Protocol)
+}
+
+/// Validate a fixed-width/offset/index buffer byte length (`rows * width`,
+/// checked multiply + 64 MiB cap) before any allocation sized from it.
+fn checked_column_len(rows: usize, width: usize, what: &str) -> Result<usize> {
+    crate::limits::checked_column_len(rows, width, what)
+        .map_err(crate::sync::error::Error::Protocol)
+}
+
+/// Validate one Array/Map offset: non-decreasing (cumulative prefix sums) and
+/// capped at MAX_BLOCK_ROWS inner elements.
+fn checked_monotonic_offset(prev: usize, value: u64, what: &str) -> Result<usize> {
+    crate::limits::checked_monotonic_offset(prev, value, what)
+        .map_err(crate::sync::error::Error::Protocol)
+}
+
+/// Charge `len` claimed bytes against a column's remaining byte budget so
+/// lying lengths fail before the matching reserve/resize/read.
+fn charge_budget(budget: &mut usize, len: usize, what: &str) -> Result<()> {
+    let remaining = budget.checked_sub(len).ok_or_else(|| {
+        crate::sync::error::Error::Protocol(format!(
+            "{what} cumulative byte length exceeds limit {}",
+            crate::limits::MAX_COLUMN_BYTES
+        ))
+    })?;
+    *budget = remaining;
+    Ok(())
+}
+
 fn checked_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| crate::sync::error::Error::Protocol(format!("{name} count too large")))
@@ -1501,7 +1717,9 @@ fn lc_idx_width(version: u64, serial_type: u64) -> Result<usize> {
     Ok(1usize << (serial_type & 0x3))
 }
 
-fn read_varint_into<R: Read>(reader: &mut R, data: &mut Vec<u8>) -> Result<u64> {
+fn read_varint_into<R: Read>(
+    reader: &mut R, data: &mut Vec<u8>, budget: &mut usize,
+) -> Result<u64> {
     let mut r = 0u64;
     let mut shift = 0;
     loop {
@@ -1512,6 +1730,7 @@ fn read_varint_into<R: Read>(reader: &mut R, data: &mut Vec<u8>) -> Result<u64> 
         }
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
+        charge_budget(budget, 1, "column")?;
         data.push(byte[0]);
         if shift == 63 && (byte[0] & 0x7F) > 1 {
             return Err(crate::sync::error::Error::Protocol(
@@ -1576,8 +1795,7 @@ fn skip_column_data(buf: &[u8], pos: &mut usize, ct: &ColumnType, rows: usize) -
         // String: each row is varint-len + data
         String => {
             for _ in 0..rows {
-                let l = usize::try_from(parse_varint(buf, pos)?)
-                    .map_err(|_| crate::sync::error::Error::Protocol("string too large".into()))?;
+                let l = checked_string_len(parse_varint(buf, pos)?, "string value length")?;
                 advance(buf, pos, l)?;
             }
         },
@@ -1596,9 +1814,7 @@ fn skip_column_data(buf: &[u8], pos: &mut usize, ct: &ColumnType, rows: usize) -
                 )));
             }
             for _ in 0..rows {
-                let l = usize::try_from(parse_varint(buf, pos)?).map_err(|_| {
-                    crate::sync::error::Error::Protocol("JSON string too large".into())
-                })?;
+                let l = checked_string_len(parse_varint(buf, pos)?, "JSON string length")?;
                 advance(buf, pos, l)?;
             }
         },
@@ -1625,15 +1841,19 @@ fn skip_column_data(buf: &[u8], pos: &mut usize, ct: &ColumnType, rows: usize) -
                     "unexpected end of buffer parsing array offsets".into(),
                 ));
             }
-            let last_off = if rows > 0 {
+            let mut last_off = 0usize;
+            for chunk in buf[*pos..off_end].chunks_exact(8) {
                 let mut offset_bytes = [0u8; 8];
-                offset_bytes.copy_from_slice(&buf[off_end - 8..off_end]);
-                usize::try_from(u64::from_le_bytes(offset_bytes)).map_err(|_| {
-                    crate::sync::error::Error::Protocol("array offset too large".into())
-                })?
-            } else {
-                0
-            };
+                offset_bytes.copy_from_slice(chunk);
+                // Offsets are cumulative prefix sums: non-decreasing, and the
+                // last offset is the inner element row count, capped before
+                // the inner column is skipped.
+                last_off = checked_monotonic_offset(
+                    last_off,
+                    u64::from_le_bytes(offset_bytes),
+                    "array offset",
+                )?;
+            }
             *pos = off_end;
             // For arrays of depth > 1, the offsets are nested
             let elem_rows = if last_off > 0 {
@@ -1766,11 +1986,13 @@ mod tests {
     #[test]
     fn read_varint_into_rejects_overlong_and_tenth_byte_overflow() {
         let mut recorded = Vec::new();
+        let mut budget = crate::limits::MAX_COLUMN_BYTES;
         let overflow = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02];
-        assert!(read_varint_into(&mut &overflow[..], &mut recorded).is_err());
+        assert!(read_varint_into(&mut &overflow[..], &mut recorded, &mut budget).is_err());
 
         let mut recorded = Vec::new();
-        assert!(read_varint_into(&mut &[0x80u8; 11][..], &mut recorded).is_err());
+        let mut budget = crate::limits::MAX_COLUMN_BYTES;
+        assert!(read_varint_into(&mut &[0x80u8; 11][..], &mut recorded, &mut budget).is_err());
     }
 
     #[test]
@@ -1993,7 +2215,8 @@ mod count_limit_tests {
         bytes.extend_from_slice(&varint(u64::MAX)); // JSON path count
         let mut reader = Cursor::new(bytes);
         let mut data = Vec::new();
-        let err = read_json_state_prefix_into(&mut reader, &mut data)
+        let mut budget = crate::limits::MAX_COLUMN_BYTES;
+        let err = read_json_state_prefix_into(&mut reader, &mut data, &mut budget)
             .expect_err("u64::MAX JSON path count must be rejected");
         match &err {
             Error::Protocol(msg) => assert_eq!(
@@ -2011,7 +2234,8 @@ mod count_limit_tests {
         bytes.extend_from_slice(&varint(65_537)); // JSON path count
         let mut reader = Cursor::new(bytes);
         let mut data = Vec::new();
-        let err = read_json_state_prefix_into(&mut reader, &mut data)
+        let mut budget = crate::limits::MAX_COLUMN_BYTES;
+        let err = read_json_state_prefix_into(&mut reader, &mut data, &mut budget)
             .expect_err("cap + 1 JSON path count must be rejected");
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
     }
@@ -2025,7 +2249,8 @@ mod count_limit_tests {
         bytes.extend_from_slice(&varint(u64::MAX)); // dynamic type count
         let mut reader = Cursor::new(bytes);
         let mut data = Vec::new();
-        let err = read_dynamic_state_prefix_into(&mut reader, &mut data)
+        let mut budget = crate::limits::MAX_COLUMN_BYTES;
+        let err = read_dynamic_state_prefix_into(&mut reader, &mut data, &mut budget)
             .expect_err("u64::MAX dynamic type count must be rejected");
         match &err {
             Error::Protocol(msg) => assert_eq!(
@@ -2079,5 +2304,305 @@ mod count_limit_tests {
         assert_eq!(block.row_count(), 1);
         assert_eq!(block.columns.len(), 1);
         assert_eq!(&block.columns[0].data[..], &[7]);
+    }
+}
+
+#[cfg(test)]
+mod byte_limit_tests {
+    use super::read_lc_body_raw_into;
+    use super::{
+        RawColumnState, discard_block_body, parse_block_body, read_block, read_block_body,
+        read_block_view, read_variant_types_body_into,
+    };
+    use crate::limits::MAX_COLUMN_BYTES;
+    use crate::sync::error::Error;
+    use crate::sync::protocol::type_parser::ColumnType;
+    use crate::sync::protocol::wire;
+    use std::io::Cursor;
+
+    fn varint(v: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, v).expect("test write");
+        buf
+    }
+
+    fn column_header(name: &str, type_name: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_string(&mut buf, name).expect("test write");
+        wire::write_string(&mut buf, type_name).expect("test write");
+        buf.push(0); // custom serialization
+        buf
+    }
+
+    /// table name + BlockInfo terminator + 1 column / 1 row header.
+    fn one_column_block(type_name: &str) -> Vec<u8> {
+        block_with_rows(type_name, 1)
+    }
+
+    fn block_with_rows(type_name: &str, rows: u64) -> Vec<u8> {
+        let mut buf = varint(0); // table name
+        buf.push(0x00); // BlockInfo terminator
+        buf.extend_from_slice(&varint(1)); // columns
+        buf.extend_from_slice(&varint(rows)); // rows
+        buf.extend_from_slice(&column_header("c", type_name));
+        buf
+    }
+
+    fn assert_protocol(err: &Error, needle: &str) {
+        match err {
+            Error::Protocol(msg) => assert!(
+                msg.contains(needle),
+                "expected {needle:?} in protocol error, got: {msg}"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streamed_string_value_length_u64_max_is_rejected_before_read() {
+        let mut bytes = one_column_block("String");
+        bytes.extend_from_slice(&varint(u64::MAX)); // lying length, no payload
+        let mut reader = Cursor::new(bytes);
+        let err = read_block(&mut reader)
+            .err()
+            .expect("lying string length must be rejected");
+        assert_protocol(
+            &err,
+            "string value length 18446744073709551615 exceeds limit 16777215",
+        );
+    }
+
+    #[test]
+    fn view_path_string_value_length_2_pow_40_is_rejected() {
+        let mut bytes = one_column_block("String");
+        bytes.extend_from_slice(&varint(1u64 << 40));
+        let mut reader = Cursor::new(bytes);
+        let mut visitor =
+            |_view: crate::sync::protocol::block::BlockView<'_>| -> crate::sync::error::Result<()> {
+                Ok(())
+            };
+        let err = read_block_view(&mut reader, &mut visitor)
+            .expect_err("2^40 string claim must be rejected on the view path");
+        assert_protocol(
+            &err,
+            "string value length 1099511627776 exceeds limit 16777215",
+        );
+    }
+
+    #[test]
+    fn from_buffer_string_value_length_u64_max_is_rejected() {
+        let mut bytes = vec![0x00]; // BlockInfo terminator
+        bytes.extend_from_slice(&varint(1)); // columns
+        bytes.extend_from_slice(&varint(1)); // rows
+        bytes.extend_from_slice(&column_header("c", "String"));
+        bytes.extend_from_slice(&varint(u64::MAX));
+        let mut pos = 0;
+        let err = parse_block_body(&bytes, &mut pos)
+            .err()
+            .expect("from-buffer lying string length must be rejected");
+        assert_protocol(&err, "string value length 18446744073709551615");
+    }
+
+    #[test]
+    fn discard_string_value_length_u64_max_is_rejected() {
+        let mut bytes = vec![0x00]; // BlockInfo terminator
+        bytes.extend_from_slice(&varint(1)); // columns
+        bytes.extend_from_slice(&varint(1)); // rows
+        bytes.extend_from_slice(&column_header("c", "String"));
+        bytes.extend_from_slice(&varint(u64::MAX));
+        let mut reader = Cursor::new(bytes);
+        let err = discard_block_body(&mut reader)
+            .expect_err("discard-path lying string length must be rejected");
+        assert_protocol(&err, "string value length 18446744073709551615");
+    }
+
+    #[test]
+    fn streamed_json_string_length_u64_max_is_rejected() {
+        let mut bytes = one_column_block("JSON");
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // serialization version
+        bytes.extend_from_slice(&varint(u64::MAX));
+        let mut reader = Cursor::new(bytes);
+        let err = read_block(&mut reader)
+            .err()
+            .expect("lying JSON length must be rejected");
+        assert_protocol(&err, "JSON string length 18446744073709551615");
+    }
+
+    #[test]
+    fn streamed_array_offset_2_pow_60_is_rejected_before_inner_read() {
+        let mut bytes = one_column_block("Array(UInt8)");
+        bytes.extend_from_slice(&(1u64 << 60).to_le_bytes()); // single offset
+        let mut reader = Cursor::new(bytes);
+        let err = read_block(&mut reader)
+            .err()
+            .expect("2^60 array offset must be rejected before the inner read");
+        assert_protocol(
+            &err,
+            "array offset total 1152921504606846976 exceeds limit 10000000",
+        );
+    }
+
+    #[test]
+    fn from_buffer_array_offset_2_pow_60_is_rejected() {
+        let mut bytes = vec![0x00];
+        bytes.extend_from_slice(&varint(1));
+        bytes.extend_from_slice(&varint(1));
+        bytes.extend_from_slice(&column_header("c", "Array(UInt8)"));
+        bytes.extend_from_slice(&(1u64 << 60).to_le_bytes());
+        let mut pos = 0;
+        let err = parse_block_body(&bytes, &mut pos)
+            .err()
+            .expect("2^60 array offset must be rejected in the buffer path");
+        assert_protocol(&err, "array offset total 1152921504606846976");
+    }
+
+    #[test]
+    fn discard_array_offset_2_pow_60_is_rejected() {
+        let mut bytes = vec![0x00];
+        bytes.extend_from_slice(&varint(1));
+        bytes.extend_from_slice(&varint(1));
+        bytes.extend_from_slice(&column_header("c", "Array(UInt8)"));
+        bytes.extend_from_slice(&(1u64 << 60).to_le_bytes());
+        let mut reader = Cursor::new(bytes);
+        let err = discard_block_body(&mut reader)
+            .expect_err("2^60 array offset must be rejected on the discard path");
+        assert_protocol(&err, "array offset total 1152921504606846976");
+    }
+
+    #[test]
+    fn streamed_map_offset_decrease_is_rejected() {
+        let mut bytes = block_with_rows("Map(UInt8, UInt8)", 2);
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&4u64.to_le_bytes()); // decreasing
+        let mut reader = Cursor::new(bytes);
+        let err = read_block(&mut reader)
+            .err()
+            .expect("decreasing map offsets must be rejected");
+        assert_protocol(&err, "map offset decreased from 9 to 4");
+    }
+
+    #[test]
+    fn fixed_width_cap_plus_one_is_rejected_before_allocation() {
+        // UInt256 rows*32 = 64 MiB + 32 must fail before the arena reserves.
+        let mut bytes = vec![0x00];
+        bytes.extend_from_slice(&varint(1)); // columns
+        bytes.extend_from_slice(&varint((MAX_COLUMN_BYTES / 32 + 1) as u64)); // rows
+        bytes.extend_from_slice(&column_header("c", "UInt256"));
+        let mut reader = Cursor::new(bytes);
+        let err = read_block_body(&mut reader)
+            .err()
+            .expect("fixed-width cap + 1 must be rejected");
+        assert_protocol(
+            &err,
+            "fixed-width column byte length 67108896 exceeds limit 67108864",
+        );
+    }
+
+    #[test]
+    fn raw_low_cardinality_index_count_u64_max_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // key serialization version
+        bytes.extend_from_slice(&(1u64 << 9).to_le_bytes()); // additional keys, UInt8 indexes
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no dictionary keys
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // index count claim
+        let mut reader = Cursor::new(bytes);
+        let mut data = Vec::new();
+        let mut budget = MAX_COLUMN_BYTES;
+        let err = read_lc_body_raw_into(
+            &mut reader,
+            &ColumnType::UInt8,
+            &RawColumnState::None,
+            1,
+            &mut data,
+            &mut budget,
+        )
+        .expect_err("u64::MAX LowCardinality index count must be rejected");
+        assert_protocol(&err, "LowCardinality index count 18446744073709551615");
+    }
+
+    #[test]
+    fn raw_low_cardinality_index_mismatch_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&(1u64 << 9).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no dictionary keys
+        bytes.extend_from_slice(&5u64.to_le_bytes()); // index count != rows
+        let mut reader = Cursor::new(bytes);
+        let mut data = Vec::new();
+        let mut budget = MAX_COLUMN_BYTES;
+        let err = read_lc_body_raw_into(
+            &mut reader,
+            &ColumnType::UInt8,
+            &RawColumnState::None,
+            1,
+            &mut data,
+            &mut budget,
+        )
+        .expect_err("LowCardinality index mismatch must be rejected");
+        assert_protocol(
+            &err,
+            "LowCardinality index count 5 does not match row count 1",
+        );
+    }
+
+    #[test]
+    fn variant_compact_rows_claim_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // mode = COMPACT
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // discriminator
+        bytes.extend_from_slice(&(1u64 << 60).to_le_bytes()); // compact rows claim
+        let mut reader = Cursor::new(bytes);
+        let mut data = Vec::new();
+        let mut budget = MAX_COLUMN_BYTES;
+        let err = read_variant_types_body_into(
+            &mut reader,
+            &["UInt8".to_string()],
+            &[RawColumnState::None],
+            1,
+            &mut data,
+            false,
+            &mut budget,
+        )
+        .expect_err("huge Variant compact rows claim must be rejected");
+        assert_protocol(
+            &err,
+            "Variant compact rows 1152921504606846976 exceeds row count 1",
+        );
+    }
+
+    #[test]
+    fn variant_compact_rows_equal_to_rows_parse() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // mode = COMPACT
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // discriminator (UInt8)
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // compact rows == rows
+        bytes.extend_from_slice(&[7, 9]); // two UInt8 values
+        let mut reader = Cursor::new(bytes);
+        let mut data = Vec::new();
+        let mut budget = MAX_COLUMN_BYTES;
+        read_variant_types_body_into(
+            &mut reader,
+            &["UInt8".to_string()],
+            &[RawColumnState::None],
+            2,
+            &mut data,
+            false,
+            &mut budget,
+        )
+        .expect("compact rows == rows parses");
+        assert_eq!(&data[data.len() - 2..], &[7, 9]);
+    }
+
+    #[test]
+    fn low_cardinality_materialization_cap_is_enforced_before_allocating() {
+        // 2,097,153 rows of a 32-byte entry would materialize 64 MiB + 32:
+        // the capacity claim must fail before with_capacity allocates.
+        let dict = vec![0u8; 32];
+        let err = super::materialize_lc_fixed(&dict, 32, b"", 4, MAX_COLUMN_BYTES / 32 + 1)
+            .expect_err("materialization cap + 1 must be rejected");
+        assert_protocol(
+            &err,
+            "LowCardinality materialized column byte length 67108896 exceeds limit 67108864",
+        );
     }
 }
