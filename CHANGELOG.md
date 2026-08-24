@@ -192,6 +192,29 @@ All notable changes to st-clickhouse are documented here.
   into query parameters.
 
 ### Fixed
+- **Buffered block framing now mirrors the wire format for Array/Map/JSON/
+  LowCardinality/Variant/Dynamic columns** (both engines): the async
+  compressed-materialized parser (`parse_decompressed_block`/`discard_decompressed_block`
+  in `connection/block_reader.rs`) and the sync buffered parser
+  (`skip_column_data` in `sync/protocol/response.rs`, used by `QueryStream`
+  and totals/extremes blocks) previously framed columns with ad-hoc skip code
+  that desynced whole blocks and lost the connection. Both now share one
+  slice-based skip implementation (`shared/skip_column.rs`) that mirrors the
+  raw stream readers byte for byte. Fixed layouts: Array/Map offsets are
+  fixed-width little-endian `UInt64` per outer row (previously parsed as
+  varints on the async path, and skipped entirely on the sync path), the inner
+  columns carry exactly the last-offset rows — zero rows and zero bytes when
+  every array is empty (the sync path previously skipped `rows - 1` inner
+  rows); a materialized JSON column's 8-byte string-serialization version is
+  consumed as framing and stripped from the sliced data (previously missing on
+  the async path); LowCardinality columns are framed and materialized through
+  their 24-byte header/dictionary/index layout (previously skipped as a bare
+  inner column on the async path, and the sync buffered parser hung on the
+  zero-row header block of every SELECT with a LowCardinality column);
+  Variant/Dynamic columns consume their per-subcolumn state prefixes,
+  discriminators, and counted subcolumns instead of jumping to the end of the
+  buffer; and `AggregateFunction` columns are rejected like the streaming
+  readers instead of silently misframing later columns.
 - **Dropping a query future no longer poisons the pool** (`st_clickhouse`, async
   engine): every pooled connection now carries an in-flight response mark, set before
   the first response-triggering packet write (query, pre-query Ping, TablesStatus,

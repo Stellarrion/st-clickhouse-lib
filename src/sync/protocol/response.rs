@@ -165,6 +165,15 @@ fn parse_column_type(type_name: &str) -> Result<ColumnType> {
 fn materialized_column_data_start(
     buf: &[u8], start: usize, ct: &ColumnType, rows: usize,
 ) -> Result<usize> {
+    // JSON nested below the top level keeps its 8-byte string-serialization
+    // version inside the sliced data, which the column decoders misread —
+    // reject it loudly instead of returning silently wrong data.
+    if rows > 0 && crate::sync::protocol::skip_column::contains_nested_json(ct) {
+        return Err(crate::sync::error::Error::Protocol(format!(
+            "nested JSON columns are not supported in buffered block reads \
+             (column type {ct}); use uncompressed reads or query_raw"
+        )));
+    }
     if rows == 0 || !matches!(ct, ColumnType::JSON) {
         return Ok(start);
     }
@@ -1245,6 +1254,11 @@ fn read_low_cardinality_into<R: Read>(
 fn read_low_cardinality_from_buffer(
     buf: &[u8], pos: &mut usize, inner: &ColumnType, rows: usize,
 ) -> Result<Vec<u8>> {
+    // Zero-row blocks (e.g. the header block of every SELECT) carry no column
+    // bytes at all, so there is no LowCardinality header to parse.
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
     let meta = parse_bytes(buf, pos, 24)?;
     let version = u64::from_le_bytes(meta[0..8].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality version length mismatch".into())
@@ -1638,11 +1652,6 @@ fn read_lc_index(data: &[u8], row: usize, width: usize) -> Result<usize> {
     checked_usize(value, "LowCardinality index")
 }
 
-fn checked_len(rows: usize, width: usize) -> Result<usize> {
-    rows.checked_mul(width)
-        .ok_or_else(|| crate::sync::error::Error::Protocol("column byte length overflow".into()))
-}
-
 /// Validate a server-controlled per-value string length against the shared
 /// 16 MiB wire limit before it sizes any buffer.
 fn checked_string_len(value: u64, what: &str) -> Result<usize> {
@@ -1766,194 +1775,16 @@ fn skip_block_info(buf: &[u8], pos: &mut usize) -> Result<()> {
 }
 
 /// Skip a single column's data in the buffer.
-/// Advances `pos` past the column's wire data based on its type.
+///
+/// Delegates to the shared slice-based skip implementation so the buffered
+/// parser frames columns exactly like the streaming raw readers: Array/Map
+/// offsets are fixed-width little-endian u64s (never varints) whose last
+/// value is the inner row count, materialized JSON carries an 8-byte
+/// string-serialization version, LowCardinality carries its header /
+/// dictionary / index layout, and Variant/Dynamic carry their per-subcolumn
+/// state prefixes.
 fn skip_column_data(buf: &[u8], pos: &mut usize, ct: &ColumnType, rows: usize) -> Result<()> {
-    if rows == 0 {
-        return Ok(());
-    }
-
-    use ColumnType::*;
-    match ct {
-        // Fixed-width primitives
-        UInt8 | Int8 | Bool | Enum8 => advance(buf, pos, rows)?,
-        UInt16 | Int16 | Date | Enum16 => advance(buf, pos, checked_len(rows, 2)?)?,
-        UInt32 | Int32 | Float32 | Date32 | DateTime | Time | IPv4 => {
-            advance(buf, pos, checked_len(rows, 4)?)?
-        },
-        UInt64 | Int64 | Float64 | DateTime64(_) | Time64(_) => {
-            advance(buf, pos, checked_len(rows, 8)?)?
-        },
-        UInt128 | Int128 | UUID | IPv6 => advance(buf, pos, checked_len(rows, 16)?)?,
-        UInt256 | Int256 => advance(buf, pos, checked_len(rows, 32)?)?,
-
-        // Decimal: width depends on precision
-        Decimal(1..=9, _) => advance(buf, pos, checked_len(rows, 4)?)?,
-        Decimal(10..=18, _) => advance(buf, pos, checked_len(rows, 8)?)?,
-        Decimal(19..=38, _) => advance(buf, pos, checked_len(rows, 16)?)?,
-        Decimal(39..=76, _) => advance(buf, pos, checked_len(rows, 32)?)?,
-
-        // String: each row is varint-len + data
-        String => {
-            for _ in 0..rows {
-                let l = checked_string_len(parse_varint(buf, pos)?, "string value length")?;
-                advance(buf, pos, l)?;
-            }
-        },
-
-        JSON => {
-            let version_start = *pos;
-            advance(buf, pos, 8)?;
-            let mut version_bytes = [0u8; 8];
-            version_bytes.copy_from_slice(&buf[version_start..version_start + 8]);
-            let version = u64::from_le_bytes(version_bytes);
-            if version != 1 && version != 4 {
-                return Err(crate::sync::error::Error::Protocol(format!(
-                    "materialized JSON reads require string serialization version 1 or 4, got {version}; \
-                     enable {}=1 or use query_raw",
-                    crate::sync::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING
-                )));
-            }
-            for _ in 0..rows {
-                let l = checked_string_len(parse_varint(buf, pos)?, "JSON string length")?;
-                advance(buf, pos, l)?;
-            }
-        },
-
-        // FixedString: rows * n
-        FixedString(n) => advance(buf, pos, checked_len(rows, *n)?)?,
-
-        Nothing => advance(buf, pos, rows)?,
-
-        // Nullable: null mask (1 byte per row) + inner column
-        Nullable(inner) => {
-            advance(buf, pos, rows)?; // null mask
-            skip_column_data(buf, pos, inner, rows)?;
-        },
-
-        // Array: offset array (rows * 8 bytes) + inner column
-        Array(inner) => {
-            let off_len = checked_len(rows, 8)?;
-            let off_end = (*pos).checked_add(off_len).ok_or_else(|| {
-                crate::sync::error::Error::Protocol("array offset overflow".into())
-            })?;
-            if off_end > buf.len() {
-                return Err(crate::sync::error::Error::Protocol(
-                    "unexpected end of buffer parsing array offsets".into(),
-                ));
-            }
-            let mut last_off = 0usize;
-            for chunk in buf[*pos..off_end].chunks_exact(8) {
-                let mut offset_bytes = [0u8; 8];
-                offset_bytes.copy_from_slice(chunk);
-                // Offsets are cumulative prefix sums: non-decreasing, and the
-                // last offset is the inner element row count, capped before
-                // the inner column is skipped.
-                last_off = checked_monotonic_offset(
-                    last_off,
-                    u64::from_le_bytes(offset_bytes),
-                    "array offset",
-                )?;
-            }
-            *pos = off_end;
-            // For arrays of depth > 1, the offsets are nested
-            let elem_rows = if last_off > 0 {
-                last_off
-            } else {
-                rows.saturating_sub(1)
-            };
-            skip_column_data(buf, pos, inner, elem_rows)?;
-        },
-
-        // Map: keys array + values array
-        Map(k, v) => {
-            skip_column_data(buf, pos, k, rows)?;
-            skip_column_data(buf, pos, v, rows)?;
-        },
-
-        // Tuple: each element
-        Tuple(elems) => {
-            for elem in elems {
-                skip_column_data(buf, pos, elem, rows)?;
-            }
-        },
-        Point => {
-            skip_column_data(buf, pos, &Float64, rows)?;
-            skip_column_data(buf, pos, &Float64, rows)?;
-        },
-        Ring => skip_column_data(buf, pos, &Array(Box::new(Point)), rows)?,
-        Polygon => skip_column_data(buf, pos, &Array(Box::new(Ring)), rows)?,
-        MultiPolygon => skip_column_data(buf, pos, &Array(Box::new(Polygon)), rows)?,
-
-        // LowCardinality: version + index serialization type + dictionary + indexes.
-        LowCardinality(inner) => {
-            let meta = parse_bytes(buf, pos, 24)?;
-            let version = u64::from_le_bytes(meta[0..8].try_into().map_err(|_| {
-                crate::sync::error::Error::Protocol("LowCardinality version length mismatch".into())
-            })?);
-            let serial_type = u64::from_le_bytes(meta[8..16].try_into().map_err(|_| {
-                crate::sync::error::Error::Protocol(
-                    "LowCardinality metadata length mismatch".into(),
-                )
-            })?);
-            let idx_width = lc_idx_width(version, serial_type)?;
-            let num_keys = checked_count(
-                u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
-                    crate::sync::error::Error::Protocol(
-                        "LowCardinality key count length mismatch".into(),
-                    )
-                })?),
-                "LowCardinality key",
-                crate::limits::MAX_JSON_DYNAMIC_ITEMS,
-            )?;
-            skip_column_data(buf, pos, inner, num_keys)?;
-            let count_bytes = parse_bytes(buf, pos, 8)?;
-            let indexes = checked_usize(
-                u64::from_le_bytes(count_bytes.try_into().map_err(|_| {
-                    crate::sync::error::Error::Protocol(
-                        "LowCardinality index count length mismatch".into(),
-                    )
-                })?),
-                "LowCardinality indexes",
-            )?;
-            advance(buf, pos, checked_len(indexes, idx_width)?)?;
-        },
-
-        // Variant: mode (8 bytes) + discriminators + sub-columns
-        Variant(_types) => {
-            advance(buf, pos, 8)?; // mode
-            // Read discriminators
-            let mut mode_bytes = [0u8; 8];
-            mode_bytes.copy_from_slice(&buf[*pos - 8..*pos]);
-            let mode = u64::from_le_bytes(mode_bytes);
-            match mode {
-                0 => {
-                    // BASIC: 1 byte per row
-                    advance(buf, pos, rows)?;
-                },
-                1 => {
-                    // COMPACT: start_offset(8) + num_rows(8)
-                    advance(buf, pos, 16)?;
-                },
-                _ => {},
-            }
-            // Skip remaining bytes (sub-columns)
-            // Complex: each discriminator maps to a type
-            // Simple: skip rest as unknown-size blob
-        },
-
-        // Dynamic, AggregateFunction: opaque blobs (skip rest)
-        Dynamic | AggregateFunction | SimpleAggregateFunction => {
-            // These have complex internal structure — skip to end
-            // For simplicity, we just leave pos at current (caller handles)
-            // Actually these consume remaining bytes
-        },
-
-        // Geo types
-        _ => {
-            // Unknown types — skip remaining bytes
-        },
-    }
-    Ok(())
+    crate::sync::protocol::skip_column::skip_column_data(buf, pos, ct, rows)
 }
 
 fn advance(buf: &[u8], pos: &mut usize, len: usize) -> Result<()> {
@@ -1981,6 +1812,235 @@ mod tests {
         wire::write_varint(buf, 0).expect("test operation failed"); // BlockInfo terminator
         wire::write_varint(buf, 0).expect("test operation failed"); // columns
         wire::write_varint(buf, 0).expect("test operation failed"); // rows
+    }
+
+    // ═══════════════════════════════════════════════
+    // Buffered block framing (skip_column_data via parse_block_body)
+    // ═══════════════════════════════════════════════
+
+    /// Build a block body: BlockInfo terminator, column and row counts, then
+    /// per column name/type/custom-serialization-byte/data.
+    fn block_buf(rows: u64, cols: &[(&str, &str, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, 0).expect("test write"); // BlockInfo end
+        wire::write_varint(&mut buf, cols.len() as u64).expect("test write");
+        wire::write_varint(&mut buf, rows).expect("test write");
+        for (name, type_name, data) in cols {
+            wire::write_string(&mut buf, name).expect("test write");
+            wire::write_string(&mut buf, type_name).expect("test write");
+            buf.push(0); // custom serialization
+            buf.extend_from_slice(data);
+        }
+        buf
+    }
+
+    /// Array/Map offsets: little-endian u64 per outer row.
+    fn offsets(values: &[u64]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for v in values {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    /// One varint-length-prefixed string value.
+    fn string_value(s: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_string(&mut buf, s).expect("test write");
+        buf
+    }
+
+    /// The inner column of an Array column carries exactly the last-offset
+    /// rows. When every array is empty the last offset is 0, so the inner
+    /// column carries zero rows and zero bytes — using `rows - 1` here would
+    /// misframe every later column of the block.
+    #[test]
+    fn buffered_array_all_empty_offsets_zero_skips_no_inner() {
+        let buf = block_buf(
+            2,
+            &[
+                ("a", "Array(UInt8)", offsets(&[0, 0])),
+                ("x", "UInt64", offsets(&[7, 8])),
+            ],
+        );
+        let mut pos = 0;
+        let block = parse_block_body(&buf, &mut pos).expect("parse block body");
+        assert_eq!(pos, buf.len());
+
+        let col = block.column::<Vec<u8>>("a").expect("read array column");
+        assert_eq!(col.get(0).expect("row 0"), Vec::<u8>::new());
+        assert_eq!(col.get(1).expect("row 1"), Vec::<u8>::new());
+        let trailing = block.column::<u64>("x").expect("read trailing column");
+        assert_eq!(trailing.get(0).expect("row 0"), 7);
+        assert_eq!(trailing.get(1).expect("row 1"), 8);
+    }
+
+    /// Normal arrays with embedded empty rows: offsets advance without inner
+    /// bytes for the empty row and the trailing column still parses.
+    #[test]
+    fn buffered_array_uint8_mixed_empty_rows_frame_trailing_column() {
+        let data = offsets(&[2, 2, 3]); // row0 [1,2], row1 [], row2 [9]
+        let buf = block_buf(
+            3,
+            &[
+                ("a", "Array(UInt8)", [data, vec![1, 2, 9]].concat()),
+                ("x", "UInt8", vec![7, 8, 9]),
+            ],
+        );
+        let mut pos = 0;
+        let block = parse_block_body(&buf, &mut pos).expect("parse block body");
+        assert_eq!(pos, buf.len());
+
+        let col = block.column::<Vec<u8>>("a").expect("read array column");
+        assert_eq!(col.get(0).expect("row 0"), vec![1, 2]);
+        assert_eq!(col.get(1).expect("row 1"), Vec::<u8>::new());
+        assert_eq!(col.get(2).expect("row 2"), vec![9]);
+        let trailing = block.column::<u8>("x").expect("read trailing column");
+        assert_eq!(trailing.get(2).expect("row 2"), 9);
+    }
+
+    /// Map is Array(Tuple(K, V)): offsets first, then the key and value
+    /// columns with the last-offset row count each.
+    #[test]
+    fn buffered_map_offsets_then_keys_and_values() {
+        let body = [
+            offsets(&[1]),     // one map entry
+            string_value("k"), // key column: 1 row
+            vec![7u8],         // value column: 1 row
+        ]
+        .concat();
+        let buf = block_buf(
+            1,
+            &[
+                ("m", "Map(String, UInt8)", body),
+                ("s", "String", string_value("tail")),
+            ],
+        );
+        let mut pos = 0;
+        let block = parse_block_body(&buf, &mut pos).expect("parse block body");
+        assert_eq!(pos, buf.len());
+
+        let map = block
+            .column::<Vec<(String, u8)>>("m")
+            .expect("read map column");
+        assert_eq!(map.get(0).expect("row 0"), vec![("k".to_string(), 7u8)]);
+        assert_eq!(
+            block
+                .column::<String>("s")
+                .expect("trailing column")
+                .get(0)
+                .expect("row 0"),
+            "tail"
+        );
+    }
+
+    /// The buffered JSON column data excludes the 8-byte string-serialization
+    /// version, matching the streaming materialized reader.
+    #[test]
+    fn buffered_json_version_prefix_consumed_and_stripped() {
+        let body = [
+            1u64.to_le_bytes().to_vec(), // string serialization version 1
+            string_value(r#"{"x":1}"#),
+            string_value(r#"{"y":2}"#),
+        ]
+        .concat();
+        let buf = block_buf(2, &[("j", "JSON", body), ("x", "UInt8", vec![5, 6])]);
+        let mut pos = 0;
+        let block = parse_block_body(&buf, &mut pos).expect("parse block body");
+        assert_eq!(pos, buf.len());
+
+        let expected_data = [string_value(r#"{"x":1}"#), string_value(r#"{"y":2}"#)].concat();
+        let json_info = block
+            .columns
+            .iter()
+            .find(|c| c.name == "j")
+            .expect("json col");
+        assert_eq!(&json_info.data[..], &expected_data[..]);
+        let trailing = block.column::<u8>("x").expect("read trailing column");
+        assert_eq!(trailing.get(1).expect("row 1"), 6);
+    }
+
+    /// Nested JSON keeps its string-serialization version inside the sliced
+    /// data, which decoders misread: the buffered parser must reject it
+    /// loudly (top-level JSON above stays allowed and version-stripped).
+    #[test]
+    fn buffered_nested_json_is_rejected_before_slicing() {
+        let body = [
+            offsets(&[1]),               // one element per outer row
+            1u64.to_le_bytes().to_vec(), // inner JSON version (must NOT be sliced)
+            string_value(r#"{"a":1}"#),
+        ]
+        .concat();
+        let buf = block_buf(1, &[("j", "Array(JSON)", body), ("x", "UInt8", vec![7])]);
+        let mut pos = 0;
+        let err = parse_block_body(&buf, &mut pos)
+            .err()
+            .expect("nested JSON must be rejected (Block lacks Debug; expect_err needs it)");
+        assert!(
+            err.to_string().contains("nested JSON"),
+            "expected nested JSON rejection, got: {err}"
+        );
+    }
+
+    /// Zero-row blocks (the header block of every SELECT) carry no column
+    /// bytes at all — including LowCardinality headers.
+    #[test]
+    fn buffered_zero_row_block_with_lowcardinality_column_parses() {
+        let buf = block_buf(0, &[("lc", "LowCardinality(String)", Vec::new())]);
+        let mut pos = 0;
+        let block = parse_block_body(&buf, &mut pos).expect("parse block body");
+        assert_eq!(pos, buf.len());
+        assert_eq!(block.row_count(), 0);
+        assert!(block.columns[0].data.is_empty());
+    }
+
+    /// Variant mode 0: per-row discriminators plus non-empty subcolumns in
+    /// type order; the trailing column must parse.
+    #[test]
+    fn buffered_variant_subcolumns_frame_trailing_column() {
+        let body = [
+            0u64.to_le_bytes().to_vec(), // BASIC mode
+            vec![0, 1],                  // row 0 -> UInt8, row 1 -> String
+            vec![5u8],                   // UInt8 subcolumn: 1 value
+            string_value("x"),           // String subcolumn: 1 value
+        ]
+        .concat();
+        let buf = block_buf(
+            2,
+            &[
+                ("v", "Variant(UInt8, String)", body),
+                ("t", "UInt8", vec![3, 4]),
+            ],
+        );
+        let mut pos = 0;
+        let block = parse_block_body(&buf, &mut pos).expect("parse block body");
+        assert_eq!(pos, buf.len());
+        let trailing = block.column::<u8>("t").expect("read trailing column");
+        assert_eq!(trailing.get(0).expect("row 0"), 3);
+        assert_eq!(trailing.get(1).expect("row 1"), 4);
+    }
+
+    /// Dynamic flattened (version 2): state prefix with subcolumn type names,
+    /// fixed-width discriminators (type count marks NULL), counted
+    /// subcolumns; the trailing column must parse.
+    #[test]
+    fn buffered_dynamic_flattened_frames_trailing_column() {
+        let mut state = Vec::new();
+        state.extend_from_slice(&2u64.to_le_bytes()); // subcolumn serialization version
+        wire::write_varint(&mut state, 1).expect("test write"); // one subcolumn type
+        wire::write_string(&mut state, "UInt8").expect("test write");
+        let body = [
+            state,
+            vec![0, 1], // row 0 -> UInt8, row 1 -> NULL (idx == type count)
+            vec![9u8],  // UInt8 subcolumn: 1 value
+        ]
+        .concat();
+        let buf = block_buf(2, &[("d", "Dynamic", body), ("t", "UInt8", vec![6, 7])]);
+        let mut pos = 0;
+        let block = parse_block_body(&buf, &mut pos).expect("parse block body");
+        assert_eq!(pos, buf.len());
+        let trailing = block.column::<u8>("t").expect("read trailing column");
+        assert_eq!(trailing.get(1).expect("row 1"), 7);
     }
 
     #[test]
