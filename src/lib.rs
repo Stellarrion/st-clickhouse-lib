@@ -8,6 +8,7 @@ pub mod connection;
 #[cfg(feature = "tokio")]
 pub mod cursor;
 pub mod error;
+pub(crate) mod limits;
 #[cfg(feature = "tokio")]
 pub mod metrics;
 #[cfg(feature = "tokio")]

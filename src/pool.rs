@@ -120,6 +120,17 @@ impl AsyncRead for StreamWrapper {
             if len == 0 {
                 continue;
             }
+            // The chunk length is server-controlled; validate it before the
+            // resize so a 4-byte header cannot drive a multi-GiB allocation.
+            if len > crate::limits::MAX_CHUNK_LEN {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "chunked transport chunk length {len} exceeds maximum {}",
+                        crate::limits::MAX_CHUNK_LEN
+                    ),
+                )));
+            }
 
             this.chunk.resize(len, 0);
             while this.chunk_fill < this.chunk.len() {
@@ -1438,6 +1449,79 @@ mod tests {
             pool.dead_addrs.lock().is_empty(),
             "config errors must not mark addresses dead"
         );
+    }
+
+    /// Server-free proof that a hostile `u32::MAX` chunk header is rejected by
+    /// the inbound chunk cap before any buffer is sized: the read must fail
+    /// with `InvalidData` naming the chunk length, never attempt a 4 GiB
+    /// resize (the old behaviour).
+    #[tokio::test]
+    async fn test_chunked_recv_rejects_oversized_chunk_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept client");
+            use tokio::io::AsyncWriteExt as _;
+            sock.write_all(&u32::MAX.to_le_bytes())
+                .await
+                .expect("send hostile chunk header");
+            // Keep the socket open so the client sees data, not EOF.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to test listener");
+        let mut wrapper = StreamWrapper::tcp(stream);
+        wrapper.set_chunked(false, true);
+
+        let mut buf = [0u8; 16];
+        let err = wrapper
+            .read(&mut buf)
+            .await
+            .expect_err("oversized chunk header must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("chunk length"),
+            "expected chunk length error, got: {err}"
+        );
+        server.abort();
+    }
+
+    /// The chunk cap keeps the happy path intact: a small well-formed chunk
+    /// still decodes through the chunked receive mode.
+    #[tokio::test]
+    async fn test_chunked_recv_still_reads_small_chunk() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept client");
+            use tokio::io::AsyncWriteExt as _;
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&3u32.to_le_bytes());
+            wire.extend_from_slice(b"abc");
+            wire.extend_from_slice(&0u32.to_le_bytes());
+            sock.write_all(&wire).await.expect("send chunk");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to test listener");
+        let mut wrapper = StreamWrapper::tcp(stream);
+        wrapper.set_chunked(false, true);
+
+        let mut buf = [0u8; 8];
+        let n = wrapper
+            .read(&mut buf)
+            .await
+            .expect("small chunk must decode");
+        assert_eq!(&buf[..n], b"abc");
+        server.abort();
     }
 
     /// Server-free proof that `get()` honours `acquire_timeout`: hold the only

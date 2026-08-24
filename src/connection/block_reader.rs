@@ -418,7 +418,6 @@ async fn read_compressed_payload_or_plain_prefix<
     const METHOD_OFFSET: usize = 16;
     const HEADER_LEN: usize = 25;
     const COMPRESSED_BODY_HEADER_LEN: usize = 9;
-    const MAX_COMPRESSED_BLOCK_SIZE: usize = 1 << 30;
 
     let mut prefix = [0u8; METHOD_OFFSET + 1];
     stream.read_exact(&mut prefix[..1]).await?;
@@ -445,8 +444,18 @@ async fn read_compressed_payload_or_plain_prefix<
     frame.extend_from_slice(&rest);
 
     let compressed_size = u32::from_le_bytes([frame[17], frame[18], frame[19], frame[20]]) as usize;
-    if !(COMPRESSED_BODY_HEADER_LEN..=MAX_COMPRESSED_BLOCK_SIZE).contains(&compressed_size) {
+    // The method byte matched, so this is a compressed frame. Sizes below the
+    // 9-byte header remain ambiguous with plain payloads and keep the plain
+    // fallback, but an oversized claim is rejected outright: it must never
+    // reach the resize below, which previously allowed up to 1 GiB.
+    if compressed_size < COMPRESSED_BODY_HEADER_LEN {
         return Ok(BlockPayload::PlainPrefix(frame));
+    }
+    if compressed_size > crate::limits::MAX_FRAME_SIZE {
+        return Err(crate::error::Error::Compression(format!(
+            "compressed_size {compressed_size} exceeds {} byte frame cap",
+            crate::limits::MAX_FRAME_SIZE
+        )));
     }
 
     let body_len = compressed_size - COMPRESSED_BODY_HEADER_LEN;
@@ -954,6 +963,85 @@ fn parse_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::io::AsyncWriteExt as _;
+
+    /// An LZ4 frame header (method byte matched) whose compressed_size is
+    /// u32::MAX must be rejected by the frame cap BEFORE the body buffer is
+    /// resized or read — the previous 1 GiB bound allowed a 4 GiB claim.
+    #[tokio::test]
+    async fn oversized_compressed_frame_rejected_before_body_read() {
+        let (mut server, mut client) = crate::runtime::io::duplex(64);
+        // 16 zero checksum bytes + method LZ4 + compressed_size u32::MAX +
+        // uncompressed_size 0. No body follows.
+        let mut wire = vec![0u8; 16];
+        wire.push(0x82);
+        wire.extend_from_slice(&u32::MAX.to_le_bytes());
+        wire.extend_from_slice(&0u32.to_le_bytes());
+        server
+            .write_all(&wire)
+            .await
+            .expect("send hostile frame header");
+
+        match read_compressed_payload_or_plain_prefix(&mut client).await {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("exceeds") && msg.contains("frame cap"),
+                    "expected frame cap error, got: {msg}"
+                );
+            },
+            Ok(BlockPayload::PlainPrefix(p)) => {
+                unreachable!(
+                    "oversized frame must not fall back to plain, got {} bytes",
+                    p.len()
+                )
+            },
+            Ok(BlockPayload::Compressed(_)) => {
+                unreachable!("oversized frame must be rejected before body read/allocation")
+            },
+        }
+    }
+
+    /// A well-formed frame below the cap still decompresses through the
+    /// block reader after the cap was added.
+    #[tokio::test]
+    async fn valid_compressed_frame_still_decodes() {
+        let payload = b"block-body-bytes".to_vec();
+        let frame =
+            crate::compression::encode_frame(&payload, crate::compression::CompressionMethod::None)
+                .expect("encode test frame");
+        let (mut server, mut client) = crate::runtime::io::duplex(64);
+        server.write_all(&frame).await.expect("send valid frame");
+
+        match read_compressed_payload_or_plain_prefix(&mut client).await {
+            Ok(BlockPayload::Compressed(bytes)) => assert_eq!(&bytes[..], &payload[..]),
+            Ok(BlockPayload::PlainPrefix(p)) => {
+                unreachable!(
+                    "expected compressed payload, got plain prefix of {} bytes",
+                    p.len()
+                )
+            },
+            Err(e) => unreachable!("expected compressed payload, got error: {e}"),
+        }
+    }
+
+    /// The plain-payload fallback survives the cap change: a body whose
+    /// 17th byte is not a compression method byte is still returned as a
+    /// plain prefix instead of being treated as a compressed frame.
+    #[tokio::test]
+    async fn non_compressed_prefix_still_falls_back_to_plain() {
+        let wire = vec![0x01u8; 17];
+        let (mut server, mut client) = crate::runtime::io::duplex(64);
+        server.write_all(&wire).await.expect("send plain prefix");
+
+        match read_compressed_payload_or_plain_prefix(&mut client).await {
+            Ok(BlockPayload::PlainPrefix(prefix)) => assert_eq!(prefix.len(), 17),
+            Ok(BlockPayload::Compressed(_)) => {
+                unreachable!("plain prefix must not be decoded as a compressed frame")
+            },
+            Err(e) => unreachable!("expected plain prefix, got error: {e}"),
+        }
+    }
 
     #[test]
     fn skip_col_typed_date32_advances_four_bytes_per_row() {

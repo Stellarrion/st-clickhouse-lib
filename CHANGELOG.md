@@ -4,6 +4,41 @@ All notable changes to st-clickhouse are documented here.
 
 ## [Unreleased]
 
+### Security
+- **Bounded transport chunk and compression-frame allocations (P0)**: all
+  server-controlled chunk and compression-frame lengths are now validated against shared internal caps
+  (`64 MiB`) before any buffer is sized, in both the async (Tokio) and sync
+  engines. Previously a single 4-byte chunk header or a 25-byte compression
+  frame header could drive up to a 4 GiB (chunked transport, sync decoder) or
+  1 GiB (async decoder, block reader) allocation — a denial-of-service vector
+  against clients connected to a hostile or compromised server.
+  - Chunked native transport (async `StreamWrapper` and sync `ChunkedReader`):
+    a chunk length above the cap fails fast with `InvalidData` before the
+    chunk buffer is resized.
+  - Compression frames (async and sync `decode_frame`): `compressed_size` is
+    checked against the 9-byte mandatory header and the cap, and
+    `uncompressed_size` against the cap, before any allocation; a frame whose
+    checksum is valid but whose declared sizes exceed the cap is still
+    rejected. The checksum is now computed in place over a single
+    checksum+header+body buffer instead of duplicating the body, and zstd
+    output is bounded during decompression to the declared (capped) size — a
+    frame that expands beyond its declaration fails at decompression instead
+    of decoding first and validating only afterwards (LZ4 was already bounded
+    by its capacity hint).
+  - Async block reader: after the compression method byte matches, an
+    oversized `compressed_size` is rejected before the frame body buffer is
+    resized or read (previously up to 1 GiB); sub-header sizes keep the
+    existing plain-payload fallback.
+  - Encode paths now use checked `u32` conversions for the wire size fields:
+    a payload that cannot be represented is refused with a clear error
+    instead of silently truncating `usize -> u32` into a corrupt frame.
+    Trusted outbound writes stay allowed up to the 4 GiB wire limit.
+  - Deterministic server-free regressions added for all of the above
+    (`u32::MAX` chunk headers on both transports, `u32::MAX`
+    compressed/uncompressed declarations, valid-checksum over-cap frames,
+    block-reader oversized frames, zstd expansion beyond the declared size);
+    None/LZ4/Zstd roundtrips are retained.
+
 ### Added
 - **Real connect timeouts (sync)**: `SyncClient::connect_with_config` /
   `connect` / `connect_with_timeout` now resolve every address and enforce
