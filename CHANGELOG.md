@@ -5,9 +5,38 @@ All notable changes to st-clickhouse are documented here.
 ## [Unreleased]
 
 ### Security
+- **Capped server-controlled item counts (P0)**: server-controlled list and
+  block dimensions are now validated against generous internal caps in
+  `src/limits.rs` before they size any `Vec::with_capacity`/`reserve`
+  allocation or bound any read loop, in both the async (Tokio) and sync
+  engines. Counts only — per-string byte lengths, Array/Map offset totals,
+  cumulative response size, timeouts, and cancellation are unchanged and
+  remain to be addressed. A hostile or compromised server previously could
+  panic the client with a capacity overflow (or drive an oversized
+  allocation) from a small varint count; it now gets a deterministic
+  `Error::Protocol` naming the field, the received count, and the limit.
+  - Password complexity rule count in the server Hello (async and sync):
+    capped at 65,536 rules (previously `u64::MAX` → capacity-overflow panic).
+  - Ignored PartUUID count (async read path and sync response skip): capped
+    at 1,048,576 UUIDs.
+  - JSON path count and Dynamic subcolumn type-name count in column state
+    prefixes (async raw reader, sync raw/materialized readers): capped at
+    65,536 items each.
+  - LowCardinality dictionary key count (async and sync readers, all
+    raw/materialized/discard variants): capped at 65,536 keys.
+  - Native block columns (≤ 65,536) and rows (≤ 10,000,000) per block across
+    every parser variant — async streamed (plain and compressed), async
+    decompressed-buffer, async raw capture, and the sync buffer, streamed,
+    view, and discard readers. The row cap bounds a single block only; total
+    rows across a streamed multi-block response are intentionally not
+    limited.
+  - Deterministic server-free regressions added for all of the above with
+    `u64::MAX` and cap+1 counts (asserting `Protocol` errors, never panics),
+    plus boundary (exact-cap) and within-cap happy paths.
 - **Bounded transport chunk and compression-frame allocations (P0)**: all
-  server-controlled chunk and compression-frame lengths are now validated against shared internal caps
-  (`64 MiB`) before any buffer is sized, in both the async (Tokio) and sync
+  server-controlled chunk and compression-frame lengths are now validated
+  against shared internal caps (`64 MiB`) before any buffer is sized, in both
+  the async (Tokio) and sync
   engines. Previously a single 4-byte chunk header or a 25-byte compression
   frame header could drive up to a 4 GiB (chunked transport, sync decoder) or
   1 GiB (async decoder, block reader) allocation — a denial-of-service vector

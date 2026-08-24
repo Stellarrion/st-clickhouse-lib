@@ -1,5 +1,5 @@
 use crate::connection::io::{
-    checked_len, checked_usize, encode_varint, lc_idx_width, read_block_header,
+    checked_count, checked_len, checked_usize, encode_varint, lc_idx_width, read_block_header,
     read_offsets_column, read_string_async, read_string_column_with_prefixes, read_varint_async,
 };
 use crate::connection::raw_block_reader::{
@@ -13,34 +13,6 @@ use crate::runtime::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-
-#[allow(dead_code)]
-fn skip_block_body(data: &[u8], pos: &mut usize) -> Result<()> {
-    loop {
-        let d = parse_varint(data, pos)?;
-        match d {
-            0 => break,
-            1 => advance_pos(data, pos, 1)?,
-            2 => advance_pos(data, pos, 4)?,
-            3 => {
-                parse_varint(data, pos)?;
-            },
-            _ => break,
-        }
-    }
-    let _cols = parse_varint(data, pos)?;
-    let rows = parse_varint(data, pos)? as usize;
-    for _ in 0.._cols {
-        let _name = parse_bytes(data, pos)?;
-        let tn_bytes = parse_bytes(data, pos)?;
-        let tn = std::str::from_utf8(tn_bytes).unwrap_or("");
-        advance_pos(data, pos, 1)?;
-        if rows > 0 {
-            skip_col_typed(data, pos, tn, rows)?;
-        }
-    }
-    Ok(())
-}
 
 fn skip_col_typed(data: &[u8], pos: &mut usize, tn: &str, rows: usize) -> Result<()> {
     if rows == 0 {
@@ -244,8 +216,16 @@ async fn read_data_block_body<
             _ => break,
         }
     }
-    let cols = checked_usize(read_varint_async(stream).await?, "columns")?;
-    let rows = checked_usize(read_varint_async(stream).await?, "rows")?;
+    let cols = checked_count(
+        read_varint_async(stream).await?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let rows = checked_count(
+        read_varint_async(stream).await?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     let mut columns = Vec::with_capacity(cols);
     for _ in 0..cols {
         let name = read_string_async(stream).await?;
@@ -332,8 +312,16 @@ async fn discard_data_block_body<
             _ => break,
         }
     }
-    let cols = checked_usize(read_varint_async(stream).await?, "columns")?;
-    let rows = checked_usize(read_varint_async(stream).await?, "rows")?;
+    let cols = checked_count(
+        read_varint_async(stream).await?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let rows = checked_count(
+        read_varint_async(stream).await?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     for _ in 0..cols {
         let name = read_string_async(stream).await?;
         let type_name = read_string_async(stream).await?;
@@ -520,8 +508,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<'_, S> {
 fn parse_decompressed_block(shared: bytes::Bytes) -> Result<Block> {
     let mut pos = 0usize;
     parse_block_info(&shared, &mut pos)?;
-    let cols = checked_usize(parse_varint(&shared, &mut pos)?, "columns")?;
-    let rows = checked_usize(parse_varint(&shared, &mut pos)?, "rows")?;
+    let cols = checked_count(
+        parse_varint(&shared, &mut pos)?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let rows = checked_count(
+        parse_varint(&shared, &mut pos)?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     let mut columns = Vec::with_capacity(cols);
     for _ in 0..cols {
         let name = parse_string(&shared, &mut pos)?.to_owned();
@@ -553,8 +549,16 @@ fn parse_decompressed_block(shared: bytes::Bytes) -> Result<Block> {
 fn discard_decompressed_block(shared: &[u8]) -> Result<usize> {
     let mut pos = 0usize;
     parse_block_info(shared, &mut pos)?;
-    let cols = checked_usize(parse_varint(shared, &mut pos)?, "columns")?;
-    let rows = checked_usize(parse_varint(shared, &mut pos)?, "rows")?;
+    let cols = checked_count(
+        parse_varint(shared, &mut pos)?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let rows = checked_count(
+        parse_varint(shared, &mut pos)?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     for _ in 0..cols {
         let name = parse_string(shared, &mut pos)?;
         let type_name = parse_string(shared, &mut pos)?;
@@ -830,11 +834,12 @@ async fn discard_lc_async<
         crate::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
     let idx_width = lc_idx_width(version, serial_type)?;
-    let num_keys = checked_usize(
+    let num_keys = checked_count(
         u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
             crate::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
-        "LowCardinality keys",
+        "LowCardinality key",
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     Box::pin(discard_column_async(stream, &inner.to_string(), num_keys)).await?;
     let mut count = [0u8; 8];
@@ -891,7 +896,11 @@ async fn read_lc_async<
     })?);
     let mut num_keys_bytes = [0u8; 8];
     num_keys_bytes.copy_from_slice(&meta[16..24]);
-    let num_keys = checked_usize(u64::from_le_bytes(num_keys_bytes), "LowCardinality keys")?;
+    let num_keys = checked_count(
+        u64::from_le_bytes(num_keys_bytes),
+        "LowCardinality key",
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
+    )?;
     let mut serial_type_bytes = [0u8; 8];
     serial_type_bytes.copy_from_slice(&meta[8..16]);
     let serial_type = u64::from_le_bytes(serial_type_bytes);
@@ -1057,6 +1066,145 @@ mod tests {
         assert_eq!(pos, 12, "Date32 must advance 4 bytes per row");
         skip_col_typed(&data, &mut pos, "UInt8", 1).expect("skip trailing UInt8 column");
         assert_eq!(pos, 13);
+    }
+
+    // ── Server-controlled count cap tests ────────────────────────────────
+
+    fn block_body_bytes(cols: u64, rows: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(0x00); // BlockInfo: field 0 terminates the info loop
+        crate::protocol::wire::write_varint(&mut data, cols).expect("test write");
+        crate::protocol::wire::write_varint(&mut data, rows).expect("test write");
+        data
+    }
+
+    #[test]
+    fn decompressed_block_column_count_u64_max_is_protocol_error() {
+        let err = parse_decompressed_block(bytes::Bytes::from(block_body_bytes(u64::MAX, 0)))
+            .err()
+            .expect("u64::MAX column count must be rejected");
+        match &err {
+            crate::error::Error::Protocol(msg) => assert_eq!(
+                msg,
+                "block column count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompressed_block_row_count_u64_max_is_protocol_error() {
+        let err = parse_decompressed_block(bytes::Bytes::from(block_body_bytes(0, u64::MAX)))
+            .err()
+            .expect("u64::MAX row count must be rejected");
+        assert!(
+            matches!(err, crate::error::Error::Protocol(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decompressed_block_row_count_cap_plus_one_is_protocol_error() {
+        let err = parse_decompressed_block(bytes::Bytes::from(block_body_bytes(0, 10_000_001)))
+            .err()
+            .expect("cap + 1 row count must be rejected");
+        match &err {
+            crate::error::Error::Protocol(msg) => {
+                assert_eq!(msg, "block row count 10000001 exceeds limit 10000000")
+            },
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discard_decompressed_block_rejects_oversized_dimensions() {
+        for (cols, rows, expected) in [
+            (u64::MAX, 0, "block column count"),
+            (0, u64::MAX, "block row count"),
+        ] {
+            let err = discard_decompressed_block(&block_body_bytes(cols, rows))
+                .expect_err("discard path must reject an oversized dimension");
+            assert!(
+                matches!(&err, crate::error::Error::Protocol(msg) if msg.contains(expected)),
+                "expected {expected} Protocol error, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_low_cardinality_rejects_oversized_key_count() {
+        let (mut tx, mut rx) = crate::runtime::io::duplex(64);
+        let mut meta = Vec::with_capacity(24);
+        meta.extend_from_slice(&1u64.to_le_bytes()); // serialization version
+        meta.extend_from_slice(&(1u64 << 9).to_le_bytes()); // additional keys, UInt8 indexes
+        meta.extend_from_slice(&u64::MAX.to_le_bytes());
+        tx.write_all(&meta)
+            .await
+            .expect("seed LowCardinality header");
+
+        let err = discard_lc_async(
+            &mut rx,
+            &crate::protocol::type_parser::ColumnType::String,
+            1,
+        )
+        .await
+        .expect_err("discard path must cap dictionary keys");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg == "LowCardinality key count 18446744073709551615 exceeds limit 65536"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn decompressed_block_row_cap_boundary_parses() {
+        // Exactly MAX_BLOCK_ROWS with zero columns allocates nothing and
+        // must still parse: the cap bounds a single block, not totals.
+        let block = parse_decompressed_block(bytes::Bytes::from(block_body_bytes(
+            0,
+            crate::limits::MAX_BLOCK_ROWS as u64,
+        )))
+        .expect("row count at the cap parses");
+        assert_eq!(block.rows, crate::limits::MAX_BLOCK_ROWS);
+        assert!(block.columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_block_column_count_u64_max_is_protocol_error() {
+        // read_data_block: plain (uncompressed) streaming path.
+        let mut wire_bytes = Vec::new();
+        crate::protocol::wire::write_varint(&mut wire_bytes, 0).expect("test write"); // table
+        wire_bytes.extend_from_slice(&block_body_bytes(u64::MAX, 0));
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire_bytes).await.expect("seed block");
+
+        let err = read_data_block(&mut rx)
+            .await
+            .err()
+            .expect("u64::MAX column count must be rejected");
+        assert!(
+            matches!(err, crate::error::Error::Protocol(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_block_body_row_count_cap_plus_one_is_protocol_error() {
+        // read_data_block_body: the plain-prefix body path shared by the
+        // compressed reader when the payload is not a compression frame.
+        let wire_bytes = block_body_bytes(0, 10_000_001);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire_bytes).await.expect("seed block body");
+
+        let err = read_data_block_body(&mut rx)
+            .await
+            .err()
+            .expect("cap + 1 row count must be rejected");
+        match &err {
+            crate::error::Error::Protocol(msg) => {
+                assert_eq!(msg, "block row count 10000001 exceeds limit 10000000")
+            },
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
     }
 
     #[test]

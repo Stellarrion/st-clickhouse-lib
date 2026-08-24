@@ -1,4 +1,4 @@
-use crate::connection::io::{checked_len, checked_usize, lc_idx_width};
+use crate::connection::io::{checked_count, checked_len, checked_usize, lc_idx_width};
 use crate::error::Result;
 use crate::protocol::block::RawBlock;
 use crate::protocol::type_parser;
@@ -29,8 +29,16 @@ pub(super) async fn read_raw_data_block<
         }
     }
 
-    let columns = checked_usize(read_varint_recorded(stream, &mut raw).await?, "columns")?;
-    let rows = checked_usize(read_varint_recorded(stream, &mut raw).await?, "rows")?;
+    let columns = checked_count(
+        read_varint_recorded(stream, &mut raw).await?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let rows = checked_count(
+        read_varint_recorded(stream, &mut raw).await?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
 
     for _ in 0..columns {
         let _name = read_string_recorded(stream, &mut raw, "column name length").await?;
@@ -423,8 +431,11 @@ async fn read_json_state_prefix_recorded<
     match version {
         1 | 4 => {},
         3 => {
-            let paths_count =
-                checked_usize(read_varint_recorded(stream, out).await?, "JSON paths")?;
+            let paths_count = checked_count(
+                read_varint_recorded(stream, out).await?,
+                "JSON path",
+                crate::limits::MAX_JSON_DYNAMIC_ITEMS,
+            )?;
             for _ in 0..paths_count {
                 let _path = read_string_recorded(stream, out, "JSON path length").await?;
             }
@@ -435,8 +446,11 @@ async fn read_json_state_prefix_recorded<
         },
         0 => {
             let _max_dynamic_paths = read_varint_recorded(stream, out).await?;
-            let paths_count =
-                checked_usize(read_varint_recorded(stream, out).await?, "JSON paths")?;
+            let paths_count = checked_count(
+                read_varint_recorded(stream, out).await?,
+                "JSON path",
+                crate::limits::MAX_JSON_DYNAMIC_ITEMS,
+            )?;
             for _ in 0..paths_count {
                 let _path = read_string_recorded(stream, out, "JSON path length").await?;
             }
@@ -606,7 +620,11 @@ async fn read_dynamic_type_names_recorded<
 >(
     stream: &mut S, out: &mut Vec<u8>, count_name: &str,
 ) -> Result<Vec<String>> {
-    let type_count = checked_usize(read_varint_recorded(stream, out).await?, count_name)?;
+    let type_count = checked_count(
+        read_varint_recorded(stream, out).await?,
+        count_name,
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
+    )?;
     let mut type_names = Vec::with_capacity(type_count);
     for _ in 0..type_count {
         type_names.push(read_string_recorded(stream, out, "dynamic type length").await?);
@@ -791,11 +809,12 @@ async fn read_lc_body_raw_recorded<
     let version = u64::from_le_bytes(out[start..start + 8].try_into().map_err(|_| {
         crate::error::Error::Protocol("LowCardinality version length mismatch".into())
     })?);
-    let num_keys = checked_usize(
+    let num_keys = checked_count(
         u64::from_le_bytes(out[start + 16..start + 24].try_into().map_err(|_| {
             crate::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
-        "LowCardinality keys",
+        "LowCardinality key",
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     let idx_width = lc_idx_width(version, serial_type)?;
 
@@ -818,4 +837,149 @@ async fn read_lc_body_raw_recorded<
         "LowCardinality indexes",
     )?;
     read_exact_recorded(stream, out, checked_len(indexes, idx_width)?).await
+}
+
+#[cfg(test)]
+mod count_limit_tests {
+    use super::{
+        read_dynamic_state_prefix_recorded, read_json_state_prefix_recorded, read_raw_data_block,
+    };
+    use crate::error::Error;
+    use crate::protocol::wire;
+    use crate::runtime::io::AsyncWriteExt as _;
+
+    fn varint(v: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, v).expect("test write");
+        buf
+    }
+
+    async fn seeded(bytes: Vec<u8>) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        tx.write_all(&bytes).await.expect("seed bytes");
+        (tx, rx)
+    }
+
+    #[tokio::test]
+    async fn raw_block_column_count_u64_max_is_protocol_error() {
+        let mut bytes = varint(0); // table name
+        bytes.push(0x00); // BlockInfo terminator
+        bytes.extend_from_slice(&varint(u64::MAX)); // columns
+        let (_tx, mut rx) = seeded(bytes).await;
+        let err = read_raw_data_block(&mut rx)
+            .await
+            .expect_err("u64::MAX column count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "block column count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_block_row_count_cap_plus_one_is_protocol_error() {
+        let mut bytes = varint(0); // table name
+        bytes.push(0x00); // BlockInfo terminator
+        bytes.extend_from_slice(&varint(1)); // columns
+        bytes.extend_from_slice(&varint(10_000_001)); // rows
+        let (_tx, mut rx) = seeded(bytes).await;
+        let err = read_raw_data_block(&mut rx)
+            .await
+            .expect_err("cap + 1 row count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn json_state_v3_path_count_u64_max_is_protocol_error() {
+        let mut bytes = 3u64.to_le_bytes().to_vec(); // serialization version 3
+        bytes.extend_from_slice(&varint(u64::MAX)); // JSON path count
+        let (_tx, mut rx) = seeded(bytes).await;
+        let mut out = Vec::new();
+        let err = read_json_state_prefix_recorded(&mut rx, &mut out)
+            .await
+            .expect_err("u64::MAX JSON path count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "JSON path count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_state_v0_path_count_cap_plus_one_is_protocol_error() {
+        let mut bytes = 0u64.to_le_bytes().to_vec(); // serialization version 0
+        bytes.extend_from_slice(&varint(0)); // max dynamic paths hint
+        bytes.extend_from_slice(&varint(65_537)); // JSON path count
+        let (_tx, mut rx) = seeded(bytes).await;
+        let mut out = Vec::new();
+        let err = read_json_state_prefix_recorded(&mut rx, &mut out)
+            .await
+            .expect_err("cap + 1 JSON path count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn dynamic_state_v1_type_count_u64_max_is_protocol_error() {
+        // Version 1 prefix: version, max-types hint, then the type count that
+        // previously fed Vec::with_capacity directly (capacity-overflow panic).
+        let mut bytes = 1u64.to_le_bytes().to_vec(); // serialization version 1
+        bytes.extend_from_slice(&varint(0)); // max types hint
+        bytes.extend_from_slice(&varint(u64::MAX)); // dynamic type count
+        let (_tx, mut rx) = seeded(bytes).await;
+        let mut out = Vec::new();
+        let err = read_dynamic_state_prefix_recorded(&mut rx, &mut out)
+            .await
+            .expect_err("u64::MAX dynamic type count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "dynamic subcolumn types count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lc_state_key_count_u64_max_is_protocol_error() {
+        // 24-byte LowCardinality prefix: version 1, serial type 0, then the
+        // dictionary key count that previously sized reads unbounded.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // key serialization version
+        // serial type: "additional keys" flag (bit 9) required by the reader
+        bytes.extend_from_slice(&(1u64 << 9).to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // dictionary key count
+        let (_tx, mut rx) = seeded(bytes).await;
+        let mut out = Vec::new();
+        let err = super::read_lc_body_raw_recorded(
+            &mut rx,
+            &crate::protocol::type_parser::ColumnType::UInt8,
+            &super::RawColumnState::None,
+            &mut out,
+        )
+        .await
+        .expect_err("u64::MAX LowCardinality key count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "LowCardinality key count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_state_v2_type_count_cap_plus_one_is_protocol_error() {
+        let mut bytes = 2u64.to_le_bytes().to_vec(); // serialization version 2
+        bytes.extend_from_slice(&varint(65_537)); // dynamic type count
+        let (_tx, mut rx) = seeded(bytes).await;
+        let mut out = Vec::new();
+        let err = read_dynamic_state_prefix_recorded(&mut rx, &mut out)
+            .await
+            .expect_err("cap + 1 dynamic type count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
 }

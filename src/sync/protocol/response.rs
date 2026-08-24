@@ -42,8 +42,16 @@ pub(crate) fn parse_block_shared(shared: &bytes::Bytes, pos: &mut usize) -> Resu
 /// already been consumed.
 pub(crate) fn parse_block_body(buf: &[u8], pos: &mut usize) -> Result<Block> {
     skip_block_info(buf, pos)?;
-    let num_cols = checked_usize(parse_varint(buf, pos)?, "columns")?;
-    let num_rows = checked_usize(parse_varint(buf, pos)?, "rows")?;
+    let num_cols = checked_count(
+        parse_varint(buf, pos)?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let num_rows = checked_count(
+        parse_varint(buf, pos)?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     let mut columns = Vec::with_capacity(num_cols);
 
     for _ in 0..num_cols {
@@ -81,8 +89,16 @@ pub(crate) fn parse_block_body(buf: &[u8], pos: &mut usize) -> Result<Block> {
 pub(crate) fn parse_block_body_shared(shared: &bytes::Bytes, pos: &mut usize) -> Result<Block> {
     let buf: &[u8] = shared;
     skip_block_info(buf, pos)?;
-    let num_cols = checked_usize(parse_varint(buf, pos)?, "columns")?;
-    let num_rows = checked_usize(parse_varint(buf, pos)?, "rows")?;
+    let num_cols = checked_count(
+        parse_varint(buf, pos)?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let num_rows = checked_count(
+        parse_varint(buf, pos)?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     let mut columns = Vec::with_capacity(num_cols);
 
     for _ in 0..num_cols {
@@ -183,8 +199,16 @@ where
     F: FnMut(BlockView<'_>) -> Result<()>,
 {
     skip_block_info_from_reader(reader)?;
-    let num_cols = checked_usize(wire::read_varint(reader)?, "columns")?;
-    let num_rows = checked_usize(wire::read_varint(reader)?, "rows")?;
+    let num_cols = checked_count(
+        wire::read_varint(reader)?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let num_rows = checked_count(
+        wire::read_varint(reader)?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
 
     if num_cols == 0 && num_rows == 0 {
         return visitor(BlockView {
@@ -247,8 +271,16 @@ pub(crate) fn discard_block<R: Read>(reader: &mut R) -> Result<usize> {
 
 pub(crate) fn discard_block_body<R: Read>(reader: &mut R) -> Result<usize> {
     skip_block_info_from_reader(reader)?;
-    let num_cols = checked_usize(wire::read_varint(reader)?, "columns")?;
-    let num_rows = checked_usize(wire::read_varint(reader)?, "rows")?;
+    let num_cols = checked_count(
+        wire::read_varint(reader)?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let num_rows = checked_count(
+        wire::read_varint(reader)?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
 
     for _ in 0..num_cols {
         let name = wire::read_string(reader)?;
@@ -270,8 +302,16 @@ pub(crate) fn discard_block_body<R: Read>(reader: &mut R) -> Result<usize> {
 
 pub(crate) fn read_block_body<R: Read>(reader: &mut R) -> Result<Block> {
     skip_block_info_from_reader(reader)?;
-    let num_cols = checked_usize(wire::read_varint(reader)?, "columns")?;
-    let num_rows = checked_usize(wire::read_varint(reader)?, "rows")?;
+    let num_cols = checked_count(
+        wire::read_varint(reader)?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let num_rows = checked_count(
+        wire::read_varint(reader)?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
 
     // Fast path: empty block marker — no columns/rows to parse.
     if num_cols == 0 && num_rows == 0 {
@@ -541,7 +581,11 @@ fn read_json_state_prefix_into<R: Read>(
     match version {
         1 | 4 => {},
         3 => {
-            let paths_count = checked_usize(read_varint_into(reader, data)?, "JSON paths")?;
+            let paths_count = checked_count(
+                read_varint_into(reader, data)?,
+                "JSON path",
+                crate::limits::MAX_JSON_DYNAMIC_ITEMS,
+            )?;
             for _ in 0..paths_count {
                 let _path = read_string_into(reader, data, "JSON path length")?;
             }
@@ -552,7 +596,11 @@ fn read_json_state_prefix_into<R: Read>(
         },
         0 => {
             let _max_dynamic_paths = read_varint_into(reader, data)?;
-            let paths_count = checked_usize(read_varint_into(reader, data)?, "JSON paths")?;
+            let paths_count = checked_count(
+                read_varint_into(reader, data)?,
+                "JSON path",
+                crate::limits::MAX_JSON_DYNAMIC_ITEMS,
+            )?;
             for _ in 0..paths_count {
                 let _path = read_string_into(reader, data, "JSON path length")?;
             }
@@ -956,11 +1004,12 @@ fn read_lc_body_raw_into<R: Read>(
     let serial_type = u64::from_le_bytes(data[start + 8..start + 16].try_into().map_err(|_| {
         crate::sync::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
-    let num_keys = checked_usize(
+    let num_keys = checked_count(
         u64::from_le_bytes(data[start + 16..start + 24].try_into().map_err(|_| {
             crate::sync::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
-        "LowCardinality keys",
+        "LowCardinality key",
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     let idx_width = 1usize << (serial_type & 0x3);
     if num_keys > 0 {
@@ -973,7 +1022,11 @@ fn read_lc_body_raw_into<R: Read>(
 fn read_dynamic_type_names_into<R: Read>(
     reader: &mut R, data: &mut Vec<u8>, count_name: &str,
 ) -> Result<Vec<String>> {
-    let type_count = checked_usize(read_varint_into(reader, data)?, count_name)?;
+    let type_count = checked_count(
+        read_varint_into(reader, data)?,
+        count_name,
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
+    )?;
     let mut type_names = Vec::with_capacity(type_count);
     for _ in 0..type_count {
         type_names.push(read_string_into(reader, data, "dynamic type length")?);
@@ -1039,11 +1092,12 @@ fn read_low_cardinality_into<R: Read>(
         crate::sync::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
     let idx_width = lc_idx_width(version, serial_type)?;
-    let num_keys = checked_usize(
+    let num_keys = checked_count(
         u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
             crate::sync::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
-        "LowCardinality keys",
+        "LowCardinality key",
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     let mut dict_data = Vec::new();
     read_column_data_into(reader, inner, num_keys, &mut dict_data)?;
@@ -1074,11 +1128,12 @@ fn read_low_cardinality_from_buffer(
         crate::sync::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
     let idx_width = lc_idx_width(version, serial_type)?;
-    let num_keys = checked_usize(
+    let num_keys = checked_count(
         u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
             crate::sync::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
-        "LowCardinality keys",
+        "LowCardinality key",
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     let dict_start = *pos;
     skip_column_data(buf, pos, inner, num_keys)?;
@@ -1220,11 +1275,12 @@ fn discard_low_cardinality<R: Read>(reader: &mut R, inner: &ColumnType, rows: us
         crate::sync::error::Error::Protocol("LowCardinality metadata length mismatch".into())
     })?);
     let idx_width = lc_idx_width(version, serial_type)?;
-    let num_keys = checked_usize(
+    let num_keys = checked_count(
         u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
             crate::sync::error::Error::Protocol("LowCardinality key count length mismatch".into())
         })?),
-        "LowCardinality keys",
+        "LowCardinality key",
+        crate::limits::MAX_JSON_DYNAMIC_ITEMS,
     )?;
     discard_column_data(reader, inner, num_keys)?;
     let mut count = [0u8; 8];
@@ -1413,6 +1469,12 @@ fn checked_len(rows: usize, width: usize) -> Result<usize> {
 fn checked_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| crate::sync::error::Error::Protocol(format!("{name} count too large")))
+}
+
+/// Validates a server-controlled item count against a [`crate::limits`] cap
+/// before any allocation or loop is sized from it.
+fn checked_count(value: u64, what: &str, max: usize) -> Result<usize> {
+    crate::limits::checked_count(value, what, max).map_err(crate::sync::error::Error::Protocol)
 }
 
 /// Validate a LowCardinality header and derive the per-row index width.
@@ -1614,13 +1676,14 @@ fn skip_column_data(buf: &[u8], pos: &mut usize, ct: &ColumnType, rows: usize) -
                 )
             })?);
             let idx_width = lc_idx_width(version, serial_type)?;
-            let num_keys = checked_usize(
+            let num_keys = checked_count(
                 u64::from_le_bytes(meta[16..24].try_into().map_err(|_| {
                     crate::sync::error::Error::Protocol(
                         "LowCardinality key count length mismatch".into(),
                     )
                 })?),
-                "LowCardinality keys",
+                "LowCardinality key",
+                crate::limits::MAX_JSON_DYNAMIC_ITEMS,
             )?;
             skip_column_data(buf, pos, inner, num_keys)?;
             let count_bytes = parse_bytes(buf, pos, 8)?;
@@ -1815,5 +1878,206 @@ mod tests {
         assert_eq!(col.get(0).expect("row 0 should decode"), "a");
         assert_eq!(col.get(1).expect("row 1 should decode"), "b");
         assert_eq!(col.get(2).expect("row 2 should decode"), "a");
+    }
+}
+
+#[cfg(test)]
+mod count_limit_tests {
+    use super::{
+        discard_block_body, parse_block_body, read_block, read_block_view,
+        read_dynamic_state_prefix_into, read_json_state_prefix_into,
+    };
+    use crate::limits;
+    use crate::sync::error::Error;
+    use crate::sync::protocol::wire;
+    use std::io::Cursor;
+
+    fn varint(v: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, v).expect("test write");
+        buf
+    }
+
+    /// BlockInfo terminator + column/row counts.
+    fn block_body_bytes(cols: u64, rows: u64) -> Vec<u8> {
+        let mut bytes = vec![0x00];
+        bytes.extend_from_slice(&varint(cols));
+        bytes.extend_from_slice(&varint(rows));
+        bytes
+    }
+
+    #[test]
+    fn parse_block_body_column_count_u64_max_is_protocol_error() {
+        let bytes = block_body_bytes(u64::MAX, 0);
+        let mut pos = 0;
+        let err = parse_block_body(&bytes, &mut pos)
+            .err()
+            .expect("u64::MAX column count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "block column count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_block_body_row_count_cap_plus_one_is_protocol_error() {
+        let bytes = block_body_bytes(0, limits::MAX_BLOCK_ROWS as u64 + 1);
+        let mut pos = 0;
+        let err = parse_block_body(&bytes, &mut pos)
+            .err()
+            .expect("cap + 1 row count must be rejected");
+        match &err {
+            Error::Protocol(msg) => {
+                assert_eq!(msg, "block row count 10000001 exceeds limit 10000000")
+            },
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_block_body_row_cap_boundary_parses() {
+        // Exactly MAX_BLOCK_ROWS with zero columns must still parse: the cap
+        // bounds a single block, never the total rows of a streamed response.
+        let bytes = block_body_bytes(0, limits::MAX_BLOCK_ROWS as u64);
+        let mut pos = 0;
+        let block = parse_block_body(&bytes, &mut pos).expect("row count at the cap parses");
+        assert_eq!(block.row_count(), limits::MAX_BLOCK_ROWS);
+        assert!(block.columns.is_empty());
+    }
+
+    #[test]
+    fn read_block_column_count_u64_max_is_protocol_error() {
+        let mut bytes = varint(0); // table name
+        bytes.extend_from_slice(&block_body_bytes(u64::MAX, 0));
+        let mut reader = Cursor::new(bytes);
+        let err = read_block(&mut reader)
+            .err()
+            .expect("u64::MAX column count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_block_view_row_count_cap_plus_one_is_protocol_error() {
+        let mut bytes = varint(0); // table name
+        bytes.extend_from_slice(&block_body_bytes(0, limits::MAX_BLOCK_ROWS as u64 + 1));
+        let mut reader = Cursor::new(bytes);
+        let mut visitor =
+            |_view: crate::sync::protocol::block::BlockView<'_>| -> crate::sync::error::Result<()> {
+                Ok(())
+            };
+        let err = read_block_view(&mut reader, &mut visitor)
+            .expect_err("cap + 1 row count must be rejected");
+        match &err {
+            Error::Protocol(msg) => {
+                assert_eq!(msg, "block row count 10000001 exceeds limit 10000000")
+            },
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discard_block_body_column_count_u64_max_is_protocol_error() {
+        let bytes = block_body_bytes(u64::MAX, 0);
+        let mut reader = Cursor::new(bytes);
+        let err =
+            discard_block_body(&mut reader).expect_err("u64::MAX column count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn json_state_v3_path_count_u64_max_is_protocol_error() {
+        let mut bytes = 3u64.to_le_bytes().to_vec(); // serialization version 3
+        bytes.extend_from_slice(&varint(u64::MAX)); // JSON path count
+        let mut reader = Cursor::new(bytes);
+        let mut data = Vec::new();
+        let err = read_json_state_prefix_into(&mut reader, &mut data)
+            .expect_err("u64::MAX JSON path count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "JSON path count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_state_v0_path_count_cap_plus_one_is_protocol_error() {
+        let mut bytes = 0u64.to_le_bytes().to_vec(); // serialization version 0
+        bytes.extend_from_slice(&varint(0)); // max dynamic paths hint
+        bytes.extend_from_slice(&varint(65_537)); // JSON path count
+        let mut reader = Cursor::new(bytes);
+        let mut data = Vec::new();
+        let err = read_json_state_prefix_into(&mut reader, &mut data)
+            .expect_err("cap + 1 JSON path count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn dynamic_state_v1_type_count_u64_max_is_protocol_error() {
+        // Version 1 prefix: version, max-types hint, then the type count that
+        // previously fed Vec::with_capacity directly (capacity-overflow panic).
+        let mut bytes = 1u64.to_le_bytes().to_vec(); // serialization version 1
+        bytes.extend_from_slice(&varint(0)); // max types hint
+        bytes.extend_from_slice(&varint(u64::MAX)); // dynamic type count
+        let mut reader = Cursor::new(bytes);
+        let mut data = Vec::new();
+        let err = read_dynamic_state_prefix_into(&mut reader, &mut data)
+            .expect_err("u64::MAX dynamic type count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "dynamic subcolumn types count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_key_count_u64_max_is_protocol_error() {
+        // 24-byte LowCardinality prefix: version 1, serial type 0, then the
+        // dictionary key count that previously sized `Vec` growth unbounded.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // key serialization version
+        // serial type: "additional keys" flag (bit 9) required by the reader
+        bytes.extend_from_slice(&(1u64 << 9).to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // dictionary key count
+        let mut pos = 0;
+        let err = super::read_low_cardinality_from_buffer(
+            &bytes,
+            &mut pos,
+            &crate::sync::protocol::type_parser::ColumnType::UInt8,
+            1,
+        )
+        .expect_err("u64::MAX LowCardinality key count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "LowCardinality key count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_block_within_caps_still_parses() {
+        // One UInt8 column, one row: counts well below every cap must keep
+        // parsing normally after the cap checks are in place.
+        let mut bytes = varint(0); // table name
+        bytes.push(0x00); // BlockInfo terminator
+        bytes.extend_from_slice(&varint(1)); // columns
+        bytes.extend_from_slice(&varint(1)); // rows
+        wire::write_string(&mut bytes, "c").expect("test write"); // column name
+        wire::write_string(&mut bytes, "UInt8").expect("test write"); // type
+        bytes.push(0); // custom serialization
+        bytes.push(7); // one UInt8 value
+        let mut reader = Cursor::new(bytes);
+        let block = read_block(&mut reader).expect("block within caps parses");
+        assert_eq!(block.row_count(), 1);
+        assert_eq!(block.columns.len(), 1);
+        assert_eq!(&block.columns[0].data[..], &[7]);
     }
 }

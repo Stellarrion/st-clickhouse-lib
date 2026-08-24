@@ -144,7 +144,12 @@ pub fn handshake(
     let password_complexity_rules = if negotiated_revision
         >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES
     {
-        let count = wire::read_varint(stream)? as usize;
+        let count = crate::limits::checked_count(
+            wire::read_varint(stream)?,
+            "password complexity rule",
+            crate::limits::MAX_PASSWORD_COMPLEXITY_RULES,
+        )
+        .map_err(crate::sync::error::Error::Protocol)?;
         let mut rules = Vec::with_capacity(count);
         for _ in 0..count {
             rules.push((wire::read_string(stream)?, wire::read_string(stream)?));
@@ -269,5 +274,101 @@ fn skip_settings_strings_with_flags(
         }
         let _flags = wire::read_varint(stream)?;
         let _value = wire::read_string(stream)?;
+    }
+}
+
+#[cfg(test)]
+mod password_rule_limit_tests {
+    use super::{ServerInfo, handshake};
+    use crate::sync::config::ClientConfig;
+    use crate::sync::error::{Error, Result};
+    use crate::sync::protocol::wire;
+    use std::io::{Read, Write};
+
+    /// Reads a fixed payload; writes are discarded. A `Cursor` cannot be used
+    /// because client-hello writes would overwrite the preloaded server bytes.
+    struct ServerHelloStream<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl Read for ServerHelloStream<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.data.len() - self.pos;
+            let take = buf.len().min(n);
+            buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            Ok(take)
+        }
+    }
+
+    impl Write for ServerHelloStream<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Server Hello bytes at negotiated revision 54461 — the first revision
+    /// that carries password complexity rules and the last that omits every
+    /// later field, so the rules block terminates the packet.
+    fn hello_with_rule_count(rule_count: u64, rules: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, 0).expect("test write"); // ServerPacket::Hello
+        wire::write_string(&mut buf, "srv").expect("test write"); // server name
+        wire::write_varint(&mut buf, 26).expect("test write"); // version major
+        wire::write_varint(&mut buf, 4).expect("test write"); // version minor
+        wire::write_varint(&mut buf, 54461).expect("test write"); // server revision
+        wire::write_string(&mut buf, "UTC").expect("test write"); // timezone (rev >= 54058)
+        wire::write_string(&mut buf, "srv").expect("test write"); // display name (rev >= 54372)
+        wire::write_varint(&mut buf, 0).expect("test write"); // version patch (rev >= 54401)
+        wire::write_varint(&mut buf, rule_count).expect("test write"); // rules (rev >= 54461)
+        for (pattern, message) in rules {
+            wire::write_string(&mut buf, pattern).expect("test write");
+            wire::write_string(&mut buf, message).expect("test write");
+        }
+        buf
+    }
+
+    fn run_handshake(server_bytes: &[u8]) -> Result<ServerInfo> {
+        let mut config = ClientConfig::default();
+        config.client_revision = 54461;
+        let mut stream = ServerHelloStream {
+            data: server_bytes,
+            pos: 0,
+        };
+        handshake(&mut stream, &config)
+    }
+
+    #[test]
+    fn hello_rule_count_u64_max_is_protocol_error() {
+        let err = run_handshake(&hello_with_rule_count(u64::MAX, &[]))
+            .expect_err("u64::MAX rule count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "password complexity rule count 18446744073709551615 exceeds limit 65536"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_rule_count_cap_plus_one_is_protocol_error() {
+        let err = run_handshake(&hello_with_rule_count(65_537, &[]))
+            .expect_err("cap + 1 rule count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn hello_rules_within_cap_parse() {
+        let info = run_handshake(&hello_with_rule_count(1, &[("min_len", "too short")]))
+            .expect("rule count within cap parses");
+        assert_eq!(info.password_complexity_rules.len(), 1);
+        assert_eq!(info.password_complexity_rules[0].0, "min_len");
+        assert_eq!(info.password_complexity_rules[0].1, "too short");
+        assert_eq!(info.negotiated_revision, 54461);
     }
 }

@@ -135,7 +135,12 @@ fn skip_profile_info(buf: &[u8], pos: &mut usize, protocol_revision: u64) -> Res
 }
 
 fn skip_part_uuids(buf: &[u8], pos: &mut usize) -> Result<()> {
-    let count = checked_usize(parse_varint(buf, pos)?, "PartUUIDs")?;
+    let count = crate::limits::checked_count(
+        parse_varint(buf, pos)?,
+        "PartUUID",
+        crate::limits::MAX_PART_UUIDS,
+    )
+    .map_err(Error::Protocol)?;
     advance(buf, pos, checked_len(count, 16)?)
 }
 
@@ -253,6 +258,43 @@ mod tests {
             buf.push(u8::from(*nested));
         }
         buf
+    }
+
+    // ── Server-controlled count cap tests ────────────────────────────────
+
+    fn part_uuids_packet(count: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, 12).expect("test write"); // PartUUIDs
+        wire::write_varint(&mut buf, count).expect("test write");
+        buf
+    }
+
+    #[test]
+    fn part_uuid_count_u64_max_is_protocol_error() {
+        let err = parse_response(
+            part_uuids_packet(u64::MAX),
+            revision::DEFAULT_PROTOCOL_REVISION,
+        )
+        .err()
+        .expect("u64::MAX PartUUID count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "PartUUID count 18446744073709551615 exceeds limit 1048576"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn part_uuid_count_cap_plus_one_is_protocol_error() {
+        let err = parse_response(
+            part_uuids_packet(1_048_577),
+            revision::DEFAULT_PROTOCOL_REVISION,
+        )
+        .err()
+        .expect("cap + 1 PartUUID count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
     }
 
     #[test]

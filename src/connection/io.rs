@@ -282,7 +282,11 @@ pub(crate) async fn read_part_uuids_packet<
 >(
     stream: &mut S,
 ) -> Result<Vec<[u8; 16]>> {
-    let count = checked_usize(read_varint_async(stream).await?, "PartUUIDs")?;
+    let count = checked_count(
+        read_varint_async(stream).await?,
+        "PartUUID",
+        crate::limits::MAX_PART_UUIDS,
+    )?;
     let mut uuids = Vec::with_capacity(count);
     for _ in 0..count {
         let mut uuid = [0u8; 16];
@@ -534,8 +538,16 @@ pub(crate) async fn read_block_header<
             _ => break,
         }
     }
-    let columns = checked_usize(read_varint_async(stream).await?, "columns")?;
-    let rows = checked_usize(read_varint_async(stream).await?, "rows")?;
+    let columns = checked_count(
+        read_varint_async(stream).await?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let rows = checked_count(
+        read_varint_async(stream).await?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     Ok((columns, rows))
 }
 
@@ -599,6 +611,12 @@ pub(crate) fn checked_len(rows: usize, width: usize) -> Result<usize> {
 pub(crate) fn checked_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| crate::error::Error::Protocol(format!("{name} count too large")))
+}
+
+/// Validates a server-controlled item count against a [`crate::limits`] cap
+/// before any allocation or loop is sized from it.
+pub(crate) fn checked_count(value: u64, what: &str, max: usize) -> Result<usize> {
+    crate::limits::checked_count(value, what, max).map_err(crate::error::Error::Protocol)
 }
 
 /// Validate a LowCardinality header and derive the per-row index width.
@@ -792,5 +810,64 @@ mod offset_read_tests {
             .expect("read offsets");
         assert!(offsets.is_empty());
         assert_eq!(total, 0);
+    }
+}
+
+#[cfg(test)]
+mod part_uuid_limit_tests {
+    use super::read_part_uuids_packet;
+    use crate::error::Error;
+    use crate::protocol::wire;
+    use crate::runtime::io::AsyncWriteExt as _;
+
+    fn uuid_packet(count: u64, uuid_bytes: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, count).expect("test write");
+        buf.extend_from_slice(uuid_bytes);
+        buf
+    }
+
+    #[tokio::test]
+    async fn part_uuid_count_u64_max_is_protocol_error() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&uuid_packet(u64::MAX, &[]))
+            .await
+            .expect("seed packet");
+        let err = read_part_uuids_packet(&mut rx)
+            .await
+            .expect_err("u64::MAX PartUUID count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "PartUUID count 18446744073709551615 exceeds limit 1048576"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn part_uuid_count_cap_plus_one_is_protocol_error() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&uuid_packet(1_048_577, &[]))
+            .await
+            .expect("seed packet");
+        let err = read_part_uuids_packet(&mut rx)
+            .await
+            .expect_err("cap + 1 PartUUID count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn part_uuids_within_cap_parse() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&uuid_packet(2, &[0x11; 32]))
+            .await
+            .expect("seed packet");
+        let uuids = read_part_uuids_packet(&mut rx)
+            .await
+            .expect("count within cap parses");
+        assert_eq!(uuids.len(), 2);
+        assert_eq!(uuids[0], [0x11; 16]);
+        assert_eq!(uuids[1], [0x11; 16]);
     }
 }
