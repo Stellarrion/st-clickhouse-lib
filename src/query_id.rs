@@ -179,6 +179,7 @@ mod tests {
     /// the process prefix and the later draw must be strictly greater. Exact
     /// consecutiveness is not asserted because parallel test threads also
     /// consume counter slots from the same process-wide state.
+    #[cfg(feature = "tokio")]
     #[test]
     fn sync_and_async_share_one_counter_sequence() {
         let mut buf = [0u8; 22];
