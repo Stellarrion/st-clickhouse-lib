@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import builtins
+
 
 class ClickHouseError(Exception):
     """Base exception for all ClickHouse errors."""
@@ -42,18 +44,23 @@ def map_error(exc: Exception) -> Exception:
     # message can itself contain words like "authentication" or "compression".
     if isinstance(exc, ValueError) and msg.startswith("ClickHouse server error (code="):
         return QueryError(msg)
+    # Native timeouts raise the built-in TimeoutError (PyTimeoutError); map
+    # them (and any builtin timeout) to st_clickhouse.TimeoutError before the
+    # word heuristics below can misclassify the message.
+    if isinstance(exc, builtins.TimeoutError):
+        return TimeoutError(msg)
     if "authentication" in msg.lower():
         return AuthenticationError(msg)
     if isinstance(exc, ConnectionError):
         return ConnectionError(msg)
     if isinstance(exc, ValueError):
+        if msg.startswith("ClickHouse configuration error"):
+            return ConfigError(msg)
         if "compression" in msg.lower():
             return CompressionError(msg)
         if "protocol" in msg.lower():
             return ProtocolError(msg)
         return QueryError(msg)
-    if isinstance(exc, TimeoutError):
-        return TimeoutError(msg)
     if "config" in msg.lower():
         return ConfigError(msg)
     if "I/O" in msg or "io" in msg.lower() or "connection" in msg.lower():

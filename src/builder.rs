@@ -199,6 +199,9 @@ impl<M> ClientBuilder<M> {
         )
     }
 
+    /// Set the connect timeout for each per-address connection attempt
+    /// (TCP + TLS + native handshake + ping). Also accepted as the URL option
+    /// `?connect_timeout=`. `Duration::ZERO` is rejected at connect time.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.opts.connect_timeout = Some(timeout);
         self

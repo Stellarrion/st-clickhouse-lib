@@ -357,6 +357,10 @@ struct RawConnectConfig<'a> {
     password: &'a str,
     database: &'a str,
     quota_key: &'a str,
+    /// Budget for the whole per-address connect: TCP + TLS + native
+    /// handshake + addendum + ping. `None` = unbounded (OS defaults).
+    /// DNS resolution is not covered — addresses arrive pre-resolved.
+    connect_timeout: Option<std::time::Duration>,
     send_timeout: Option<std::time::Duration>,
     ssh_signer: Option<&'a handshake::SshSigner>,
     #[cfg(feature = "tokio-tls")]
@@ -366,8 +370,31 @@ struct RawConnectConfig<'a> {
 }
 
 /// Create a new connection: TCP connect → handshake → addendum → ping.
+///
+/// The whole per-address future is bounded by `config.connect_timeout` (when
+/// set): expiry cancels the in-flight setup and returns
+/// [`Error::Timeout`](crate::error::Error::Timeout) naming the address and the
+/// budget, so a server that accepts TCP and never sends Hello cannot hang the
+/// pool. `None` keeps the unbounded OS default. The caller
+/// (`SimplePool::connect_round_robin`) rejects a zero timeout up front.
 #[tracing::instrument(level = "debug", skip_all, fields(addr = %config.addr), name = "clickhouse.connect")]
 async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
+    let addr = config.addr;
+    match config.connect_timeout {
+        Some(budget) => {
+            match crate::runtime::time::timeout(budget, connect_raw_inner(config)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(crate::error::Error::Timeout(format!(
+                    "connect to {addr} (TCP + TLS + handshake + ping) timed out after {budget:?}"
+                ))),
+            }
+        },
+        None => connect_raw_inner(config).await,
+    }
+}
+
+/// Unbounded per-address connect: TCP connect → TLS → handshake → addendum → ping.
+async fn connect_raw_inner(config: RawConnectConfig<'_>) -> Result<Connection> {
     let addr = config.addr;
     let raw = crate::runtime::net::TcpStream::connect(addr).await?;
     configure_tcp(&raw);
@@ -689,7 +716,14 @@ impl SimplePool {
         }
     }
 
-    /// Set connect timeout.
+    /// Set the connect timeout applied to each per-address connect attempt
+    /// (TCP + TLS + native handshake + addendum + ping) in
+    /// [`SimplePool::get`](Self::get). New connections and reconnects read the
+    /// current value at connect time. DNS resolution is not bounded by it.
+    ///
+    /// [`Duration::ZERO`] is invalid and rejected at connect time with
+    /// [`Error::Config`](crate::error::Error::Config) — it cannot mean "no
+    /// deadline". Use `None` (the default) for the unbounded OS behaviour.
     pub(crate) fn set_connect_timeout(&mut self, t: Duration) {
         self.connect_timeout = Some(t);
     }
@@ -767,6 +801,16 @@ impl SimplePool {
                 "no addresses configured".into(),
             ));
         }
+        // A zero budget is deterministic misconfiguration: fail before any
+        // address is tried so it is never retried or recorded as a dead
+        // address by the circuit breaker.
+        if let Some(t) = self.connect_timeout
+            && t.is_zero()
+        {
+            return Err(crate::error::Error::Config(
+                "connect_timeout must be greater than zero; Duration::ZERO would remove the connect deadline".into(),
+            ));
+        }
         // Periodically re-resolve DNS to discover new cluster nodes
         self.refresh_dns().await;
 
@@ -799,6 +843,7 @@ impl SimplePool {
                 password: &self.password,
                 database: &self.database,
                 quota_key: &self.quota_key,
+                connect_timeout: self.connect_timeout,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
                 tls_config: self.tls_config.clone(),
@@ -812,6 +857,7 @@ impl SimplePool {
                 password: &self.password,
                 database: &self.database,
                 quota_key: &self.quota_key,
+                connect_timeout: self.connect_timeout,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
             })
@@ -1106,6 +1152,17 @@ mod tests {
     }
 
     #[test]
+    fn test_set_connect_timeout() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 1);
+        assert!(pool.connect_timeout.is_none(), "default is unbounded");
+        pool.set_connect_timeout(Duration::from_secs(2));
+        assert_eq!(pool.connect_timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
     fn test_acquire_timeout_defaults_none() {
         let addr = "127.0.0.1:9000"
             .parse::<std::net::SocketAddr>()
@@ -1260,6 +1317,127 @@ mod tests {
             .expect("test operation failed");
         let pool = SimplePool::new(vec![addr], 5);
         assert_eq!(pool.slot_count(), 5);
+    }
+
+    /// Bind a local listener that accepts connections and then stays silent —
+    /// a server that never sends its Hello.
+    async fn silent_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        crate::runtime::spawn(async move {
+            // Accept and hold every connection open without writing anything.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    fn refused_addr() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind refused-port probe");
+        let addr = listener.local_addr().expect("refused-port address");
+        drop(listener);
+        addr
+    }
+
+    /// A silent server must trip the connect timeout — covering TCP accept,
+    /// handshake, addendum, and ping — long before anything else could save
+    /// it, leaving the slot `None` and the address recorded as failed.
+    #[tokio::test]
+    async fn test_connect_timeout_bounds_silent_server() {
+        let addr = silent_listener().await;
+        let mut pool = SimplePool::new(vec![addr], 1);
+        pool.set_connect_timeout(Duration::from_millis(200));
+
+        let start = Instant::now();
+        let err = match pool.get().await {
+            Ok(_) => unreachable!("silent server must not yield a connection"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+
+        match &err {
+            crate::error::Error::Timeout(msg) => {
+                assert!(
+                    msg.contains(&addr.to_string()),
+                    "message must name the address: {msg}"
+                );
+                assert!(msg.contains("200ms"), "message must name the budget: {msg}");
+            },
+            other => unreachable!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "connect timeout must fire in ~200ms, took {elapsed:?}"
+        );
+        // Slot stays empty: the next acquire starts from scratch.
+        assert!(
+            pool.slots[0].try_lock().expect("slot lockable").is_none(),
+            "failed connect must leave the slot None"
+        );
+        // The circuit breaker saw the failure.
+        assert_eq!(pool.failure_counts.lock().get(&addr), Some(&1));
+        assert!(pool.dead_addrs.lock().contains_key(&addr));
+    }
+
+    /// Fast network errors (connection refused) keep their I/O identity — the
+    /// connect timeout must not convert them into Timeout — and failover moves
+    /// on to the next address.
+    #[tokio::test]
+    async fn test_connect_timeout_failover_keeps_io_error_identity() {
+        let refused = refused_addr();
+        let silent = silent_listener().await;
+        let mut pool = SimplePool::new(vec![refused, silent], 1);
+        pool.set_connect_timeout(Duration::from_millis(200));
+
+        let err = match pool.get().await {
+            Ok(_) => unreachable!("no address here can complete a handshake"),
+            Err(e) => e,
+        };
+        // The final error is the silent address timing out, not the refusal.
+        match &err {
+            crate::error::Error::Timeout(msg) => {
+                assert!(
+                    msg.contains(&silent.to_string()),
+                    "message must name the address: {msg}"
+                );
+            },
+            other => unreachable!("expected Timeout from the silent address, got {other:?}"),
+        }
+        // Both attempts were recorded by the circuit breaker.
+        assert_eq!(pool.failure_counts.lock().get(&refused), Some(&1));
+        assert_eq!(pool.failure_counts.lock().get(&silent), Some(&1));
+        assert!(pool.dead_addrs.lock().contains_key(&refused));
+        assert!(pool.dead_addrs.lock().contains_key(&silent));
+    }
+
+    /// `Duration::ZERO` is deterministic misconfiguration: rejected as Config
+    /// before any address is tried, never retried, never marked dead.
+    #[tokio::test]
+    async fn test_connect_timeout_zero_rejected_as_config() {
+        let addr = silent_listener().await;
+        let mut pool = SimplePool::new(vec![addr], 1);
+        pool.set_connect_timeout(Duration::ZERO);
+
+        let err = match pool.get().await {
+            Ok(_) => unreachable!("zero connect_timeout must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::error::Error::Config(ref msg) if msg.contains("connect_timeout")),
+            "expected Config error, got {err:?}"
+        );
+        assert!(
+            pool.failure_counts.lock().is_empty(),
+            "config errors are not failures"
+        );
+        assert!(
+            pool.dead_addrs.lock().is_empty(),
+            "config errors must not mark addresses dead"
+        );
     }
 
     /// Server-free proof that `get()` honours `acquire_timeout`: hold the only

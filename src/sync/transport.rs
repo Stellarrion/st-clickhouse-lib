@@ -97,6 +97,11 @@ impl Transport {
         self.raw_tcp().set_read_timeout(timeout)
     }
 
+    /// Set write timeout on the underlying TCP socket.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.raw_tcp().set_write_timeout(timeout)
+    }
+
     /// Set TCP_NODELAY.
     pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
         self.raw_tcp().set_nodelay(nodelay)

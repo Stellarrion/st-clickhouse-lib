@@ -5,6 +5,33 @@ All notable changes to st-clickhouse are documented here.
 ## [Unreleased]
 
 ### Added
+- **Real connect timeouts (sync)**: `SyncClient::connect_with_config` /
+  `connect` / `connect_with_timeout` now resolve every address and enforce
+  `connect_timeout` per TCP connect attempt (previously only the first
+  resolved address was tried, with no timeout). The whole setup phase — TLS
+  handshake, native handshake, addendum — runs under one absolute wall-clock
+  deadline enforced by a socket-shutdown watchdog (with temporary socket I/O
+  timeouts as a fallback), restored to the normal `query_timeout` read deadline
+  after success. Silent and byte-dripping peers cannot extend setup. Setup
+  expiry surfaces as the new `sync::Error::Timeout` (Linux `WouldBlock` /
+  `TimedOut` both classified); `SyncClient::connect_stream` documents the same
+  setup-bound semantics for pre-established sockets. `connect_timeout == 0`
+  is rejected up front with the new `sync::Error::Config`.
+- **Real connect timeouts (async)**: `SimplePool.connect_timeout` (set via
+  `ClientBuilder::connect_timeout`, URL `?connect_timeout=`, or
+  `Client::with_connect_timeout`) now bounds the whole per-address
+  `connect_raw` future — TCP + TLS + native handshake + addendum + Ping —
+  through the runtime timeout helper. Expiry returns `Error::Timeout` with the
+  address and budget, leaves the slot empty, and feeds failover /
+  circuit-breaker bookkeeping exactly like any other connect error.
+  `Duration::ZERO` is rejected as `Error::Config` before any address is tried
+  (never retried, never marked dead). DNS resolution remains unbounded by it
+  and `acquire_timeout` still bounds only the slot wait. Reconnects read the
+  current setting at connect time.
+- **Python timeout/config mapping**: native connect/setup timeouts raise the
+  built-in `TimeoutError`, and the high-level `map_error` translates it to
+  `st_clickhouse.TimeoutError` (not a generic `ClickHouseError`); native
+  configuration errors (`connect_timeout=0`) map to `st_clickhouse.ConfigError`.
 - **True per-query settings overlays**: `SyncClient::{execute,query}_with_settings`,
   `_{with_params_and_settings}`, and `_{with_params_settings_and_ignored_part_uuids}`
   build each Query packet from the persistent `ClientConfig.settings` overlaid by a

@@ -114,7 +114,9 @@ class Client:
         database: Default database (default: "").
         settings: ClickHouse session settings dict.
         compression: Compression method — ``"lz4"``, ``"zstd"``, or None.
-        connect_timeout: Connect timeout in seconds (default: 10.0).
+        connect_timeout: Connect timeout in seconds (default: 10.0). Bounds
+            TCP establishment plus TLS/native handshake setup per address;
+            expiry raises :class:`TimeoutError`. Must be > 0.
         query_timeout: Query timeout in seconds (default: 300.0).
         tls: Enable TLS encryption (default: False). Uses system CA store.
         tls_domain: TLS SNI hostname override (default: parsed from addr).
@@ -562,7 +564,9 @@ class AsyncClient:
         database: Default database.
         settings: ClickHouse session settings dict.
         compression: Compression method — ``"lz4"``, ``"zstd"``, or ``None``.
-        connect_timeout: Connect timeout in seconds (default: 10.0).
+        connect_timeout: Connect timeout in seconds (default: 10.0). Bounds
+            TCP establishment plus TLS/native handshake setup per address;
+            expiry raises :class:`TimeoutError`. Must be > 0.
         query_timeout: Query timeout in seconds (default: 300.0).
         ssh_signer: Callable receiving ClickHouse challenge bytes and returning
             an SSH-key signature string for native SSH authentication.

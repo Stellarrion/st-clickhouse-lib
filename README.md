@@ -282,6 +282,28 @@ let results = client.batch()
     .await?;
 ```
 
+#### Connection timeouts
+
+`connect_timeout` (builder option, URL `?connect_timeout=`, or
+`Client::with_connect_timeout` / sync `ClientConfig::with_connect_timeout`)
+bounds **each per-address connection attempt end to end**: TCP establishment,
+TLS handshake, native protocol handshake, addendum, and (async) the
+connect-time Ping. A server that accepts TCP and then never sends its Hello
+fails with `Error::Timeout` instead of hanging until the query timeout.
+
+- Async: each resolved address gets the full budget; expiry returns
+  `Error::Timeout` naming the address and budget, the pool slot stays empty,
+  and failover/circuit-breaker bookkeeping treats it like any connect failure.
+- Sync: resolved addresses are tried in order, each with one full end-to-end
+  budget shared by TCP and setup. An absolute socket-shutdown watchdog (plus
+  socket I/O timeouts as fallback) defeats byte-drip peers; the normal
+  `query_timeout` read deadline is restored after success.
+- `Duration::ZERO` is rejected with `Error::Config` — it cannot mean "no
+  deadline". Async pools are unbounded when the option is unset; sync
+  `ClientConfig` defaults to 10 seconds.
+- DNS resolution is not bounded by `connect_timeout`. It is independent of
+  `acquire_timeout`, which bounds only the wait for a free pool slot.
+
 ### Python Client
 
 ```python

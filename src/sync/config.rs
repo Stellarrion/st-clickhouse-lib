@@ -53,7 +53,10 @@ pub struct ClientConfig {
     pub client_version_patch: u64,
     /// Protocol revision (defines which features the server enables).
     pub client_revision: u64,
-    /// Timeout for establishing the TCP connection.
+    /// Timeout for each per-address connection attempt: TCP establishment
+    /// plus the whole setup phase (TLS handshake, native handshake,
+    /// addendum). Must be greater than zero; see
+    /// [`SyncClient::connect_with_config`](crate::sync::SyncClient::connect_with_config).
     pub connect_timeout: Duration,
     /// Read timeout for queries (applied to the TCP stream).
     pub query_timeout: Duration,
@@ -186,6 +189,13 @@ impl ClientConfig {
         self.client_revision = rev;
         self
     }
+    /// Set the connect timeout (see [`ClientConfig::connect_timeout`]).
+    ///
+    /// Each resolved address gets the full timeout for TCP establishment and
+    /// connection setup; expiry returns
+    /// [`Error::Timeout`](crate::sync::error::Error::Timeout) for setup or TCP
+    /// stalls. `Duration::ZERO` is rejected with
+    /// [`Error::Config`](crate::sync::error::Error::Config) at connect time.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self

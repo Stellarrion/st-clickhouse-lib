@@ -1,7 +1,7 @@
 //! Error type mapping: st-clickhouse errors → Python exceptions.
 
 use pyo3::PyErr;
-use pyo3::exceptions::{PyConnectionError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyTimeoutError, PyValueError};
 
 /// Map a Rust Error to the appropriate Python PyErr.
 pub fn to_py_err(err: st_clickhouse::sync::error::Error) -> PyErr {
@@ -32,6 +32,16 @@ pub fn to_py_err(err: st_clickhouse::sync::error::Error) -> PyErr {
             PyValueError::new_err(format!(
                 "ClickHouse server error (code={code}, name={name}): {message}"
             ))
+        },
+        // Timeouts (connect/setup deadline expiry) → built-in TimeoutError,
+        // which the high-level `map_error` translates to
+        // `st_clickhouse.TimeoutError`.
+        st_clickhouse::sync::error::Error::Timeout(msg) => {
+            PyTimeoutError::new_err(format!("ClickHouse timeout: {msg}"))
+        },
+        // Invalid configuration → ValueError recognised as ConfigError.
+        st_clickhouse::sync::error::Error::Config(msg) => {
+            PyValueError::new_err(format!("ClickHouse configuration error: {msg}"))
         },
     }
 }

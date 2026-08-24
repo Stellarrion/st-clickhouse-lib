@@ -73,6 +73,108 @@ use crate::sync::query_packet::{
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
+/// Reject a zero `connect_timeout` clearly: it cannot mean "no deadline"
+/// (that is the hang this timeout exists to prevent).
+fn validate_connect_timeout(config: &ClientConfig) -> Result<()> {
+    if config.connect_timeout.is_zero() {
+        return Err(Error::Config(
+            "connect_timeout must be greater than zero; Duration::ZERO would remove the connect deadline".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an I/O error is a socket read/write deadline expiry.
+///
+/// A blocking socket with a timeout reports `TimedOut` on most platforms, but
+/// Linux reports `WouldBlock`; both mean the configured deadline expired.
+fn is_socket_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Classify a failed connection setup: an expired wall-clock deadline (or its
+/// socket timeout fallback) becomes a distinct [`Error::Timeout`].
+fn classify_setup_error(
+    result: Result<ServerInfo>, config: &ClientConfig, deadline_expired: bool,
+) -> Result<ServerInfo> {
+    match result {
+        _ if deadline_expired => Err(Error::Timeout(format!(
+            "connection setup to {} did not complete within {:?}",
+            config.addr(),
+            config.connect_timeout
+        ))),
+        Err(Error::Io(ref e)) if is_socket_timeout(e) => Err(Error::Timeout(format!(
+            "connection setup to {} did not complete within {:?}",
+            config.addr(),
+            config.connect_timeout
+        ))),
+        other => other,
+    }
+}
+
+/// Wall-clock guard for blocking sync setup. Socket timeouts alone reset on
+/// every read/write and can be defeated by a peer that drip-feeds bytes. The
+/// watchdog shuts down a cloned socket at the absolute deadline, interrupting
+/// TLS/native handshake I/O. It is disarmed and joined before a client escapes.
+struct SetupWatchdog {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
+    budget: Duration,
+}
+
+impl SetupWatchdog {
+    fn start(tcp: &TcpStream, budget: Duration) -> Result<Self> {
+        let tcp = tcp.try_clone()?;
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let expired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expired_in_thread = expired.clone();
+        let join = std::thread::Builder::new()
+            .name("st-clickhouse-connect-timeout".into())
+            .spawn(move || {
+                if matches!(
+                    stopped.recv_timeout(budget),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    expired_in_thread.store(true, std::sync::atomic::Ordering::Release);
+                    let _ = tcp.shutdown(std::net::Shutdown::Both);
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            join: Some(join),
+            expired,
+            started: std::time::Instant::now(),
+            budget,
+        })
+    }
+
+    fn finish(mut self) -> bool {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        self.expired.load(std::sync::atomic::Ordering::Acquire)
+            || self.started.elapsed() >= self.budget
+    }
+}
+
+impl Drop for SetupWatchdog {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
 
 /// A synchronous ClickHouse native protocol client.
 ///
@@ -101,20 +203,67 @@ impl SyncClient {
 
     /// Connect to a ClickHouse server using a full [`ClientConfig`].
     ///
-    /// Handles handshake, addendum, ping/pong, and sets read timeout
-    /// from `config.query_timeout`.
+    /// Resolves `config.addr()` and tries every socket address in order. Each
+    /// address gets one wall-clock `config.connect_timeout` budget shared by
+    /// TCP establishment and subsequent TLS/native setup. Transient TCP/setup
+    /// I/O and timeout failures move to the next address; deterministic setup
+    /// errors surface immediately. See [`SyncClient::connect_stream`]. A
+    /// `connect_timeout` of [`Duration::ZERO`](std::time::Duration::ZERO) is
+    /// rejected with [`Error::Config`].
+    ///
+    /// On success the connection is left in normal query mode: the socket read
+    /// timeout is `config.query_timeout` and the write timeout is unset.
     pub fn connect_with_config(config: ClientConfig) -> Result<Self> {
         revision::validate_supported_revision(config.client_revision).map_err(Error::Protocol)?;
+        validate_connect_timeout(&config)?;
 
-        // Native connect() produces a clean blocking socket with no
-        // non-blocking flags left over from connect_timeout.
-        let addr = config
-            .addr()
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| Error::Protocol("no address resolved".into()))?;
-        let stream = TcpStream::connect(addr)?;
-        Self::connect_stream(stream, config)
+        let timeout = config.connect_timeout;
+        let mut last_err = None;
+        // Collect first: `ToSocketAddrs` resolves lazily and each `next()` can
+        // touch the resolver, which must not happen inside the loop.
+        let addrs: Vec<std::net::SocketAddr> = config.addr().to_socket_addrs()?.collect();
+        if addrs.is_empty() {
+            return Err(Error::Protocol("no address resolved".into()));
+        }
+        for addr in addrs {
+            let attempt_started = std::time::Instant::now();
+            // `connect_timeout` returns a plain blocking socket — no
+            // non-blocking flags left over from the timed connect.
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(stream) => {
+                    let Some(setup_budget) = timeout.checked_sub(attempt_started.elapsed()) else {
+                        last_err = Some(Error::Timeout(format!(
+                            "connect to {addr} timed out after {timeout:?}"
+                        )));
+                        continue;
+                    };
+                    if setup_budget.is_zero() {
+                        last_err = Some(Error::Timeout(format!(
+                            "connect to {addr} timed out after {timeout:?}"
+                        )));
+                        continue;
+                    }
+                    let transport = crate::sync::transport::Transport::new_plain(stream);
+                    match Self::connect_transport_with_budget(
+                        transport,
+                        config.clone(),
+                        setup_budget,
+                    ) {
+                        Ok(client) => return Ok(client),
+                        Err(e @ (Error::Io(_) | Error::Timeout(_))) => last_err = Some(e),
+                        Err(e) => return Err(e),
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(if is_socket_timeout(&e) {
+                        Error::Timeout(format!("TCP connect to {addr} timed out after {timeout:?}"))
+                    } else {
+                        Error::Io(e)
+                    });
+                },
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Protocol("no address resolved".into())))
     }
 
     /// Connect to a ClickHouse server at `host:port`.
@@ -157,6 +306,21 @@ impl SyncClient {
         SyncClient::connect_with_config(config)
     }
 
+    /// Complete the connection setup over an already-established TCP stream.
+    ///
+    /// The stream must be a fresh blocking socket to a ClickHouse native
+    /// endpoint — nothing may have been written to or read from it yet
+    /// (`TCP_NODELAY` is set here). The whole setup phase — optional TLS
+    /// handshake, native protocol handshake, and the handshake addendum — is
+    /// bounded by one absolute `config.connect_timeout` deadline. A watchdog
+    /// interrupts the socket at that deadline (temporary socket timeouts are a
+    /// fallback), so even a byte-dripping peer cannot extend setup. On success,
+    /// the normal query read timeout (`config.query_timeout`) is restored and
+    /// writes are unbounded.
+    ///
+    /// Setup expiry surfaces as [`Error::Timeout`]; a `connect_timeout` of
+    /// [`Duration::ZERO`](std::time::Duration::ZERO) is rejected up front with
+    /// [`Error::Config`].
     pub fn connect_stream(stream: TcpStream, config: ClientConfig) -> Result<Self> {
         let transport = crate::sync::transport::Transport::new_plain(stream);
         Self::connect_transport(transport, config)
@@ -166,8 +330,29 @@ impl SyncClient {
     fn connect_transport(
         transport: crate::sync::transport::Transport, config: ClientConfig,
     ) -> Result<Self> {
+        validate_connect_timeout(&config)?;
+        let budget = config.connect_timeout;
+        Self::connect_transport_with_budget(transport, config, budget)
+    }
+
+    /// Complete setup within one absolute wall-clock budget.
+    fn connect_transport_with_budget(
+        transport: crate::sync::transport::Transport, config: ClientConfig, budget: Duration,
+    ) -> Result<Self> {
+        validate_connect_timeout(&config)?;
+        if budget.is_zero() {
+            return Err(Error::Timeout(format!(
+                "connection setup to {} had no remaining connect timeout",
+                config.addr()
+            )));
+        }
         transport.set_nodelay(true)?;
-        let _ = transport.set_read_timeout(Some(config.query_timeout));
+        // Socket deadlines are a fallback for platforms where shutdown does
+        // not promptly interrupt a blocking syscall. The watchdog below owns
+        // the absolute wall-clock deadline and defeats byte-drip peers.
+        transport.set_read_timeout(Some(budget))?;
+        transport.set_write_timeout(Some(budget))?;
+        let watchdog = SetupWatchdog::start(transport.raw_tcp(), budget)?;
 
         #[cfg(feature = "tls")]
         let mut transport = if let Some(ref tls_config) = config.tls_config {
@@ -187,10 +372,41 @@ impl SyncClient {
         #[cfg(not(feature = "tls"))]
         let mut transport = transport;
 
-        let mut server_info = handshake::handshake(&mut transport, &config)?;
+        let setup = Self::handshake_and_negotiate(&mut transport, &config);
+        let deadline_expired = watchdog.finish();
+        let setup = classify_setup_error(setup, &config, deadline_expired);
+
+        // Back to normal query semantics. A successful setup is not allowed to
+        // escape with stale setup deadlines if either restoration fails.
+        if setup.is_ok() {
+            transport.set_read_timeout(Some(config.query_timeout))?;
+            transport.set_write_timeout(None)?;
+        } else {
+            // The failed socket is discarded; restoration is best effort only.
+            let _ = transport.set_read_timeout(Some(config.query_timeout));
+            let _ = transport.set_write_timeout(None);
+        }
+        let server_info = setup?;
+
+        let query_template = build_query_packet_template(&config, server_info.negotiated_revision);
+
+        Ok(SyncClient {
+            stream: transport,
+            server_info,
+            config,
+            query_template,
+            schema_cache: HashMap::new(),
+        })
+    }
+
+    /// Native handshake plus handshake addendum over an established transport.
+    fn handshake_and_negotiate(
+        transport: &mut crate::sync::transport::Transport, config: &ClientConfig,
+    ) -> Result<ServerInfo> {
+        let mut server_info = handshake::handshake(transport, config)?;
 
         if server_info.negotiated_revision >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM {
-            let chunked = negotiate_chunked_transport(&server_info, &config)?;
+            let chunked = negotiate_chunked_transport(&server_info, config)?;
             server_info.use_chunked_send = chunked.send_chunked;
             server_info.use_chunked_recv = chunked.recv_chunked;
             let mut buf = Vec::new();
@@ -209,16 +425,7 @@ impl SyncClient {
             transport.write_all(&buf)?;
             transport.flush()?;
         }
-
-        let query_template = build_query_packet_template(&config, server_info.negotiated_revision);
-
-        Ok(SyncClient {
-            stream: transport,
-            server_info,
-            config,
-            query_template,
-            schema_cache: HashMap::new(),
-        })
+        Ok(server_info)
     }
 
     // ── Builder methods ──

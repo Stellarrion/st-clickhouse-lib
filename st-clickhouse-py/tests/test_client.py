@@ -142,6 +142,55 @@ class TestConnection:
         with pytest.raises(AuthenticationError):
             connect(docker_ch, user=CLICKHOUSE_USER, password="wrong_password")
 
+    def test_connect_timeout_silent_server_raises_timeout_error(self):
+        """A server that accepts TCP but never answers must raise
+        st_clickhouse.TimeoutError (and the builtin TimeoutError) within the
+        configured connect_timeout — not hang until query_timeout."""
+        import socket
+        import threading
+        import time
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        held: list[socket.socket] = []
+
+        def accept_and_stay_silent() -> None:
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                held.append(conn)  # accept, never write, never close
+
+        acceptor = threading.Thread(target=accept_and_stay_silent, daemon=True)
+        acceptor.start()
+
+        start = time.monotonic()
+        with pytest.raises(ch.TimeoutError) as excinfo:
+            connect(
+                f"127.0.0.1:{port}",
+                connect_timeout=0.5,
+                query_timeout=60.0,
+            )
+        elapsed = time.monotonic() - start
+
+        # High-level error is the specific st_clickhouse.TimeoutError, not a
+        # generic ClickHouseError (the native layer raised the builtin
+        # TimeoutError; map_error must translate it).
+        assert type(excinfo.value) is ch.TimeoutError, type(excinfo.value)
+        assert "did not complete" in str(excinfo.value)
+        # Generous upper bound: far below the 60 s query timeout.
+        assert elapsed < 30.0, f"connect timeout fired too late: {elapsed:.1f}s"
+        listener.close()
+
+    def test_connect_timeout_zero_is_config_error(self):
+        """Duration.ZERO cannot mean "no deadline" — it must be rejected."""
+        with pytest.raises(ch.ConfigError):
+            connect("127.0.0.1:9000", connect_timeout=0.0)
+
     def test_context_manager(self, docker_ch: str):
         """Client works as a context manager."""
         with connect(docker_ch, user=CLICKHOUSE_USER, password=CLICKHOUSE_PASS) as c:
@@ -176,6 +225,38 @@ class TestConnection:
         )
         assert c.ping()
         c.close()
+
+
+class TestErrorMapping:
+    """Native-to-Python error translation for the new timeout/config errors."""
+
+    def test_native_builtin_timeout_maps_to_st_timeout(self):
+        from st_clickhouse._errors import map_error
+
+        native = TimeoutError("ClickHouse timeout: connection setup stalled")
+        mapped = map_error(native)
+        assert type(mapped) is ch.TimeoutError
+        assert isinstance(mapped, ClickHouseError)  # still part of the hierarchy
+
+    def test_native_config_error_maps_to_config_error(self):
+        from st_clickhouse._errors import map_error
+
+        native = ValueError(
+            "ClickHouse configuration error: connect_timeout must be greater than zero"
+        )
+        mapped = map_error(native)
+        assert type(mapped) is ch.ConfigError
+
+    def test_builtin_timeout_wins_over_word_heuristics(self):
+        from st_clickhouse._errors import map_error
+
+        # A timeout message containing "connection" must stay a TimeoutError
+        # instead of falling through to the connection-word heuristic.
+        native = TimeoutError(
+            "connect to 127.0.0.1:9000 (TCP + TLS + handshake + ping) timed out"
+        )
+        mapped = map_error(native)
+        assert type(mapped) is ch.TimeoutError
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -23,6 +23,10 @@ pub enum Error {
         /// Root message plus any nested exception chain.
         message: String,
     },
+    /// Operation timed out (TCP connect or connection setup deadline).
+    Timeout(String),
+    /// Invalid client configuration (e.g. a zero `connect_timeout`).
+    Config(String),
 }
 
 impl fmt::Display for Error {
@@ -37,6 +41,8 @@ impl fmt::Display for Error {
                 name,
                 message,
             } => write!(f, "server error (code={code}, name={name}): {message}"),
+            Error::Timeout(msg) => write!(f, "timeout: {msg}"),
+            Error::Config(msg) => write!(f, "configuration error: {msg}"),
         }
     }
 }
@@ -61,11 +67,37 @@ impl Error {
     pub fn is_server_error(&self) -> bool {
         matches!(self, Error::ServerError { .. })
     }
+
+    /// Returns `true` if a configured deadline expired (connect/setup).
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Timeout(_))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_display_and_predicate() {
+        let err = Error::Timeout("connect to 127.0.0.1:9000 timed out".into());
+        assert!(err.is_timeout());
+        assert!(!err.is_server_error());
+        assert_eq!(
+            err.to_string(),
+            "timeout: connect to 127.0.0.1:9000 timed out"
+        );
+    }
+
+    #[test]
+    fn config_display_is_distinct_from_protocol() {
+        let err = Error::Config("connect_timeout must be greater than zero".into());
+        assert!(!err.is_timeout());
+        assert_eq!(
+            err.to_string(),
+            "configuration error: connect_timeout must be greater than zero"
+        );
+    }
 
     #[test]
     fn server_error_display_includes_code_name_and_message() {

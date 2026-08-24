@@ -62,7 +62,22 @@ impl Client {
         self
     }
 
-    /// Set connect timeout.
+    /// Set the connect timeout for every new pooled connection.
+    ///
+    /// Each per-address connect attempt — TCP establishment, TLS handshake,
+    /// native handshake, addendum, and the connect-time Ping — must complete
+    /// within `t`; expiry returns
+    /// [`Error::Timeout`](crate::error::Error::Timeout) naming the address and
+    /// the budget, and the address is recorded as failed for failover and the
+    /// circuit breaker exactly like any other connect error. New connections
+    /// and reconnects read the current value at connect time; existing healthy
+    /// connections are not dropped. DNS resolution is not bounded by `t`.
+    ///
+    /// `Duration::ZERO` is rejected with
+    /// [`Error::Config`](crate::error::Error::Config) at connect time. This
+    /// timeout is independent of
+    /// [`with_acquire_timeout`](Self::with_acquire_timeout), which bounds only
+    /// the wait for a free pool slot.
     pub fn with_connect_timeout(mut self, t: Duration) -> Self {
         self.connect_timeout = t;
         self.pool.set_connect_timeout(t);
