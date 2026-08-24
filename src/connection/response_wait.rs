@@ -24,17 +24,17 @@ pub(super) async fn read_table_structure(
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
                         if deadline.is_some() {
-                            cancel_and_drain(stream, timeout, response_compressed).await?;
+                            let _ = cancel_and_drain(stream, timeout, response_compressed).await;
                             return Err(Error::Timeout("query exceeded deadline".into()));
                         }
-                        return Err(Error::Protocol(
-                            "timeout waiting for INSERT table structure".into(),
+                        return Err(Error::Timeout(
+                            "receive timeout waiting for INSERT table structure".into(),
                         ));
                     },
                 }
             },
             None => {
-                cancel_and_drain(stream, timeout, response_compressed).await?;
+                let _ = cancel_and_drain(stream, timeout, response_compressed).await;
                 return Err(Error::Timeout("query exceeded deadline".into()));
             },
         };
@@ -85,15 +85,17 @@ pub(super) async fn drain_response(
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
                         if deadline.is_some() {
-                            cancel_and_drain(stream, timeout, response_compressed).await?;
+                            let _ = cancel_and_drain(stream, timeout, response_compressed).await;
                             return Err(Error::Timeout("query exceeded deadline".into()));
                         }
-                        return Ok(()); // recv_timeout floor, no deadline: unchanged
+                        return Err(Error::Timeout(
+                            "receive timeout while draining query response".into(),
+                        ));
                     },
                 }
             },
             None => {
-                cancel_and_drain(stream, timeout, response_compressed).await?;
+                let _ = cancel_and_drain(stream, timeout, response_compressed).await;
                 return Err(Error::Timeout("query exceeded deadline".into()));
             },
         };
@@ -209,9 +211,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_and_drain_stays_best_effort_on_exception() {
-        // The cancellation drain must keep swallowing exceptions: it runs
-        // after a deadline trip where the Timeout error is already decided.
+    async fn cancel_and_drain_accepts_terminal_exception() {
+        // A server exception is a terminal response to cancellation and is
+        // considered a clean end of the drain.
         let mut payload = exception_packet(159, "DB::Exception", "cancelled");
         payload.push(5); // EndOfStream
         let mut stream = stream_with_payload(payload).await;
@@ -221,6 +223,6 @@ mod tests {
             false,
         )
         .await
-        .expect("best-effort cancellation drain returns Ok on exception");
+        .expect("terminal cancellation exception drains cleanly");
     }
 }

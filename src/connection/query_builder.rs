@@ -8,7 +8,8 @@ use crate::connection::query_packet::{
 use crate::connection::query_result::QueryResult;
 use crate::connection::row_stream_reader::read_query_blocks;
 use crate::connection::select_response::{
-    AllRowsHandler, FirstBlockHandler, RawBlocksHandler, RowCountHandler, read_select_response,
+    AllRowsHandler, BlocksHandler, FirstBlockHandler, RawBlocksHandler, RowCountHandler,
+    read_select_response,
 };
 use crate::connection::server_packets::write_ignored_part_uuids_if_any;
 use crate::connection::tcp::Client;
@@ -72,7 +73,8 @@ impl<'a> QueryBuilder<'a> {
     /// - `fetch::<MyRow>()` for exactly one row
     /// - `fetch::<Option<MyRow>>()` for zero or one row
     /// - `fetch::<Scalar<u64>>()` for one scalar value
-    /// - `fetch::<Block>()` for the first data block
+    /// - `fetch::<Block>()` for the single data block (errors on multi-block
+    ///   results; see [`QueryBuilder::block`])
     /// - `fetch::<RawBlocks>()` for native block payloads
     /// - `fetch::<RowCount>()` for count-only scans
     pub async fn fetch<T: QueryResult>(self) -> Result<T> {
@@ -310,11 +312,25 @@ impl<'a> QueryBuilder<'a> {
         }
     }
 
-    /// Fetch the first result block with retries on retryable errors.
-    /// Reads until EoS on `stream_mut()` — connection stays clean.
+    /// Fetch the single result block with retries on retryable errors.
+    ///
+    /// Exact-one-block semantics: returns the query's one non-empty data
+    /// block. If a second non-empty block arrives, the full response is still
+    /// read (the connection stays clean) but an error is returned — extra rows
+    /// are never silently discarded. Use [`QueryBuilder::blocks`] for
+    /// multi-block results.
     pub async fn block(self) -> Result<Block> {
         let deadline = self.effective_deadline();
         self.retry(deadline, |dl| self._try_block(dl)).await
+    }
+
+    /// Fetch all non-empty result blocks, preserving block boundaries.
+    ///
+    /// Reads until EoS with retries on retryable errors; each returned
+    /// [`Block`] keeps the server's own block split (e.g. `max_block_size`).
+    pub async fn blocks(self) -> Result<Vec<Block>> {
+        let deadline = self.effective_deadline();
+        self.retry(deadline, |dl| self._try_blocks(dl)).await
     }
 
     /// Internal block read — called in retry loop.
@@ -335,10 +351,33 @@ impl<'a> QueryBuilder<'a> {
         result
     }
 
+    /// Internal multi-block read — called in retry loop.
+    async fn _try_blocks(
+        &self, deadline: Option<crate::runtime::time::Instant>,
+    ) -> Result<Vec<Block>> {
+        let (mut guard, response_compressed) = self
+            .send_select_query(QuerySettingsMode::Materialized)
+            .await?;
+        let result = read_select_response(
+            guard.stream_mut(),
+            self.client.recv_timeout,
+            deadline,
+            response_compressed,
+            &self.callbacks,
+            BlocksHandler::default(),
+        )
+        .await;
+        guard.invalidate_on_err(&result);
+        result
+    }
+
     /// Stream rows via a background task that owns the TcpStream.
+    ///
+    /// The background reader honors the compression negotiated for this query
+    /// (client-level or [`QueryBuilder::with_compression`]).
     pub async fn rows<T: crate::row::Row>(self) -> Result<crate::cursor::RowCursor<T>> {
         let metric_guard = QueryMetricGuard::new(self.client.metrics(), 1);
-        let (mut guard, _) = self
+        let (mut guard, response_compressed) = self
             .send_select_query(QuerySettingsMode::Materialized)
             .await?;
 
@@ -375,6 +414,7 @@ impl<'a> QueryBuilder<'a> {
                 Some(&cancel_clone),
                 recv_timeout,
                 deadline,
+                response_compressed,
             )
             .await
             {

@@ -7,8 +7,9 @@ All notable changes to st-clickhouse are documented here.
 ### Added
 - **Query timeout**: opt-in hard wall-clock deadline via `Client::with_query_timeout(d)`
   and per-query `QueryBuilder::timeout(d)`. On expiry the query is cancelled server-side
-  (`Cancel` packet) and the pooled connection is drained and reused. Default `None` —
-  no behaviour change for existing users. Async client only; sync core already
+  (`Cancel` packet); the connection is discarded after a timeout so a partial
+  response can never return to the pool. Default `None` — no behaviour change for
+  queries that finish within their deadline. Async client only; sync core already
   supported `query_timeout`.
 - **Pool acquire timeout**: bound the wait for a free pool slot via
   `Client::with_acquire_timeout(d)` / `ClientBuilder::acquire_timeout(d)` / URL
@@ -23,6 +24,8 @@ All notable changes to st-clickhouse are documented here.
   generation so pooled connections reconnect carrying the new key. Note: URL
   `?quota_key=` is now the protocol ClientInfo field (previously it fell through
   to the ClickHouse `settings` map).
+- `QueryBuilder::blocks()` returns every non-empty result block while preserving
+  server block boundaries and moving, rather than copying, column payloads.
 
 ### Changed (BREAKING)
 - `PlainColumnData::read_from_bytes` now returns `Result<Self>` and rejects a logical
@@ -30,6 +33,9 @@ All notable changes to st-clickhouse are documented here.
   soundness hole that could lead to an out-of-bounds unsafe read.
 - Async `execute()` and `InsertSession::end()` now return ClickHouse server exceptions
   instead of reporting silent success.
+- `.block()` and `fetch::<Block>()` now require exactly one non-empty server block and
+  return an error on multi-block results instead of silently dropping later rows. Use
+  `.blocks()` when the result can span blocks.
 
 ### Fixed
 - Derived rows map fields by column name even when the SELECT order differs, while
@@ -41,6 +47,16 @@ All notable changes to st-clickhouse are documented here.
   of panicking or silently discarding high bits.
 - Malformed LowCardinality dictionaries and indexes now return protocol errors instead
   of panicking, allocating from unchecked counts, or zero-filling invalid entries.
+- `rows()` and `begin_select()` now decode LZ4/Zstd Data and ProfileEvents blocks using
+  the query's negotiated compression mode; compressed streams no longer lose rows or
+  fail as uncompressed input.
+- Dropping or explicitly cancelling a `BlockStream` discards its socket when a clean
+  asynchronous drain is not possible, preventing TLS framing violations and pooled
+  connection desynchronization.
+- Protocol/decode errors are no longer retried as if transient, and timed-out sockets
+  are always removed from the pool before a later query can reuse partial responses.
+- Dropping an unfinished `InsertSession` closes its socket instead of returning a
+  connection that is still waiting for INSERT data to the pool.
 
 ## [0.2.0] — 2026-06-21
 

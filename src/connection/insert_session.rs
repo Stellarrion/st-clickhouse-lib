@@ -56,8 +56,10 @@ impl Client {
         let deadline = self
             .query_timeout
             .map(|t| crate::runtime::time::Instant::now() + t);
-        let block =
-            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await?;
+        let block_result =
+            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await;
+        guard.invalidate_on_err(&block_result);
+        let block = block_result?;
         metric_guard.succeed();
         Ok(InsertSession {
             guard,
@@ -69,6 +71,17 @@ impl Client {
             table_name: table.to_owned(),
             schema,
         })
+    }
+}
+
+impl Drop for InsertSession<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            // Async cleanup is impossible in Drop. Closing the socket aborts
+            // the unfinished INSERT and prevents its pending protocol state
+            // from being handed to the next pool user.
+            let _ = self.guard.take_stream();
+        }
     }
 }
 
@@ -101,7 +114,6 @@ impl InsertSession<'_> {
     }
 
     pub async fn end(mut self) -> Result<()> {
-        self.active = false;
         use crate::protocol::block_writer;
         let stream = self.guard.stream_mut();
         let empty = Block {
@@ -119,12 +131,17 @@ impl InsertSession<'_> {
         }
         stream.write_packet(&buf).await?;
         stream.flush().await?;
-        drain_response(
+        let result = drain_response(
             stream,
             self.recv_timeout,
             compression_flag(self.compression) == 1,
             self.deadline,
         )
-        .await
+        .await;
+        if result.is_ok() {
+            self.active = false;
+        }
+        self.guard.invalidate_on_err(&result);
+        result
     }
 }

@@ -44,10 +44,17 @@ use st_clickhouse::connection::{QueryResult, RowCount, Scalar};
 
 let client = Client::connect("127.0.0.1:9000").await?;
 
-// Block — zero-copy columnar slices, 60M+ rows/s
-let block = client.query("SELECT number FROM system.numbers LIMIT 100000")
-    .fetch::<st_clickhouse::protocol::block::Block>().await?;
-let nums: &[u64] = block.column::<u64>("number")?;
+// Blocks — all server blocks, preserving zero-copy columnar payloads
+let blocks = client
+    .query("SELECT number FROM system.numbers LIMIT 100000")
+    .blocks()
+    .await?;
+for block in &blocks {
+    let nums = block.column::<u64>("number")?;
+    if let Some(slice) = nums.as_slice() {
+        println!("received {} values", slice.len());
+    }
+}
 
 // Vec — owned rows, ergonomic
 let rows: Vec<(u64, String)> = client
@@ -160,16 +167,18 @@ client.close()
 
 | Method | Returns | Rows/s (1M rows) | Memory | Best For |
 |--------|---------|-----------------|--------|----------|
-| `.block()` | `Block` | 60M+ | Zero-copy (borrowed) | Columnar analytics, 60M+ rows/s |
+| `.block()` | `Block` | 60M+ | Zero-copy (borrowed) | Results guaranteed to contain exactly one server block |
+| `.blocks()` | `Vec<Block>` | 60M+ | Zero-copy payloads | Multi-block columnar results without dropped rows |
 | `.all::<T>()` | `Vec<T>` | 20M+ | Owned rows | Small results, ergonomic access |
 | `.rows::<T>()` | `RowCursor<T>` | 10M+ | Streaming | Large results, low memory |
 | `.execute(sql)` | `()` | N/A | N/A | DDL, INSERT (no return data) |
 
 **Rule of thumb:**
 - **Result < 10K rows** → `.all::<T>()` — ergonomic, no borrow lifetime issues
-- **Result 10K–1M rows** → `.block()` — columnar zero-copy, fastest path
+- **Result 10K–1M rows** → `.blocks()` — all columnar blocks, fastest materialized path
 - **Result > 1M rows** → `.rows::<T>()` — streaming, constant memory
-- **Need column slices** → `.block()` + `block.column::<T>("name")`
+- **Need one known server block** → `.block()` — errors rather than truncating if another block arrives
+- **Need column slices** → iterate `.blocks()` and call `block.column::<T>("name")`
 - **Need owned rows** → `.all::<(u64, String)>()`
 
 ### Python

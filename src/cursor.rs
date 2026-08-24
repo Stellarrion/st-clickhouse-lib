@@ -2,7 +2,7 @@
 //!
 //! Receives blocks from a channel (fed by a background task). Each call to
 //! `next()` constructs an owned row. For zero-allocation access, use the
-//! columnar API on individual blocks (`.block()` + `block.column::<T>()`).
+//! columnar API on individual blocks (`.blocks()` + `block.column::<T>()`).
 
 use crate::error::Result;
 use crate::protocol::block::Block;

@@ -68,9 +68,20 @@ impl<'a> QueryBuilder<'a> {
             .await
     }
 
-    /// Execute a SELECT query and return the first data block.
+    /// Execute a SELECT that must return exactly one non-empty data block.
     ///
+    /// Returns an error instead of silently dropping rows if the server emits
+    /// more than one block. Use [`blocks`](Self::blocks) for general results.
     pub async fn block(self) -> Result<Block> {
+        self.into_connection_query().block().await
+    }
+
+    /// Execute a SELECT and return every non-empty server block.
+    pub async fn blocks(self) -> Result<Vec<Block>> {
+        self.into_connection_query().blocks().await
+    }
+
+    fn into_connection_query(self) -> crate::connection::QueryBuilder<'a> {
         let mut query = self.client.query(&self.sql);
         for param in self.params {
             query = match param.value {
@@ -78,7 +89,7 @@ impl<'a> QueryBuilder<'a> {
                 None => query.bind_null(param.name),
             };
         }
-        query.block().await
+        query
     }
 }
 

@@ -90,24 +90,22 @@ impl Error {
         )
     }
 
-    /// Returns `true` if the error means the socket is broken and the
-    /// connection must not be reused (forced close or I/O failure).
+    /// Returns `true` if the socket must not be reused.
     ///
-    /// Excludes query timeouts: a query deadline cancels+drains server-side and
-    /// returns the connection to the pool still usable.
+    /// Query timeouts are connection-fatal too: cancellation is bounded and a
+    /// partially drained response must never return to the pool.
     pub fn is_broken_connection(&self) -> bool {
-        matches!(self, Error::ConnectionClosed(_) | Error::Io(_))
+        matches!(
+            self,
+            Error::ConnectionClosed(_) | Error::Io(_) | Error::Timeout(_)
+        )
     }
 
     /// Returns `true` if the error is retryable (connection issues, timeouts).
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Error::Io(_)
-                | Error::Timeout(_)
-                | Error::ConnectionClosed(_)
-                | Error::Protocol(_)
-                | Error::PoolTimeout(_)
+            Error::Io(_) | Error::Timeout(_) | Error::ConnectionClosed(_) | Error::PoolTimeout(_)
         )
     }
 }
@@ -130,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn broken_connection_is_io_or_closed_not_timeout() {
+    fn broken_connection_includes_timeouts() {
         assert!(
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
@@ -139,8 +137,7 @@ mod tests {
             .is_broken_connection()
         );
         assert!(Error::ConnectionClosed("server closed".into()).is_broken_connection());
-        // A query timeout cancels+drains and leaves the connection usable.
-        assert!(!Error::Timeout("query exceeded deadline".into()).is_broken_connection());
+        assert!(Error::Timeout("query exceeded deadline".into()).is_broken_connection());
     }
 
     #[test]
@@ -148,6 +145,11 @@ mod tests {
         let e = Error::PoolTimeout("no slot".into());
         assert!(e.is_retryable(), "PoolTimeout must stay retryable");
         assert!(!e.is_timeout(), "PoolTimeout must NOT match is_timeout");
+    }
+
+    #[test]
+    fn protocol_errors_are_not_retried() {
+        assert!(!Error::Protocol("deterministic decode failure".into()).is_retryable());
     }
 
     #[test]

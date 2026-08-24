@@ -84,8 +84,10 @@ impl<T> std::ops::Deref for Scalar<T> {
 
 /// Result type accepted by [`QueryBuilder::fetch`].
 ///
-/// Implemented for [`Block`], `Vec<T>`, `T`, `Option<T>`, [`Scalar<T>`],
-/// [`RawBlocks`], and [`RowCount`].
+/// Implemented for [`Block`] (exact-one-block semantics — errors on
+/// multi-block results), `Vec<T>`, `T`, `Option<T>`, [`Scalar<T>`],
+/// [`RawBlocks`], and [`RowCount`]. Use `QueryBuilder::blocks()` for all
+/// result blocks.
 #[allow(async_fn_in_trait)]
 pub trait QueryResult: Sized {
     async fn fetch_from(query: QueryBuilder<'_>) -> Result<Self>;
@@ -93,6 +95,8 @@ pub trait QueryResult: Sized {
 
 impl QueryResult for Block {
     async fn fetch_from(query: QueryBuilder<'_>) -> Result<Self> {
+        // Exact-one-block semantics: errors when the query returns multiple
+        // non-empty blocks (never silently truncates).
         query.block().await
     }
 }

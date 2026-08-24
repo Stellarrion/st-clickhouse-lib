@@ -968,3 +968,34 @@ async fn test_insert_after_clear() {
 
     eprintln!("SUCCESS: test_insert_after_clear");
 }
+
+#[tokio::test]
+async fn dropping_active_insert_session_does_not_poison_pool() {
+    let client = common::connect_client_pool(1).await;
+    client
+        .execute("DROP TABLE IF EXISTS st_drop_active_insert")
+        .await
+        .expect("drop stale table");
+    client
+        .execute("CREATE TABLE st_drop_active_insert (id UInt64) ENGINE = Memory")
+        .await
+        .expect("create table");
+
+    let session = client
+        .begin_insert("st_drop_active_insert")
+        .await
+        .expect("begin insert");
+    drop(session); // must close the mid-INSERT socket instead of pooling it
+
+    let probe: u64 = client
+        .query("SELECT toUInt64(1)")
+        .scalar()
+        .await
+        .expect("pool reconnects after abandoned INSERT");
+    assert_eq!(probe, 1);
+
+    client
+        .execute("DROP TABLE st_drop_active_insert")
+        .await
+        .expect("cleanup table");
+}

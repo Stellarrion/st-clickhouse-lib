@@ -96,12 +96,19 @@ async fn test_array_example() {
     for n in &[1usize, 5, 100] {
         let sql = format!("INSERT INTO test_arr (arr) SELECT range({}) AS arr", n);
         client.execute(&sql).await.expect("test operation failed");
-        let block = client
+        let blocks = client
             .query("SELECT arr FROM test_arr ORDER BY arr")
-            .block()
+            .blocks()
             .await
             .expect("test operation failed");
-        assert!(block.row_count() > 0, "expected rows for n={n}");
+        assert!(
+            blocks
+                .iter()
+                .map(st_clickhouse::Block::row_count)
+                .sum::<usize>()
+                > 0,
+            "expected rows for n={n}"
+        );
     }
 }
 

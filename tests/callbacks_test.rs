@@ -42,22 +42,26 @@ async fn test_progress_callback() {
         on_part_uuids: None,
     };
 
-    let block = client
+    let blocks = client
         .query("SELECT number FROM system.numbers LIMIT 100000")
         .with_callbacks(callbacks)
-        .block()
+        .blocks()
         .await
         .expect("test operation failed");
+    let returned_rows = blocks
+        .iter()
+        .map(st_clickhouse::Block::row_count)
+        .sum::<usize>();
 
     assert!(
         fired.load(Ordering::SeqCst),
         "progress callback should fire"
     );
-    assert!(block.row_count() > 0, "should return rows");
+    assert!(returned_rows > 0, "should return rows");
     eprintln!(
-        "Progress: reported {} rows, block has {} rows",
+        "Progress: reported {} rows, result has {} rows",
         row_count.load(Ordering::SeqCst),
-        block.row_count()
+        returned_rows
     );
 }
 

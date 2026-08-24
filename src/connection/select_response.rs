@@ -61,17 +61,20 @@ pub(super) async fn read_select_response<H: SelectResponseHandler>(
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
                         if deadline.is_some() {
-                            cancel_and_drain(stream, recv_timeout, response_compressed).await?;
+                            let _ =
+                                cancel_and_drain(stream, recv_timeout, response_compressed).await;
                             return Err(crate::error::Error::Timeout(
                                 "query exceeded deadline".into(),
                             ));
                         }
-                        return Err(crate::error::Error::Protocol("timeout".into()));
+                        return Err(crate::error::Error::Timeout(
+                            "receive timeout while reading query response".into(),
+                        ));
                     },
                 }
             },
             None => {
-                cancel_and_drain(stream, recv_timeout, response_compressed).await?;
+                let _ = cancel_and_drain(stream, recv_timeout, response_compressed).await;
                 return Err(crate::error::Error::Timeout(
                     "query exceeded deadline".into(),
                 ));
@@ -115,9 +118,18 @@ pub(super) async fn read_select_response<H: SelectResponseHandler>(
     }
 }
 
+/// Single-block terminal: returns the query's one non-empty Data block.
+///
+/// Exact-one-block semantics: a second non-empty Data block is an error, never
+/// a silent truncation. Once the first block is captured, later Data blocks
+/// are discarded (without materializing their columns) so the response is
+/// still read through EndOfStream and the pooled connection stays clean;
+/// `finish` then surfaces the error. Backs [`QueryBuilder::block`] and
+/// `fetch::<Block>()`.
 #[derive(Default)]
 pub(super) struct FirstBlockHandler {
     first: Option<Block>,
+    extra_blocks: bool,
 }
 
 impl SelectResponseHandler for FirstBlockHandler {
@@ -126,16 +138,57 @@ impl SelectResponseHandler for FirstBlockHandler {
     async fn on_data(
         &mut self, stream: &mut crate::pool::StreamWrapper, response_compressed: bool,
     ) -> Result<()> {
+        if self.first.is_some() {
+            // Keep the stream aligned by consuming (not materializing) the
+            // extra block, then flag it so `finish` errors out.
+            let rows = discard_data_block_maybe_compressed(stream, response_compressed).await?;
+            if rows > 0 {
+                self.extra_blocks = true;
+            }
+            return Ok(());
+        }
         let block = read_data_block_maybe_compressed(stream, response_compressed).await?;
-        if block.row_count() > 0 && self.first.is_none() {
+        if block.row_count() > 0 {
             self.first = Some(block);
         }
         Ok(())
     }
 
     fn finish(self) -> Result<Self::Output> {
+        if self.extra_blocks {
+            return Err(crate::error::Error::Protocol(
+                "query returned multiple non-empty data blocks; use .blocks() to fetch all of them"
+                    .into(),
+            ));
+        }
         self.first
             .ok_or_else(|| crate::error::Error::Protocol("no data blocks".into()))
+    }
+}
+
+/// Multi-block terminal: collects every non-empty Data block, preserving
+/// block boundaries. Column payloads are moved into the `Block` values, not
+/// copied. Backs [`QueryBuilder::blocks`].
+#[derive(Default)]
+pub(super) struct BlocksHandler {
+    blocks: Vec<Block>,
+}
+
+impl SelectResponseHandler for BlocksHandler {
+    type Output = Vec<Block>;
+
+    async fn on_data(
+        &mut self, stream: &mut crate::pool::StreamWrapper, response_compressed: bool,
+    ) -> Result<()> {
+        let block = read_data_block_maybe_compressed(stream, response_compressed).await?;
+        if block.row_count() > 0 {
+            self.blocks.push(block);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self::Output> {
+        Ok(self.blocks)
     }
 }
 
