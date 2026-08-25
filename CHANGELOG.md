@@ -358,6 +358,33 @@ All notable changes to st-clickhouse are documented here.
 - Dropping an unfinished `InsertSession` closes its socket instead of returning a
   connection that is still waiting for INSERT data to the pool.
 
+### Fixed (CI)
+- **The `ci` profile is now passed to nextest as a cargo profile**: the test
+  job ran `cargo nextest run --profile ci`, which selects a *nextest* profile
+  that no `.config/nextest.toml` in the repo defines. It now runs with
+  `--cargo-profile ci`, so the `[profile.ci]` cargo profile from `Cargo.toml`
+  applies while nextest keeps its default profile.
+- **The crates.io wait now tracks the derive crate's real version**: the
+  publish job polled the index for a hardcoded `st-clickhouse-derive =
+  "0.1.0"` while the crate is at 0.2.0, so every release would have timed out
+  after publishing derive. The expected version is now parsed from
+  `derive/Cargo.toml` (pure shell, no new runner dependencies) and the timeout
+  message reports it.
+- **MSRV is now enforced in CI, and the declared MSRV is now true**: a
+  bounded `msrv` job runs `cargo check --workspace --all-features` using the
+  `rust-version` parsed live from `Cargo.toml`, so the check cannot drift from
+  the declaration; `publish-crates` and `build-wheels` depend on it. Enforcing
+  this exposed that 1.85 was never buildable: `src/pool.rs` uses let-chains
+  (stable since Rust 1.88) and `--all-features` enables `bench-clickhouse-rs`,
+  whose `clickhouse` 0.15 dependency requires Rust 1.89. The declared
+  `rust-version` is corrected from 1.85 to 1.89 (also in `fuzz/Cargo.toml`);
+  verified locally: the check passes on 1.89 and fails on 1.85/1.88.
+- **Crate versions are guarded before publishing**: a `version-check` job
+  asserts that `st-clickhouse-lib`, `st-clickhouse-derive`, and
+  `st-clickhouse-py` (both its `Cargo.toml` and `pyproject.toml`) carry the
+  same version, failing fast with a clear message; both release jobs depend
+  on it.
+
 ## [0.2.0] — 2026-06-21
 
 ### Changed (BREAKING)

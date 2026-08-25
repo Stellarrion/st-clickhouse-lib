@@ -5,7 +5,7 @@ resolver = "2"
 # Workspace-level package metadata — inherited by all crates
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["Stellarrion"]
 

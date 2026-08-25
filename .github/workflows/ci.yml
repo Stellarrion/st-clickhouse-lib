@@ -140,7 +140,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Run Rust tests
-        run: cargo nextest run --workspace --exclude st-clickhouse-py --all-features --profile ci
+        run: cargo nextest run --workspace --exclude st-clickhouse-py --all-features --cargo-profile ci
         env:
           CLICKHOUSE_HOST: "127.0.0.1:9000"
           CLICKHOUSE_USER: "default"
@@ -242,11 +242,67 @@ jobs:
       - run: cargo deny check advisories sources licenses
       - run: cargo audit
 
+  # ── MSRV ─────────────────────────────────────────────────────
+  # Checks the rust-version declared in Cargo.toml, so the job cannot drift
+  # from the declaration. Note: the workspace needs >= 1.89 for
+  # --all-features (src/pool.rs uses let-chains, stable since 1.88; the
+  # bench-clickhouse-rs feature pulls clickhouse 0.15, which requires 1.89).
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read declared MSRV from Cargo.toml
+        id: msrv
+        run: |
+          MSRV="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$MSRV" ]; then
+            echo "Failed to parse rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "Declared MSRV: $MSRV"
+          echo "version=$MSRV" >> "$GITHUB_OUTPUT"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --workspace --all-features
+
+  # ── Version consistency ─────────────────────────────────────
+  version-check:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert all crate versions are equal
+        run: |
+          LIB_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          DERIVE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' derive/Cargo.toml | head -n 1)"
+          PY_CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' st-clickhouse-py/Cargo.toml | head -n 1)"
+          PY_PROJECT_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' st-clickhouse-py/pyproject.toml | head -n 1)"
+          if [ -z "$LIB_VERSION" ] || [ -z "$DERIVE_VERSION" ] || [ -z "$PY_CARGO_VERSION" ] || [ -z "$PY_PROJECT_VERSION" ]; then
+            echo "Failed to parse at least one crate version:"
+            echo "  st-clickhouse-lib (Cargo.toml): $LIB_VERSION"
+            echo "  st-clickhouse-derive (derive/Cargo.toml): $DERIVE_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/Cargo.toml): $PY_CARGO_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/pyproject.toml): $PY_PROJECT_VERSION"
+            exit 1
+          fi
+          if [ "$LIB_VERSION" != "$DERIVE_VERSION" ] || [ "$LIB_VERSION" != "$PY_CARGO_VERSION" ] || [ "$LIB_VERSION" != "$PY_PROJECT_VERSION" ]; then
+            echo "Crate versions are inconsistent; refusing to publish:"
+            echo "  st-clickhouse-lib (Cargo.toml): $LIB_VERSION"
+            echo "  st-clickhouse-derive (derive/Cargo.toml): $DERIVE_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/Cargo.toml): $PY_CARGO_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/pyproject.toml): $PY_PROJECT_VERSION"
+            echo "Bump all crates to the same version before tagging a release."
+            exit 1
+          fi
+          echo "All crate versions agree: $LIB_VERSION"
+
   # ── Release (crates.io) ──────────────────────────────────────
   publish-crates:
     name: Release (crates.io)
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, clippy, build, test, python, audit]
+    needs: [fmt, clippy, build, test, python, audit, msrv, version-check]
     runs-on: ubuntu-latest
     environment:
       name: crates-io
@@ -282,13 +338,20 @@ jobs:
         run: cargo publish -p st-clickhouse-derive
       - name: Wait for derive helper in crates.io index
         run: |
+          DERIVE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' derive/Cargo.toml | head -n 1)"
+          if [ -z "$DERIVE_VERSION" ]; then
+            echo "Failed to parse st-clickhouse-derive version from derive/Cargo.toml"
+            exit 1
+          fi
+          echo "Waiting for st-clickhouse-derive $DERIVE_VERSION in the crates.io index"
           for i in $(seq 1 30); do
-            if cargo search st-clickhouse-derive --limit 1 | grep -q '^st-clickhouse-derive = "0.1.0"'; then
+            if cargo search st-clickhouse-derive --limit 1 | grep -q "^st-clickhouse-derive = \"$DERIVE_VERSION\""; then
+              echo "st-clickhouse-derive $DERIVE_VERSION is available in the crates.io index"
               exit 0
             fi
             sleep 10
           done
-          echo "st-clickhouse-derive 0.1.0 did not appear in crates.io index in time"
+          echo "st-clickhouse-derive $DERIVE_VERSION did not appear in the crates.io index in time"
           exit 1
       - name: Publish user-facing crate
         run: cargo publish -p st-clickhouse-lib
@@ -297,7 +360,7 @@ jobs:
   build-wheels:
     name: Build wheels (${{ matrix.os }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, clippy, build, test, python, audit]
+    needs: [fmt, clippy, build, test, python, audit, msrv, version-check]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
