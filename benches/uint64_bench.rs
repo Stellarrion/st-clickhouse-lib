@@ -31,7 +31,7 @@ fn time<F: FnMut()>(label: &str, mut f: F) {
 
 fn main() -> st_clickhouse::Result<()> {
     let buf: Vec<u8> = (0u64..COUNT as u64).flat_map(|v| v.to_le_bytes()).collect();
-    let aligned = (buf.as_ptr() as usize) % 8 == 0;
+    let aligned = (buf.as_ptr() as usize).is_multiple_of(8);
 
     // Decode once: read_column is a zero-copy slice borrow.
     let mut ctx = ReadColumnContext::new(COUNT, &buf);

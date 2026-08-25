@@ -208,34 +208,34 @@ impl<'a> AnyColumnData<'a> {
             Int256 => Int256,
         );
 
-        if tid == TypeId::of::<i8>() {
-            if let Self::Enum(col) = self {
-                let value = *col.values.get(row_index).ok_or_else(|| {
-                    crate::error::Error::Protocol(format!(
-                        "Enum: index {row_index} out of bounds (len {})",
-                        col.values.len()
-                    ))
-                })?;
-                let value = i8::try_from(value).map_err(|_| {
-                    crate::error::Error::Protocol(format!("Enum value {value} does not fit i8"))
-                })?;
-                return unsafe { copy_value_checked::<T, i8>(value) };
-            }
+        if tid == TypeId::of::<i8>()
+            && let Self::Enum(col) = self
+        {
+            let value = *col.values.get(row_index).ok_or_else(|| {
+                crate::error::Error::Protocol(format!(
+                    "Enum: index {row_index} out of bounds (len {})",
+                    col.values.len()
+                ))
+            })?;
+            let value = i8::try_from(value).map_err(|_| {
+                crate::error::Error::Protocol(format!("Enum value {value} does not fit i8"))
+            })?;
+            return unsafe { copy_value_checked::<T, i8>(value) };
         }
 
-        if tid == TypeId::of::<i16>() {
-            if let Self::Enum(col) = self {
-                let value = *col.values.get(row_index).ok_or_else(|| {
-                    crate::error::Error::Protocol(format!(
-                        "Enum: index {row_index} out of bounds (len {})",
-                        col.values.len()
-                    ))
-                })?;
-                let value = i16::try_from(value).map_err(|_| {
-                    crate::error::Error::Protocol(format!("Enum value {value} does not fit i16"))
-                })?;
-                return unsafe { copy_value_checked::<T, i16>(value) };
-            }
+        if tid == TypeId::of::<i16>()
+            && let Self::Enum(col) = self
+        {
+            let value = *col.values.get(row_index).ok_or_else(|| {
+                crate::error::Error::Protocol(format!(
+                    "Enum: index {row_index} out of bounds (len {})",
+                    col.values.len()
+                ))
+            })?;
+            let value = i16::try_from(value).map_err(|_| {
+                crate::error::Error::Protocol(format!("Enum value {value} does not fit i16"))
+            })?;
+            return unsafe { copy_value_checked::<T, i16>(value) };
         }
 
         try_any_typed_columns!(

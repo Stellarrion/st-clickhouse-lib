@@ -829,10 +829,10 @@ async fn read_variant_types_body_raw_recorded<
                 } else {
                     Some(usize::from(discriminator))
                 };
-                if let Some(idx) = idx {
-                    if idx < counts.len() {
-                        counts[idx] += 1;
-                    }
+                if let Some(idx) = idx
+                    && idx < counts.len()
+                {
+                    counts[idx] += 1;
                 }
             }
             for (idx, (type_name, count)) in type_names.iter().zip(counts).enumerate() {

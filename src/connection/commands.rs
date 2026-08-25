@@ -150,13 +150,13 @@ impl Client {
     ///
     /// To stop a query, use one of these instead:
     /// - a query deadline — [`Client::with_query_timeout`] or
-    ///   [`crate::query::QueryBuilder::timeout`] — which cancels server-side
-    ///   and bounds the drain;
+    ///   [`crate::connection::QueryBuilder::timeout`] — which cancels
+    ///   server-side and bounds the drain;
     /// - [`crate::BlockStream::cancel`] on the stream returned by
     ///   [`Client::begin_select`];
     /// - dropping the [`crate::cursor::RowCursor`] returned by
-    ///   [`crate::query::QueryBuilder::rows`] — its detached reader task sends
-    ///   `Cancel` and owns its socket.
+    ///   [`crate::connection::QueryBuilder::rows`] — its detached reader task
+    ///   sends `Cancel` and owns its socket.
     #[deprecated(
         since = "0.2.0",
         note = "Client::cancel cannot reach the connection running the query and always returns Error::Config; use a query timeout, BlockStream::cancel, or drop the RowCursor"

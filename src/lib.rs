@@ -41,6 +41,7 @@ pub mod prelude {
         QualifiedTableName, TableStatus, TablesStatusResponse,
     };
     #[cfg(feature = "tokio")]
+    #[allow(deprecated)] // keep the deprecated shim reachable from the prelude
     pub use crate::query::QueryBuilder;
 
     #[cfg(feature = "derive")]
@@ -70,6 +71,7 @@ pub use protocol::parameters::QueryParameter;
 #[cfg(feature = "tokio")]
 pub use protocol::table_status::{QualifiedTableName, TableStatus, TablesStatusResponse};
 #[cfg(feature = "tokio")]
+#[allow(deprecated)] // keep the deprecated shim importable at the crate root
 pub use query::QueryBuilder;
 
 #[cfg(feature = "derive")]

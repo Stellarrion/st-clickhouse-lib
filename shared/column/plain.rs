@@ -593,7 +593,7 @@ impl<'a, T: PlainColumn + Copy> PlainColumnData<'a, T> {
             return None;
         }
         let ptr = self.buf.as_ptr() as *const T;
-        if (ptr as usize) % align_of::<T>() == 0 {
+        if (ptr as usize).is_multiple_of(align_of::<T>()) {
             // SAFETY: T: PlainColumn guarantees valid bit pattern + no padding.
             // Alignment is verified above. Size is count * size_of::<T>(),
             // proven within buf.len() by the check above.

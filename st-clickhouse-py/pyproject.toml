@@ -3,9 +3,13 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
+# Metadata mirrors st-clickhouse-py/Cargo.toml (name/version/license/description).
+# `version` must stay literal here: .github/workflows/ci.yml (version-check job)
+# parses it with sed and gates releases on Cargo.toml/pyproject.toml agreement.
+# description uses the exact Cargo.toml string to prevent wording drift.
 name = "st-clickhouse-py"
 version = "0.2.0"
-description = "ClickHouse native protocol client — Python bindings"
+description = "Python bindings for st-clickhouse — ClickHouse native protocol"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = "Apache-2.0"

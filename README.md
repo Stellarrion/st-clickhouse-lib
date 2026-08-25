@@ -136,7 +136,8 @@ blocks = client.query_blocks(
     "SELECT number FROM system.numbers LIMIT 100000"
 )
 for block in blocks:
-    col = block.column("number")  # list[int]
+    col = block["number"]         # Column object
+    values = col.to_list()        # list[int]
 
 # Streaming — low memory for large results
 for block in client.query_stream("SELECT number FROM system.numbers"):
@@ -259,18 +260,18 @@ let block: Block = /* ... */;
 let rows = client
     .query("SELECT * FROM ext WHERE id IN (SELECT id FROM external_table)")
     .with_external_table("external_table", block)
-    .fetch_all::<(u64, String)>()
+    .fetch::<Vec<(u64, String)>>()
     .await?;
 
 // ── Query callbacks ──────────────────────────────────────────
-let rows = client
-    .query("SELECT sleep(2)")
+let block = client
+    .query("SELECT number FROM system.numbers LIMIT 10")
     .with_callbacks(QueryCallbacks {
         on_progress: Some(Box::new(|p| println!("Progress: {p:?}"))),
-        on_log: Some(Box::new(|l| println!("Log: {l}"))),
+        on_log: Some(Box::new(|l| println!("Log: {l:?}"))),
         ..Default::default()
     })
-    .execute()
+    .fetch::<Block>()
     .await?;
 
 // ── Batch queries (single round-trip) ────────────────────────
@@ -320,12 +321,11 @@ client = Client(
     user="default",
     password="",
     database="default",
-    compression="lz4",         # "lz4", "zstd", or "none"
-    pool_size=4,
-    connect_timeout=30,
-    recv_timeout=300,
-    send_retries=1,
-    ping_before_query=False,
+    settings={"max_threads": "8"},
+    compression="lz4",          # "lz4", "zstd", or None
+    connect_timeout=30,         # bounds TCP + handshake setup
+    query_timeout=300,          # hard deadline per query (server-side cancel)
+    max_response_size=256 * 1024 * 1024,  # response budget in bytes
     tls=True,
     tls_domain="clickhouse.local",
     tls_ca_file="/etc/ssl/certs/ca.crt",
@@ -355,8 +355,8 @@ rows = client.query(
     params={"id": 42},
 )
 
-# Pool metrics
-metrics = client.metrics
+# Pool metrics (AsyncClient only)
+metrics = async_client.metrics
 # => {pool_slots: 4, pool_in_use: 1, connection_errors: 0, ...}
 
 client.close()
@@ -509,7 +509,7 @@ Top critical risks addressed in v0.1:
 
 ### Key Design Decisions
 
-- **Sync core + async wrapper** — The protocol engine is 100% sync (`std::net::TcpStream`). Tokio async is layered on top via `tokio::task::spawn_blocking` for the I/O thread. This avoids bridging two async runtimes.
+- **Two engines, one wire format** — The async client speaks native tokio I/O directly (`tokio::net::TcpStream`, pool, cancellation-safe futures). The independent sync core (`std::net::TcpStream`) backs the Python bindings; both share the wire codec and column code in `shared/`.
 - **Lockless pool** — Per-slot `tokio::sync::Mutex`, no blocking mutex in async path. Round-robin via `AtomicUsize`.
 - **Zero-copy columns** — `PlainColumnData<T>` provides `&[T]` directly into the decompression buffer when aligned, falling back to `read_unaligned` when misaligned (Nullable mask before data).
 - **DNS rotation** — `resolve_all()` returns every A/AAAA record. Pool rotates through all IPs round-robin. Periodic DNS refresh (300s default) picks up new cluster nodes.
@@ -608,6 +608,10 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 - ✅ **Circuit breaker** — per-address exponential backoff on failure
 - ✅ **Query retry** — configurable retries with exponential backoff + jitter
 - ✅ **Write timeouts** — configurable per-operation timeout
+- ✅ **Query deadlines** — `Client::with_query_timeout` / per-query `QueryBuilder::timeout`; expiry cancels the query server-side and discards the connection
+- ✅ **Pool acquire timeout** — bounded wait for a free pool slot (`Error::PoolTimeout`)
+- ✅ **Response-size budgets** — `max_response_size` caps the bytes retained by accumulating reads; streaming paths stay unbudgeted by design
+- ✅ **Bounded protocol framing** — every server-controlled count/length is validated before it sizes an allocation (hostile-server safe)
 - ✅ **Batch queries** — multiple queries, single round-trip
 - ✅ **Streaming** — `RowCursor` with background I/O prefetch
 - ✅ **INSERT** — native protocol with `FORMAT Native`, streaming insert
@@ -632,7 +636,8 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 - ✅ **Sync + Async** — `Client` (sync) and `AsyncClient` via thread-per-query
 - ✅ **4 output shapes** — `query()` (dicts), `query_tuples()`, `query_columns()`, `query_blocks()`
 - ✅ **Streaming** — `query_stream()` for large results
-- ✅ **TLS** — `tls=True` with CA file, client cert, skip-verify option
+- ✅ **Cancellation that works** — `cancel()` fails closed with guidance; cancelling the awaiting task or abandoning a stream kills the query's connection and the server aborts the query
+- ✅ **TLS** — `tls=True` with CA file and client certificate
 - ✅ **Per-query settings** — `settings={"key": "val"}` overlaid per query, never leaking onto the connection
 - ✅ **Server-side parameters** — `params={"id": 42}`
 - ✅ **Connection pool** — health checks, idle reaper, metrics

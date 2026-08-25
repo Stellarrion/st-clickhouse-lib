@@ -63,8 +63,9 @@ exclude = [
     ".cargo/**",
     ".github/**",
     ".gitignore",
-    "Cargo.toml.orig",
+    "benches/**",
     "deny.toml",
+    "docs/**",
     "fuzz/**",
     "st-clickhouse-py/**",
 ]
@@ -122,7 +123,6 @@ serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 default = ["lz4", "derive", "tokio", "tokio-tls"]
-native = []
 lz4 = ["dep:lz4_flex"]
 zstd = ["dep:zstd"]
 tls = ["dep:rustls", "dep:webpki-roots"]
@@ -136,10 +136,6 @@ tokio-tls = [
 ]
 derive = ["dep:st-clickhouse-derive"]
 bench-clickhouse-rs = ["tokio", "dep:clickhouse", "dep:serde"]
-
-[dev-dependencies]
-futures = "0.3"
-testcontainers = "0.27"
 
 [[bin]]
 name = "column_decode_bench"

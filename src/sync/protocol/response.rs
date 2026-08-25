@@ -886,10 +886,10 @@ fn read_variant_types_body_into<R: Read>(
                 } else {
                     Some(usize::from(discriminator))
                 };
-                if let Some(idx) = idx {
-                    if idx < counts.len() {
-                        counts[idx] += 1;
-                    }
+                if let Some(idx) = idx
+                    && idx < counts.len()
+                {
+                    counts[idx] += 1;
                 }
             }
             read_dynamic_subcolumns_into(reader, type_names, type_states, &counts, data, budget)

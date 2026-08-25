@@ -1,8 +1,6 @@
-[project]
-name = "st-clickhouse-py"
-version = "0.2.0"
-description = "ClickHouse native protocol client — Python bindings"
-requires-python = ">=3.12,<3.15"
+# No [project] metadata here on purpose: the package metadata lives in
+# ../pyproject.toml (mirroring ../Cargo.toml). This file only carries
+# tool configuration for the python/ sources and does not ship in the wheel.
 
 [tool.pyrefly]
 project-includes = [

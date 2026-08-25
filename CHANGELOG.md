@@ -385,6 +385,67 @@ All notable changes to st-clickhouse are documented here.
   same version, failing fast with a clear message; both release jobs depend
   on it.
 
+### Removed
+- **Dead `native` Cargo feature**: `native = []` was referenced by no
+  `cfg(feature = "native")` gate, no CI job, and no documentation (the
+  runtime-free build is `--no-default-features --features lz4,tls`). Removed
+  from `[features]`; every feature combination that built before still builds.
+- **Unused dev-dependencies** `futures` and `testcontainers`: no test, bench,
+  or example imports `futures` (the regular optional dependency `futures-io`
+  is unaffected) and the test suite connects to a fixed local ClickHouse
+  endpoint (`tests/common`), not testcontainers. Both removed from
+  `[dev-dependencies]`; `Cargo.lock` drops their subtrees.
+- **Internal paths no longer ship in the crate tarball**: `docs/**` (internal
+  design plans/specs) and `benches/**` (local benchmark harnesses) are now in
+  `[package] exclude`; the eight `[[bin]]` bench harnesses are local-only and
+  Cargo strips them from the published manifest (`cargo package` verifies
+  cleanly offline). The dead `Cargo.toml.orig` exclude entry (Cargo always
+  includes its own normalized copy) was also removed. `shared/*.rs` remain
+  packaged — both engines `include!` them.
+
+### Deprecated
+- **`st_clickhouse::QueryBuilder` (the `crate::query` shim)**: it duplicates a
+  strict subset of the richer builder returned by `Client::query()`
+  (`st_clickhouse::connection::QueryBuilder`) — settings, compression,
+  callbacks, query IDs, per-query timeouts, external tables, streaming — and
+  its parameterized `execute` is `Client::execute_with_params`. The shim is
+  now `#[deprecated]` (still present and functional; re-exports at the crate
+  root and in the prelude are unchanged) with guidance pointing at
+  `Client::query()` / `Client::execute_with_params`. Two doc-links in
+  `Client::cancel`'s guidance that pointed at the shim's non-existent
+  `timeout`/`rows` methods now point at `connection::QueryBuilder`.
+
+### Fixed (docs and packaging metadata)
+- **README corrected**: the Python `Client(...)` example listed kwargs the
+  constructor never accepted (`pool_size`, `recv_timeout`, `send_retries`,
+  `ping_before_query`) and omitted the real `settings`, `query_timeout`, and
+  `max_response_size`; `client.metrics` was shown on the sync `Client`
+  (it exists only on `AsyncClient`); the block-access example used a
+  non-existent `block.column(name)` (it is `block["name"]` returning a
+  `Column`, convert with `.to_list()`); the Rust examples called
+  non-existent `fetch_all::<T>()` (use `fetch::<Vec<T>>()`) and
+  `QueryBuilder::execute()` after `with_callbacks` (use `fetch::<Block>()`);
+  the architecture section claimed the async engine bridges the sync core via
+  `tokio::task::spawn_blocking` (it speaks tokio I/O directly; the sync core
+  is a separate engine sharing `shared/`); and the Python feature list
+  advertised a TLS skip-verify option that does not exist. Feature lists now
+  mention query deadlines, the pool acquire timeout, response-size budgets,
+  and bounded protocol framing.
+- **Python type stubs match the real surface** (`__init__.pyi`): added the
+  TLS keyword group to `Client.__init__` and `connect()`; added
+  `ssh_signer`/`validate_schema` to `connect_async()`; added
+  `Client.tables_status`/`table_status`, their `AsyncClient` counterparts,
+  and `AsyncClient.metrics`. The fail-closed `cancel()` signatures and the
+  `QueryStream` (`eos`/`finished`/`cancel`/`close`) surface were already
+  correct.
+- **`st-clickhouse-py` metadata de-duplicated**: the root `pyproject.toml`
+  description now uses the exact `Cargo.toml` string (name/version/license
+  already agreed and are kept literal for the CI `version-check` sed), and
+  the nested `python/pyproject.toml` no longer carries a duplicate `[project]`
+  table (tool config only; it never shipped in the wheel — verified with a
+  local `maturin build`, whose wheel metadata reports version 0.2.0 and
+  `License-Expression: Apache-2.0` from the single source).
+
 ## [0.2.0] — 2026-06-21
 
 ### Changed (BREAKING)

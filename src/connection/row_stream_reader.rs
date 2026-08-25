@@ -28,15 +28,15 @@ pub(super) async fn read_query_blocks(
 ) -> Result<()> {
     use crate::connection::io::packet_read_timeout;
     loop {
-        if let Some(c) = cancel {
-            if c.load(std::sync::atomic::Ordering::Relaxed) {
-                stream
-                    .write_packet(&[ClientPacket::Cancel as u8])
-                    .await
-                    .ok();
-                stream.flush().await.ok();
-                return Ok(());
-            }
+        if let Some(c) = cancel
+            && c.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            stream
+                .write_packet(&[ClientPacket::Cancel as u8])
+                .await
+                .ok();
+            stream.flush().await.ok();
+            return Ok(());
         }
         let packet_type = match packet_read_timeout(recv_timeout, deadline) {
             Some(per_read) => {

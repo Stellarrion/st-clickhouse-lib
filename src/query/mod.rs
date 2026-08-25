@@ -2,6 +2,12 @@
 //!
 //! Wraps [`Client`] and adds SQL helpers for server-side
 //! `{name:Type}` placeholders (ClickHouse 54459+).
+//!
+//! This builder is a thin convenience shim over the richer
+//! [`crate::connection::QueryBuilder`] returned by [`Client::query`], which
+//! additionally supports settings,
+//! compression, callbacks, query IDs, timeouts, external tables, and
+//! streaming reads.
 
 use crate::Client;
 use crate::error::Result;
@@ -19,12 +25,19 @@ use crate::protocol::parameters::QueryParameter;
 ///     .block()
 ///     .await?;
 /// ```
+#[deprecated(
+    since = "0.3.0",
+    note = "thin shim over the richer builder returned by Client::query; use st_clickhouse::connection::QueryBuilder (settings, timeouts, callbacks, streaming) or Client::execute_with_params for parameterized DDL"
+)]
 pub struct QueryBuilder<'a> {
     client: &'a Client,
     sql: String,
     params: Vec<QueryParameter>,
 }
 
+// The shim's own methods reference the deprecated struct's fields; the
+// deprecation is aimed at external users, not at this delegation code.
+#[allow(deprecated)]
 impl<'a> QueryBuilder<'a> {
     /// Create a new empty query builder for the given client.
     pub fn new(client: &'a Client) -> Self {
@@ -98,6 +111,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn test_query_builder_bind_chaining() {
         // Test that the builder API compiles and chains correctly.
         // We can't construct a real Client here, but the type system
