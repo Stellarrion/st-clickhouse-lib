@@ -107,6 +107,13 @@ impl<'a> BatchBuilder<'a> {
     ///
     /// Sends all query packets in a single `write()` call, then reads responses
     /// sequentially. Returns `None` for queries that produce no data blocks.
+    ///
+    /// Each result set gets its own cumulative response budget
+    /// ([`Client::with_max_response_size`]): the decoded payload bytes of
+    /// every block the reader materializes for that result set are charged,
+    /// and a breach fails the batch with
+    /// [`Error::ResponseTooLarge`](crate::error::Error::ResponseTooLarge).
+    /// The reader task owns the socket, so a breached batch closes it.
     pub async fn execute(self) -> Result<Vec<Option<Block>>> {
         if self.queries.is_empty() {
             return Ok(Vec::new());
@@ -167,9 +174,13 @@ impl<'a> BatchBuilder<'a> {
             .ok_or_else(|| crate::error::Error::Protocol("connection stream taken".into()))?;
         drop(guard);
 
+        let max_response_size = self.client.max_response_size;
         let (block_tx, mut block_rx) = mpsc::channel(n * 2);
         crate::runtime::spawn(async move {
-            if let Err(e) = read_n_result_sets(stream, n, response_compressed, &block_tx).await {
+            if let Err(e) =
+                read_n_result_sets(stream, n, response_compressed, max_response_size, &block_tx)
+                    .await
+            {
                 let _ = block_tx.send((0, Err(e))).await;
             }
         });
@@ -204,11 +215,19 @@ impl<'a> BatchBuilder<'a> {
 
 /// Read `n` sequential result sets from the stream, sending each block
 /// tagged with its query index. A result set ends at EndOfStream (type 5).
+///
+/// Each result set is budgeted separately: the decoded payload bytes of every
+/// materialized Data block are charged against a fresh
+/// [`ResponseBudget`](crate::limits::ResponseBudget) sized by
+/// `max_response_size`, and a breach is reported for that result set's index.
 async fn read_n_result_sets(
     mut stream: crate::pool::StreamWrapper, n: usize, response_compressed: bool,
-    block_tx: &mpsc::Sender<(usize, Result<Option<Block>>)>,
+    max_response_size: usize, block_tx: &mpsc::Sender<(usize, Result<Option<Block>>)>,
 ) -> Result<()> {
+    let mut budget = crate::limits::ResponseBudget::new(max_response_size);
     for query_idx in 0..n {
+        // Fresh budget per result set (pipelined queries are independent).
+        budget.reset();
         // Read packets until EoS for this result set
         loop {
             let packet_type = read_varint_async(&mut stream).await?;
@@ -219,9 +238,19 @@ async fn read_n_result_sets(
                         response_compressed,
                     )
                     .await?;
-                    if block.row_count() > 0
-                        && block_tx.send((query_idx, Ok(Some(block)))).await.is_err()
-                    {
+                    if block.row_count() == 0 {
+                        continue;
+                    }
+                    if budget.charge(block.payload_bytes()).is_err() {
+                        let _ = block_tx
+                            .send((
+                                query_idx,
+                                Err(crate::error::Error::response_budget_exceeded(&budget)),
+                            ))
+                            .await;
+                        return Ok(());
+                    }
+                    if block_tx.send((query_idx, Ok(Some(block)))).await.is_err() {
                         return Ok(());
                     }
                 },

@@ -351,7 +351,7 @@ impl<'a> QueryBuilder<'a> {
             deadline,
             response_compressed,
             &self.callbacks,
-            FirstBlockHandler::default(),
+            FirstBlockHandler::new(self.client.max_response_size),
         )
         .await;
         guard.finish_response(&result);
@@ -371,7 +371,7 @@ impl<'a> QueryBuilder<'a> {
             deadline,
             response_compressed,
             &self.callbacks,
-            BlocksHandler::default(),
+            BlocksHandler::new(self.client.max_response_size),
         )
         .await;
         guard.finish_response(&result);
@@ -508,7 +508,7 @@ impl<'a> QueryBuilder<'a> {
             deadline,
             response_compressed,
             &self.callbacks,
-            AllRowsHandler::<T>::default(),
+            AllRowsHandler::<T>::new(self.client.max_response_size),
         )
         .await;
         guard.finish_response(&result);
@@ -528,7 +528,7 @@ impl<'a> QueryBuilder<'a> {
             deadline,
             response_compressed,
             &self.callbacks,
-            RawBlocksHandler::default(),
+            RawBlocksHandler::new(self.client.max_response_size),
         )
         .await;
         guard.finish_response(&result);

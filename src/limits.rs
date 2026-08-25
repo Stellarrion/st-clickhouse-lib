@@ -161,6 +161,136 @@ pub(crate) fn checked_count(
     usize::try_from(value).map_err(|_| format!("{what} count {value} exceeds limit {max}"))
 }
 
+// ─── Cumulative response budget ──────────────────────────────────────────────
+
+/// Default cumulative response-size budget for accumulating query APIs
+/// (256 MiB of decoded block payload bytes). Mirrored by the sync
+/// `ClientConfig::max_response_size` default and the async
+/// `Client::with_max_response_size` default.
+pub(crate) const DEFAULT_MAX_RESPONSE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Running cumulative decoded-byte budget for one accumulated response read.
+///
+/// This is the enforcement unit of the public `max_response_size` limit: the
+/// metric is the summed [`Block::payload_bytes`] (or `RawBlock` payload
+/// length) of every block an accumulating API retains — see the public docs
+/// on `Client::with_max_response_size` / `ClientConfig::max_response_size`.
+/// Streaming APIs (block views, `RowCursor`, `BlockStream`, `QueryStream`)
+/// never construct one: their memory is bounded per block, not per response.
+///
+/// [`Block::payload_bytes`]: crate::protocol::block::Block::payload_bytes
+#[derive(Debug, Clone)]
+pub(crate) struct ResponseBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl ResponseBudget {
+    /// New budget allowing up to `limit` cumulative decoded payload bytes.
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    /// The configured limit in bytes.
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Decoded payload bytes charged so far.
+    pub(crate) fn used(&self) -> usize {
+        self.used
+    }
+
+    /// Charge `bytes` decoded payload bytes against the budget.
+    ///
+    /// Returns `Err(())` when the cumulative total passes the limit (or the
+    /// addition itself overflows); charging up to exactly `limit` succeeds.
+    /// On breach `used` records the attempted total so callers can report
+    /// how much had been decoded when the limit was exceeded (except on the
+    /// addition-overflow arm, where `used` stays at its pre-overflow value).
+    pub(crate) fn charge(&mut self, bytes: usize) -> std::result::Result<(), ()> {
+        match self.used.checked_add(bytes) {
+            Some(used) => {
+                self.used = used;
+                if used > self.limit { Err(()) } else { Ok(()) }
+            },
+            None => Err(()),
+        }
+    }
+
+    /// Reset the running total for a fresh result set on the same read
+    /// (`Client::batch` pipelines several result sets per connection).
+    #[cfg_attr(not(feature = "tokio"), expect(dead_code))]
+    pub(crate) fn reset(&mut self) {
+        self.used = 0;
+    }
+}
+
+#[cfg(test)]
+mod response_budget_tests {
+    use super::{DEFAULT_MAX_RESPONSE_SIZE, ResponseBudget};
+
+    #[test]
+    fn charge_up_to_exactly_the_limit_passes() {
+        let mut budget = ResponseBudget::new(32);
+        budget.charge(16).expect("first half fits");
+        budget.charge(16).expect("exact cap must pass");
+        assert_eq!(budget.used(), 32);
+        assert_eq!(budget.limit(), 32);
+    }
+
+    #[test]
+    fn charge_past_the_limit_errors_and_reports_total() {
+        let mut budget = ResponseBudget::new(16);
+        budget.charge(16).expect("at cap");
+        assert!(budget.charge(1).is_err(), "cap + 1 must breach");
+        assert_eq!(budget.used(), 17, "breach reports the attempted total");
+    }
+
+    #[test]
+    fn first_block_past_a_tiny_cap_breaches() {
+        let mut budget = ResponseBudget::new(1);
+        assert!(budget.charge(2).is_err(), "single oversized block breaches");
+    }
+
+    #[test]
+    fn checked_add_overflow_breaches_instead_of_panicking() {
+        let mut budget = ResponseBudget::new(usize::MAX);
+        budget
+            .charge(usize::MAX)
+            .expect("usize::MAX fits usize::MAX");
+        assert!(
+            budget.charge(1).is_err(),
+            "overflow must breach, not panic under overflow-checks"
+        );
+    }
+
+    #[test]
+    fn reset_restarts_the_running_total() {
+        let mut budget = ResponseBudget::new(16);
+        budget.charge(16).expect("first result set at cap");
+        budget.reset();
+        budget
+            .charge(16)
+            .expect("second result set gets a fresh budget");
+        assert_eq!(budget.used(), 16);
+    }
+
+    #[test]
+    fn zero_budget_accepts_only_empty_payloads() {
+        let mut budget = ResponseBudget::new(0);
+        budget
+            .charge(0)
+            .expect("empty blocks carry no payload bytes");
+        assert!(budget.charge(1).is_err());
+    }
+
+    #[test]
+    fn default_limit_is_256_mib() {
+        assert_eq!(DEFAULT_MAX_RESPONSE_SIZE, 256 * 1024 * 1024);
+    }
+}
+
 #[cfg(test)]
 mod count_tests {
     use super::checked_count;

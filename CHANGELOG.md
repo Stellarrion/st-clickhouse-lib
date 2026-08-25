@@ -43,13 +43,29 @@ All notable changes to st-clickhouse are documented here.
   recycling a socket left mid-INSERT.
 
 ### Security
+- **Cumulative response-size budget is now enforced (`max_response_size`)**:
+  the accumulating query APIs bound the total decoded payload bytes they
+  retain — async `fetch`/`all`/`blocks`/`block` (first result block)/raw block
+  capture and each `batch()` result set, and sync `query`/`query_all` (with a
+  checked row-count sum replacing the overflow-panicking `usize` sum). The
+  `ResponseTooLarge { limit, received }` error names the configured limit and
+  the decoded total at breach and points to the streaming APIs
+  (`rows()`/`RowCursor`, `BlockStream`, `QueryStream`), which stay unbudgeted
+  by design — their memory is bounded per block. On breach the connection is
+  discarded (async pool slot) or deterministically recovered via Cancel plus a
+  bounded discard through the same buffered reader (sync), so the next query
+  on the same client/pool succeeds. Configuration: async
+  `ClientBuilder::with_max_response_size` and sync
+  `ClientConfig::max_response_size` (default 256 MiB, previously dead
+  config); the Python bindings surface the error as `QueryError` with the
+  same guidance.
 - **Capped server-controlled item counts (P0)**: server-controlled list and
   block dimensions are now validated against generous internal caps in
   `src/limits.rs` before they size any `Vec::with_capacity`/`reserve`
   allocation or bound any read loop, in both the async (Tokio) and sync
   engines. Counts only — per-string byte lengths, Array/Map offset totals,
-  cumulative response size, timeouts, and cancellation are unchanged and
-  remain to be addressed. A hostile or compromised server previously could
+  timeouts, and cancellation are unchanged and were addressed separately. A
+  hostile or compromised server previously could
   panic the client with a capacity overflow (or drive an oversized
   allocation) from a small varint count; it now gets a deterministic
   `Error::Protocol` naming the field, the received count, and the limit.

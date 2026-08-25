@@ -27,6 +27,22 @@ pub enum Error {
     Timeout(String),
     /// Invalid client configuration (e.g. a zero `connect_timeout`).
     Config(String),
+    /// An accumulating query result exceeded the configured response-size
+    /// budget (`ClientConfig::max_response_size`).
+    ///
+    /// The cumulative decoded payload bytes of the result blocks passed the
+    /// limit. The client sends `Cancel` and drains the remaining response so
+    /// the single connection stays usable; if that bounded drain fails the
+    /// socket is shut down instead (the next query then fails fast rather
+    /// than reading the aborted response's bytes). Raise the limit, or use a
+    /// streaming API (`SyncClient::start_stream` /
+    /// `SyncClient::query_with_block_view`), which is not size-budgeted.
+    ResponseTooLarge {
+        /// The configured budget in bytes.
+        limit: usize,
+        /// Decoded payload bytes accumulated when the limit was exceeded.
+        received: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -43,6 +59,13 @@ impl fmt::Display for Error {
             } => write!(f, "server error (code={code}, name={name}): {message}"),
             Error::Timeout(msg) => write!(f, "timeout: {msg}"),
             Error::Config(msg) => write!(f, "configuration error: {msg}"),
+            Error::ResponseTooLarge { limit, received } => write!(
+                f,
+                "response too large: decoded {received} bytes of result blocks exceeds \
+                 max_response_size {limit}; raise ClientConfig::max_response_size \
+                 (with_max_response_size), or use a streaming API \
+                 (start_stream/query_with_block_view) which is not size-budgeted"
+            ),
         }
     }
 }
@@ -72,6 +95,23 @@ impl Error {
     pub fn is_timeout(&self) -> bool {
         matches!(self, Error::Timeout(_))
     }
+
+    /// Returns `true` if this is a response-size budget breach.
+    pub fn is_response_too_large(&self) -> bool {
+        matches!(self, Error::ResponseTooLarge { .. })
+    }
+}
+
+impl Error {
+    /// Build the budget-breach error from an internal
+    /// [`crate::limits::ResponseBudget`] after a failed `charge`, reporting
+    /// the configured limit and the decoded total at breach.
+    pub(crate) fn response_budget_exceeded(budget: &crate::limits::ResponseBudget) -> Self {
+        Error::ResponseTooLarge {
+            limit: budget.limit(),
+            received: budget.used(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +137,43 @@ mod tests {
             err.to_string(),
             "configuration error: connect_timeout must be greater than zero"
         );
+    }
+
+    #[test]
+    fn response_too_large_display_names_limit_and_remedies() {
+        let err = Error::ResponseTooLarge {
+            limit: 1024,
+            received: 2048,
+        };
+        assert!(err.is_response_too_large());
+        assert!(!err.is_timeout());
+        let text = err.to_string();
+        assert!(
+            text.contains("max_response_size 1024"),
+            "error must name the limit: {text}"
+        );
+        assert!(
+            text.contains("with_max_response_size"),
+            "error must say how to raise the limit: {text}"
+        );
+        assert!(
+            text.contains("streaming API"),
+            "error must point at unbudgeted streaming APIs: {text}"
+        );
+    }
+
+    #[test]
+    fn response_budget_exceeded_reports_limit_and_decoded_total() {
+        let mut budget = crate::limits::ResponseBudget::new(16);
+        budget.charge(16).expect("at cap");
+        budget.charge(1).expect_err("breach");
+        match Error::response_budget_exceeded(&budget) {
+            Error::ResponseTooLarge { limit, received } => {
+                assert_eq!(limit, 16);
+                assert_eq!(received, 17);
+            },
+            other => unreachable!("expected ResponseTooLarge, got {other:?}"),
+        }
     }
 
     #[test]

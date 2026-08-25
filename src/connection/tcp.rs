@@ -35,6 +35,11 @@ pub struct Client {
     pub(crate) query_timeout: Option<Duration>,
     pub(crate) schema_cache: Arc<RwLock<HashMap<String, TableSchema>>>,
     pub(crate) validate_schema: bool,
+    /// Cumulative response-size budget in decoded block payload bytes for
+    /// the accumulating APIs (`blocks()`, `all()`, `raw()`, `fetch::<Block>`,
+    /// `batch()`). Set via [`Client::with_max_response_size`]; streaming APIs
+    /// (`rows()`, `BlockStream`) are not budgeted.
+    pub(crate) max_response_size: usize,
 }
 
 /// Explicit name for the default async client implementation.

@@ -43,5 +43,14 @@ pub fn to_py_err(err: st_clickhouse::sync::error::Error) -> PyErr {
         st_clickhouse::sync::error::Error::Config(msg) => {
             PyValueError::new_err(format!("ClickHouse configuration error: {msg}"))
         },
+        // Response-size budget breach → ValueError naming the limit; raise
+        // `max_response_size` or use a streaming API.
+        st_clickhouse::sync::error::Error::ResponseTooLarge { limit, received } => {
+            PyValueError::new_err(format!(
+                "ClickHouse response too large: decoded {received} bytes exceeds \
+                 max_response_size {limit}; raise max_response_size or use a \
+                 streaming API"
+            ))
+        },
     }
 }

@@ -44,6 +44,7 @@ impl Client {
             query_timeout: None,
             schema_cache: Arc::new(RwLock::new(HashMap::<String, TableSchema>::new())),
             validate_schema: false,
+            max_response_size: crate::limits::DEFAULT_MAX_RESPONSE_SIZE,
         }
     }
 

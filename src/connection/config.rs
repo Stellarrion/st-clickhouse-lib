@@ -132,6 +132,33 @@ impl Client {
         self
     }
 
+    /// Set the cumulative response-size budget for accumulating query APIs.
+    ///
+    /// The budget is measured in **decoded block payload bytes**: the sum of
+    /// [`Block::payload_bytes`] over every result block the API retains (for
+    /// raw capture, the summed [`RawBlock::payload_bytes`]). It applies to
+    /// `query(..).blocks()`, `.all()`, `.raw()`, `fetch::<Block>()` /
+    /// `fetch::<RawBlocks>()` / `fetch::<Vec<T>>()`, and each result set of
+    /// `batch()`. A response whose cumulative decoded payload passes the
+    /// limit fails with
+    /// [`Error::ResponseTooLarge`](crate::error::Error::ResponseTooLarge)
+    /// naming the limit; the mid-response socket is discarded and the pool
+    /// reconnects transparently for the next query.
+    ///
+    /// Default: 256 MiB. This bounds client memory when an honest server
+    /// streams a huge result into an accumulating API. Streaming APIs —
+    /// `query(..).rows()` ([`RowCursor`](crate::cursor::RowCursor)) and
+    /// [`BlockStream`](crate::connection::BlockStream) — hand out one block
+    /// at a time and are deliberately **not** budgeted. Pass `usize::MAX` to
+    /// disable the limit.
+    ///
+    /// [`Block::payload_bytes`]: crate::protocol::block::Block::payload_bytes
+    /// [`RawBlock::payload_bytes`]: crate::protocol::block::RawBlock::payload_bytes
+    pub fn with_max_response_size(mut self, size: usize) -> Self {
+        self.max_response_size = size;
+        self
+    }
+
     /// Attach a metrics sink shared with the connection pool.
     pub fn with_metrics(mut self, metrics: &'static crate::metrics::Metrics) -> Self {
         self.pool.with_metrics(metrics);

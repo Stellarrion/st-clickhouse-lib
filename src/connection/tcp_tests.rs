@@ -411,6 +411,7 @@ fn test_client() -> Client {
         query_timeout: None,
         schema_cache: Arc::new(RwLock::new(HashMap::new())),
         validate_schema: false,
+        max_response_size: crate::limits::DEFAULT_MAX_RESPONSE_SIZE,
     }
 }
 
@@ -619,7 +620,7 @@ async fn first_block_handler_errors_on_second_non_empty_block() {
         None,
         false,
         &QueryCallbacks::default(),
-        FirstBlockHandler::default(),
+        FirstBlockHandler::new(usize::MAX),
     )
     .await;
     let err = result
@@ -653,7 +654,7 @@ async fn first_block_handler_accepts_single_block_and_skips_empty_ones() {
         None,
         false,
         &QueryCallbacks::default(),
-        FirstBlockHandler::default(),
+        FirstBlockHandler::new(usize::MAX),
     )
     .await
     .expect("single non-empty block must succeed");
@@ -678,7 +679,7 @@ async fn blocks_handler_collects_all_blocks_and_preserves_boundaries() {
         None,
         false,
         &QueryCallbacks::default(),
-        BlocksHandler::default(),
+        BlocksHandler::new(usize::MAX),
     )
     .await
     .expect("multi-block response must succeed");
@@ -690,6 +691,286 @@ async fn blocks_handler_collects_all_blocks_and_preserves_boundaries() {
     assert_eq!(block_values(&blocks[0]), vec![1, 2]);
     assert_eq!(block_values(&blocks[1]), vec![3]);
     assert_eq!(block_values(&blocks[2]), vec![4, 5, 6]);
+}
+
+// ---------------------------------------------------------------------------
+// Response-size budget (max_response_size) — accumulating handlers only
+// ---------------------------------------------------------------------------
+
+/// One `data_packet(&[a, b])` block decodes to a single UInt64 column of
+/// `2 * 8 = 16` payload bytes — the unit of the response budget.
+fn two_block_payload() -> Vec<u8> {
+    let mut payload = data_packet(&[1, 2]);
+    payload.extend_from_slice(&data_packet(&[3, 4]));
+    payload.extend_from_slice(&end_of_stream_packet());
+    payload
+}
+
+#[tokio::test]
+async fn blocks_handler_tiny_cap_breaches_on_second_block() {
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    // Budget 16 bytes: the first block (16 payload bytes) fits exactly, the
+    // second breaches at a block boundary.
+    let mut stream = fake_stream(two_block_payload()).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(16),
+    )
+    .await;
+    let err = result
+        .err()
+        .expect("second block must breach the 16-byte budget");
+    match &err {
+        crate::error::Error::ResponseTooLarge { limit, received } => {
+            assert_eq!(*limit, 16);
+            assert_eq!(*received, 32, "breach reports the decoded total");
+        },
+        other => unreachable!("expected ResponseTooLarge, got {other:?}"),
+    }
+    assert!(
+        err.to_string().contains("max_response_size 16")
+            && err.to_string().contains("with_max_response_size"),
+        "error must name the limit and the remedy: {err}"
+    );
+    assert!(
+        err.is_broken_connection(),
+        "the mid-response socket must be discarded"
+    );
+}
+
+#[tokio::test]
+async fn blocks_handler_exactly_at_cap_passes() {
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    // Two blocks of 16 payload bytes each: exactly 32 stays within a
+    // 32-byte budget (a strict-greater-than check, never off-by-one).
+    let mut stream = fake_stream(two_block_payload()).await;
+    let blocks = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(32),
+    )
+    .await
+    .expect("cumulative payload exactly at the cap must pass");
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].payload_bytes(), 16);
+    assert_eq!(blocks[1].payload_bytes(), 16);
+}
+
+#[tokio::test]
+async fn all_rows_handler_charges_decoded_block_payload() {
+    use crate::connection::select_response::{AllRowsHandler, read_select_response};
+    // Row-vector APIs charge the same decoded block payload metric: 16-byte
+    // blocks, budget 16 → the second block breaches.
+    let mut stream = fake_stream(two_block_payload()).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        AllRowsHandler::<(u64,)>::new(16),
+    )
+    .await;
+    let err = match result {
+        Err(e) => e,
+        Ok(rows) => unreachable!("row accumulation must respect the budget, got {rows:?} rows"),
+    };
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::ResponseTooLarge {
+                limit: 16,
+                received: 32
+            }
+        ),
+        "expected ResponseTooLarge(16, 32), got {err:?}"
+    );
+
+    // Exactly at cap: all rows materialize.
+    let mut stream = fake_stream(two_block_payload()).await;
+    let rows = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        AllRowsHandler::<(u64,)>::new(32),
+    )
+    .await
+    .expect("exactly-at-cap row read must pass");
+    assert_eq!(rows.as_slice(), &[(1u64,), (2u64,), (3u64,), (4u64,)]);
+}
+
+#[tokio::test]
+async fn first_block_handler_charges_only_the_retained_block() {
+    use crate::connection::select_response::{FirstBlockHandler, read_select_response};
+    // The retained first block (16 payload bytes) is budgeted; later blocks
+    // are discarded un-materialized and never charged.
+    let mut payload = data_packet(&[1, 2]);
+    payload.extend_from_slice(&data_packet(&[]));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload.clone()).await;
+    let block = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        FirstBlockHandler::new(16),
+    )
+    .await
+    .expect("retained block exactly at cap passes");
+    assert_eq!(block_values(&block), vec![1, 2]);
+
+    let mut stream = fake_stream(payload).await;
+    let err = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        FirstBlockHandler::new(15),
+    )
+    .await
+    .err()
+    .expect("a single block larger than the budget must breach");
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::ResponseTooLarge {
+                limit: 15,
+                received: 16
+            }
+        ),
+        "expected ResponseTooLarge(15, 16), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn raw_blocks_handler_budgets_native_payload_bytes() {
+    use crate::connection::select_response::{RawBlocksHandler, read_select_response};
+    // Raw capture charges the native block body length (RawBlock::payload_bytes),
+    // which is larger than the materialized column bytes.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&data_packet(&[1]));
+    payload.extend_from_slice(&end_of_stream_packet());
+    let mut stream = fake_stream(payload).await;
+    let blocks = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        RawBlocksHandler::new(usize::MAX),
+    )
+    .await
+    .expect("unbudgeted raw read must pass");
+    let raw_len = blocks[0].payload_bytes();
+    assert!(raw_len > 8, "raw body includes framing beyond column bytes");
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&data_packet(&[1]));
+    payload.extend_from_slice(&data_packet(&[2]));
+    payload.extend_from_slice(&end_of_stream_packet());
+    let mut stream = fake_stream(payload).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        RawBlocksHandler::new(raw_len),
+    )
+    .await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => unreachable!("second raw block must breach the per-block-sized budget"),
+    };
+    assert!(
+        matches!(err, crate::error::Error::ResponseTooLarge { limit, received } if limit == raw_len && received == 2 * raw_len),
+        "expected ResponseTooLarge(raw_len, 2*raw_len), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_reader_is_not_budgeted_while_blocks_would_breach() {
+    // The streaming path (rows()/RowCursor, BlockStream) takes no budget by
+    // design: the same payload that breaches a tiny cap on the accumulating
+    // handler streams through fine.
+    use crate::connection::row_stream_reader::read_query_blocks;
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+
+    let mut payload = Vec::new();
+    for _ in 0..32 {
+        payload.extend_from_slice(&data_packet(&[1, 2]));
+    }
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    // Sanity: the accumulating handler breaches a 16-byte budget on it.
+    let mut stream = fake_stream(payload.clone()).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(16),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(crate::error::Error::ResponseTooLarge { .. })),
+        "accumulating read of the same payload must breach"
+    );
+
+    // The streaming reader carries every block with no cap. Drain the
+    // channel concurrently: the reader's `send` parks once the bounded
+    // channel is full, so awaiting the read before receiving would deadlock.
+    let stream = fake_stream(payload).await;
+    let (tx, mut rx) = crate::runtime::sync::mpsc::channel(4);
+    let reader_tx = tx.clone();
+    let reader = crate::runtime::spawn(async move {
+        read_query_blocks(
+            stream,
+            &reader_tx,
+            &QueryCallbacks::default(),
+            None,
+            Duration::from_secs(5),
+            None,
+            false,
+        )
+        .await
+    });
+    let mut blocks = 0;
+    let mut reader_err: Option<crate::error::Error> = None;
+    loop {
+        match rx.recv().await {
+            Some(Ok(Some(_))) => blocks += 1,
+            Some(Ok(None)) | None => break,
+            Some(Err(e)) => {
+                reader_err = Some(e);
+                break;
+            },
+        }
+    }
+    drop(tx);
+    reader
+        .await
+        .expect("reader task joins")
+        .expect("streaming read must not be budgeted");
+    assert!(
+        reader_err.is_none(),
+        "streaming read failed: {:?}",
+        reader_err
+    );
+    assert_eq!(blocks, 32, "every streamed block must arrive");
 }
 
 #[tokio::test]
@@ -709,7 +990,7 @@ async fn blocks_handler_reads_lz4_compressed_blocks() {
         None,
         true,
         &QueryCallbacks::default(),
-        BlocksHandler::default(),
+        BlocksHandler::new(usize::MAX),
     )
     .await
     .expect("compressed multi-block response must succeed");
@@ -733,7 +1014,7 @@ async fn lz4_framed_block_parsed_as_plain_must_fail() {
         None,
         false,
         &QueryCallbacks::default(),
-        BlocksHandler::default(),
+        BlocksHandler::new(usize::MAX),
     )
     .await;
     assert!(
@@ -757,7 +1038,7 @@ async fn blocks_handler_reads_zstd_compressed_blocks() {
         None,
         true,
         &QueryCallbacks::default(),
-        BlocksHandler::default(),
+        BlocksHandler::new(usize::MAX),
     )
     .await
     .expect("zstd multi-block response must succeed");

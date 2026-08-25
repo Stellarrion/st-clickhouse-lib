@@ -637,14 +637,30 @@ impl SyncClient {
     ///
     /// Uses streaming reads from a `BufReader`-wrapped socket to minimise
     /// syscall overhead.  Reads packet by packet until EndOfStream (type 5).
+    ///
+    /// The accumulated blocks are budgeted by
+    /// [`ClientConfig::max_response_size`]: the summed decoded payload bytes
+    /// of the retained blocks (see [`Block::payload_bytes`]) must stay within
+    /// the limit, else the query fails with
+    /// [`Error::ResponseTooLarge`]. Streaming alternatives
+    /// ([`start_stream`](Self::start_stream),
+    /// [`query_with_block_view`](Self::query_with_block_view)) are not
+    /// budgeted.
+    ///
+    /// [`Block::payload_bytes`]: crate::sync::protocol::block::Block::payload_bytes
     pub fn query(&mut self, query: &str) -> Result<Vec<Block>> {
         self.query_with_params(query, &[])
     }
 
     /// Execute a SELECT and decode all rows into owned values.
+    ///
+    /// The blocks are subject to the `max_response_size` budget (see
+    /// [`SyncClient::query`]); the total row count is summed with checked
+    /// arithmetic — an overflow errors instead of panicking under
+    /// overflow-checks.
     pub fn query_all<T: crate::sync::row::Row>(&mut self, query: &str) -> Result<Vec<T>> {
         let blocks = self.query(query)?;
-        let total_rows = blocks.iter().map(Block::row_count).sum();
+        let total_rows = total_row_count(&blocks)?;
         let mut rows = Vec::with_capacity(total_rows);
         for block in &blocks {
             rows.extend(crate::sync::row::read_all::<T>(block)?);
@@ -820,27 +836,79 @@ impl SyncClient {
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
         let mut blocks = Vec::with_capacity(8);
-        if self.server_info.use_chunked_recv {
-            let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
-            let mut reader = ChunkedReader::new(raw);
+        let mut budget = crate::limits::ResponseBudget::new(self.config.max_response_size);
+        // One reader across the read AND any recovery drain: dropping a
+        // buffered reader mid-response loses up to 64 KiB of read-ahead, so a
+        // freshly-built recovery reader would drain a misaligned stream and
+        // fail non-deterministically. The recovery below therefore runs
+        // through THIS instance (Cancel is written through the reader's own
+        // Write impl, which delegates to the transport) so the buffered
+        // continuation of the half-read response is never lost.
+        let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
+        let read = if self.server_info.use_chunked_recv {
+            let mut chunked = ChunkedReader::new(&mut reader);
             read_response_blocks(
-                &mut reader,
+                &mut chunked,
                 &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
-            )?;
+                &mut budget,
+            )
         } else {
-            let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             read_response_blocks(
                 &mut reader,
                 &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
-            )?;
+                &mut budget,
+            )
+        };
+        match read {
+            Ok(()) => Ok(blocks),
+            Err(e) => {
+                if !matches!(e, Error::ResponseTooLarge { .. }) {
+                    return Err(e);
+                }
+                // Budget breach: the response is half-read. Recover through
+                // the SAME reader — Cancel then a bounded discard to
+                // EndOfStream — so this client stays usable instead of
+                // poisoning the next query. On a failed recovery the socket
+                // is shut down so a misaligned stream can never be reused.
+                let drained = (|| -> Result<()> {
+                    crate::sync::chunked::write_cancel_packet(
+                        &mut reader,
+                        self.server_info.use_chunked_send,
+                    )?;
+                    let drain_deadline = std::time::Instant::now()
+                        + self.config.query_timeout.min(Duration::from_secs(5));
+                    if self.server_info.use_chunked_recv {
+                        let mut chunked = ChunkedReader::new(&mut reader);
+                        read_response_row_count(
+                            &mut chunked,
+                            drain_deadline,
+                            rev,
+                            self.server_info.use_chunked_send,
+                        )
+                        .map(|_| ())
+                    } else {
+                        read_response_row_count(
+                            &mut reader,
+                            drain_deadline,
+                            rev,
+                            self.server_info.use_chunked_send,
+                        )
+                        .map(|_| ())
+                    }
+                })();
+                drop(reader);
+                if drained.is_err() {
+                    let _ = self.stream.raw_tcp().shutdown(std::net::Shutdown::Both);
+                }
+                Err(e)
+            },
         }
-        Ok(blocks)
     }
 
     /// Consume the response to EndOfStream, surfacing every failure.
@@ -850,29 +918,31 @@ impl SyncClient {
     /// connection framing is intact and the client stays usable; after a
     /// protocol error the stream position is unknown and the connection must
     /// be dropped.
+    ///
+    /// Blocks are discarded as they arrive, not materialized: a DDL/DML
+    /// response is never buffered, so no response-size budget applies.
     pub fn drain_response(&mut self) -> Result<()> {
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
-        let mut blocks = Vec::new();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
-            read_response_blocks(
+            read_response_row_count(
                 &mut reader,
-                &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
             )
+            .map(|_| ())
         } else {
             let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
-            read_response_blocks(
+            read_response_row_count(
                 &mut reader,
-                &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
             )
+            .map(|_| ())
         }
     }
 
@@ -1266,11 +1336,30 @@ fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
 // Response-parsing free functions (generic over R: Read for BufReader support)
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Sum row counts across blocks with checked arithmetic. An honest server
+/// streaming enough blocks can pass `usize` capacity; `query_all` must error,
+/// not panic under overflow-checks.
+fn total_row_count(blocks: &[Block]) -> Result<usize> {
+    let mut total = 0usize;
+    for block in blocks {
+        total = total.checked_add(block.row_count()).ok_or_else(|| {
+            Error::Protocol("total row count overflow while materializing rows".into())
+        })?;
+    }
+    Ok(total)
+}
+
 /// Read response packets until EndOfStream (type 5).
 /// Pushes Data blocks into `blocks`.
+///
+/// Every accumulated block's decoded payload bytes are charged against
+/// `budget` (sized from `ClientConfig::max_response_size`); a breach aborts
+/// at a block boundary with [`Error::ResponseTooLarge`]. The caller must then
+/// recover the connection (Cancel plus a bounded discard through the same
+/// buffered reader inside the query method).
 fn read_response_blocks<R: std::io::Read + std::io::Write>(
     reader: &mut R, blocks: &mut Vec<Block>, deadline: std::time::Instant, rev: u64,
-    chunked_send: bool,
+    chunked_send: bool, budget: &mut crate::limits::ResponseBudget,
 ) -> Result<()> {
     loop {
         if std::time::Instant::now() > deadline {
@@ -1287,6 +1376,9 @@ fn read_response_blocks<R: std::io::Read + std::io::Write>(
         match packet_type {
             1 => {
                 let block = crate::sync::protocol::response::read_block(reader)?;
+                budget
+                    .charge(block.payload_bytes())
+                    .map_err(|_| Error::response_budget_exceeded(budget))?;
                 blocks.push(block);
             },
             2 => return Err(read_exception_packet(reader)),
@@ -2331,6 +2423,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            &mut crate::limits::ResponseBudget::new(usize::MAX),
         )
         .expect_err("server exception must surface");
         assert!(err.is_server_error(), "expected ServerError, got {err:?}");
@@ -2346,6 +2439,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            &mut crate::limits::ResponseBudget::new(usize::MAX),
         )
         .expect("EndOfStream drains to Ok");
 
@@ -2357,12 +2451,186 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            &mut crate::limits::ResponseBudget::new(usize::MAX),
         )
         .expect_err("unknown packet type must surface");
         assert!(
             matches!(err, Error::Protocol(ref msg) if msg.contains("unknown packet type")),
             "expected protocol error, got {err:?}"
         );
+    }
+
+    /// Wire body of one Data packet carrying a single UInt64 column with
+    /// `vals.len() * 8` payload bytes (the budget metric).
+    fn u64_data_packet(vals: &[u64]) -> Vec<u8> {
+        let mut p = Vec::new();
+        wire::write_varint(&mut p, 1).expect("test operation failed"); // Data
+        put_string(&mut p, ""); // table name
+        // BlockInfo: field 1 (is_overflows), field 2 (bucket_num), terminator.
+        wire::write_varint(&mut p, 1).expect("test operation failed");
+        p.push(0);
+        wire::write_varint(&mut p, 2).expect("test operation failed");
+        p.extend_from_slice(&(-1i32).to_le_bytes());
+        wire::write_varint(&mut p, 0).expect("test operation failed");
+        wire::write_varint(&mut p, 1).expect("test operation failed"); // columns
+        wire::write_varint(&mut p, vals.len() as u64).expect("test operation failed"); // rows
+        put_string(&mut p, "v");
+        put_string(&mut p, "UInt64");
+        p.push(0); // custom serialization = none
+        for val in vals {
+            p.extend_from_slice(&val.to_le_bytes());
+        }
+        p
+    }
+
+    fn two_block_wire() -> Vec<u8> {
+        let mut wire = u64_data_packet(&[1, 2]); // 16 payload bytes
+        wire.extend_from_slice(&u64_data_packet(&[3, 4])); // 16 more
+        wire.push(5); // EndOfStream
+        wire
+    }
+
+    #[test]
+    fn read_response_blocks_tiny_cap_breaches_naming_the_limit() {
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            &mut crate::limits::ResponseBudget::new(16),
+        )
+        .expect_err("second 16-byte block must breach a 16-byte budget");
+        match err {
+            Error::ResponseTooLarge { limit, received } => {
+                assert_eq!(limit, 16);
+                assert_eq!(received, 32, "breach reports the decoded total");
+            },
+            other => unreachable!("expected ResponseTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            blocks.len(),
+            1,
+            "blocks accumulated up to the breach are kept"
+        );
+    }
+
+    #[test]
+    fn read_response_blocks_exactly_at_cap_passes() {
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            &mut crate::limits::ResponseBudget::new(32),
+        )
+        .expect("cumulative payload exactly at the cap must pass");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].payload_bytes(), 16);
+        assert_eq!(blocks[1].payload_bytes(), 16);
+    }
+
+    #[test]
+    fn client_config_budget_reaches_enforcement() {
+        // The plumbing contract: the configured limit sizes the budget that
+        // read_response_blocks enforces. A tiny configured cap changes the
+        // outcome of the same wire response.
+        let config = crate::sync::config::ClientConfig::default().with_max_response_size(16);
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            &mut crate::limits::ResponseBudget::new(config.max_response_size),
+        )
+        .expect_err("tiny configured cap must breach on the second block");
+        assert!(
+            matches!(
+                err,
+                Error::ResponseTooLarge {
+                    limit: 16,
+                    received: 32
+                }
+            ),
+            "expected ResponseTooLarge(16, 32), got {err:?}"
+        );
+
+        let config = crate::sync::config::ClientConfig::default().with_max_response_size(32);
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            &mut crate::limits::ResponseBudget::new(config.max_response_size),
+        )
+        .expect("cap raised to the exact payload passes");
+    }
+
+    #[test]
+    fn read_response_block_views_are_not_budgeted() {
+        // The streaming block-view path takes no budget by design: the same
+        // payload that breaches a tiny cap when accumulated streams through.
+        let mut visitor_calls = 0usize;
+        let mut rows_seen = 0usize;
+        let result = {
+            let mut reader = std::io::Cursor::new(two_block_wire());
+            read_response_block_views(
+                &mut reader,
+                &mut |view: crate::sync::protocol::block::BlockView<'_>| {
+                    visitor_calls += 1;
+                    rows_seen += view.row_count();
+                    Ok(())
+                },
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                revision::DEFAULT_PROTOCOL_REVISION,
+                false,
+            )
+        };
+        result.expect("block-view streaming must not be budgeted");
+        assert_eq!(visitor_calls, 2);
+        assert_eq!(rows_seen, 4);
+    }
+
+    #[test]
+    fn total_row_count_errors_instead_of_overflowing() {
+        // query_all previously summed row counts with `sum()` — an overflow
+        // panic under overflow-checks. Now it errors.
+        let blocks = vec![
+            Block {
+                columns: Vec::new(),
+                rows: usize::MAX / 2 + 1,
+            },
+            Block {
+                columns: Vec::new(),
+                rows: usize::MAX / 2 + 1,
+            },
+        ];
+        let err =
+            total_row_count(&blocks).expect_err("row-count sum overflow must error, not panic");
+        assert!(
+            matches!(err, Error::Protocol(ref msg) if msg.contains("row count overflow")),
+            "expected overflow Protocol error, got {err:?}"
+        );
+
+        let ok_blocks = vec![
+            Block::empty(),
+            Block {
+                columns: Vec::new(),
+                rows: 7,
+            },
+        ];
+        assert_eq!(total_row_count(&ok_blocks).expect("small sums pass"), 7);
     }
 
     #[test]

@@ -103,6 +103,21 @@ pub(super) fn write_chunked_packet<W: Write>(writer: &mut W, pkt: &[u8]) -> Resu
     Ok(())
 }
 
+/// Send a bare Cancel packet through a writer, chunked-framed when required.
+///
+/// Used by the response-budget recovery path, which must write through the
+/// SAME buffered reader instance that performed the aborted read (dropping it
+/// would lose its read-ahead buffer and desynchronize the recovery drain).
+pub(super) fn write_cancel_packet<W: Write>(writer: &mut W, chunked_send: bool) -> Result<()> {
+    if chunked_send {
+        write_chunked_packet(writer, &[3])
+    } else {
+        writer.write_all(&[3])?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
 pub(super) struct TransportReader<'a> {
     inner: std::io::BufReader<&'a mut crate::sync::transport::Transport>,
 }
