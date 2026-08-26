@@ -208,6 +208,19 @@ All notable changes to st-clickhouse are documented here.
   into query parameters.
 
 ### Fixed
+- **Python `AsyncClient` pool self-starvation at high concurrency** (found by
+  the v0.3 benchmark pass): pool-acquire waiters and the queries whose
+  completion would free their slots shared one bounded default executor, so
+  at concurrency above `pool_max_size + executor width` (e.g. 32 concurrent
+  queries on a 4-slot pool) every waiter deterministically hit the 30 s
+  `pool_acquire_timeout`. Acquire work now runs on a dedicated, lazily-spawned
+  executor owned by the client (3.12-safe CPU sizing, shut down on `close()`),
+  so query work always finds default-executor threads; 32- and 64-concurrency
+  bursts complete in milliseconds. Relatedly, the 13 pooled one-shot helpers
+  released their client a second time after `_run_pooled`'s own release —
+  a re-acquired slot could be recycled mid-use (two tasks briefly sharing one
+  native connection) or produce a bogus `Pool is closed` error; release now
+  happens exactly once, destroy-aware, in `_run_pooled`.
 - **Buffered block framing now mirrors the wire format for Array/Map/JSON/
   LowCardinality/Variant/Dynamic columns** (both engines): the async
   compressed-materialized parser (`parse_decompressed_block`/`discard_decompressed_block`

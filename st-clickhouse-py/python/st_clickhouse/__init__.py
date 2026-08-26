@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Iterator, AsyncIterator, Tuple
@@ -713,6 +714,28 @@ class AsyncClient:
             )
         except Exception as e:
             raise _map_error(e) from e
+        # Dedicated executor for pool admission (``pool.acquire``).
+        #
+        # Acquire waiters park on the pool Condition for up to
+        # ``acquire_timeout``. Routing them through the loop's *default*
+        # executor starved it: once concurrent queries exceeded
+        # ``pool_max_size`` + default-executor width (min(32, cpu+4), 28
+        # here), every default-executor thread sat blocked inside
+        # ``acquire()`` while the queued query work items — the only things
+        # that release slots and wake the waiters — could never start.
+        # Every pending acquire then failed at exactly ``acquire_timeout``.
+        # A separate executor breaks that cycle: waiters park here while
+        # queries always find default-executor threads. Sized like the
+        # platform default so a burst of waiters is admitted as widely as
+        # the loop's own executor would admit it; threads spawn lazily, so
+        # an idle client pays nothing.
+        # os.process_cpu_count is 3.13+; fall back to os.cpu_count on 3.12
+        # (both return None on exotic platforms, hence the `or 1`).
+        cpu_count = getattr(os, "process_cpu_count", None) or os.cpu_count
+        self._acquire_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(32, (cpu_count() or 1) + 4),
+            thread_name_prefix="ch-pool-acquire",
+        )
         self._closed: bool = False
 
     # ── Pooled one-shot plumbing ────────────────────────────────────
@@ -726,6 +749,10 @@ class AsyncClient:
         floor by asyncio. A reclaim thread recovers it from the worker's
         holder and releases it, so a cancelled acquire can never leak a
         lent slot.
+
+        Runs on the client's dedicated acquire executor (see ``__init__``),
+        never on the loop default executor: blocked waiters must not
+        occupy the threads that query work items need to release slots.
         """
         holder: Dict[str, Any] = {"done": False}
 
@@ -736,7 +763,7 @@ class AsyncClient:
             finally:
                 holder["done"] = True
 
-        fut = loop.run_in_executor(None, _do_acquire)
+        fut = loop.run_in_executor(self._acquire_executor, _do_acquire)
 
         try:
             return await fut
@@ -774,11 +801,16 @@ class AsyncClient:
     async def _run_pooled(self, op: Callable[..., Any], *args: Any) -> Any:
         """Run a one-shot operation on a pooled client, cancellation-safe.
 
-        The operation holds the client for its duration and releases it in
-        its ``finally``. If the awaiting task is cancelled mid-query, the
-        connection is killed deterministically (the server aborts the query,
-        the executor thread unblocks) and the pool slot is destroyed — a
-        replacement is created on the next acquire. Note that the asyncio
+        The operation runs with the client held; ``_run`` releases it in
+        its ``finally`` — the ONLY release site, so an acquired client can
+        never be released twice. (A second, op-level release raced with the
+        slot being re-acquired and stole it from its new owner: the victim
+        acquire then failed with a misleading "Pool is closed", and two
+        tasks could share one native connection.) If the awaiting task is
+        cancelled mid-query, the connection is killed deterministically
+        (the server aborts the query, the executor thread unblocks) and the
+        pool slot is destroyed — a replacement is created on the next
+        acquire. Note that the asyncio
         wrapper future is cancelled *instantly* while the executor work
         keeps running; the discard therefore cannot rely on ``fut.done()``.
         """
@@ -845,10 +877,7 @@ class AsyncClient:
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> None:
-        try:
-            client.execute(query, params, ignored_part_uuids, settings=settings)
-        finally:
-            self._pool.release(client)
+        client.execute(query, params, ignored_part_uuids, settings=settings)
 
     async def query(
         self,
@@ -881,10 +910,7 @@ class AsyncClient:
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> List[Dict[str, Any]]:
-        try:
-            return client.query(query, params, ignored_part_uuids, settings=settings)
-        finally:
-            self._pool.release(client)
+        return client.query(query, params, ignored_part_uuids, settings=settings)
 
     async def query_tuples(
         self,
@@ -915,10 +941,7 @@ class AsyncClient:
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> List[Tuple[Any, ...]]:
-        try:
-            return client.query_tuples(query, params, ignored_part_uuids, settings=settings)
-        finally:
-            self._pool.release(client)
+        return client.query_tuples(query, params, ignored_part_uuids, settings=settings)
 
     async def query_columns(
         self,
@@ -949,10 +972,7 @@ class AsyncClient:
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> Dict[str, List[Any]]:
-        try:
-            return client.query_columns(query, params, ignored_part_uuids, settings=settings)
-        finally:
-            self._pool.release(client)
+        return client.query_columns(query, params, ignored_part_uuids, settings=settings)
 
     async def query_blocks(
         self,
@@ -985,10 +1005,7 @@ class AsyncClient:
         ignored_part_uuids: Optional[Iterable[Any]],
         settings: Optional[Dict[str, str]],
     ) -> List[Block]:
-        try:
-            return client.query_blocks(query, params, ignored_part_uuids, settings=settings)
-        finally:
-            self._pool.release(client)
+        return client.query_blocks(query, params, ignored_part_uuids, settings=settings)
 
     async def insert(self, query: str, rows: List[Dict[str, Any]]) -> None:
         """Insert rows into a table from a list of dicts.
@@ -1029,10 +1046,7 @@ class AsyncClient:
     def _sync_insert_blocks_on(
         self, client: Any, query: str, table_name: str, blocks: List[Block]
     ) -> None:
-        try:
-            client.insert(query, table_name, blocks)
-        finally:
-            self._pool.release(client)
+        client.insert(query, table_name, blocks)
 
     async def ping(self) -> bool:
         """Ping the server. Returns True on success.
@@ -1042,10 +1056,7 @@ class AsyncClient:
         return await self._run_pooled(self._sync_ping_on)
 
     def _sync_ping_on(self, client: Any) -> bool:
-        try:
-            return client.ping()
-        finally:
-            self._pool.release(client)
+        return client.ping()
 
     async def cancel(self) -> None:
         """Fail closed: this method cannot cancel a running query.
@@ -1076,10 +1087,7 @@ class AsyncClient:
     def _sync_tables_status_on(
         self, client: Any, tables: List[Tuple[str, str]]
     ) -> Dict[Tuple[str, str], Dict[str, Any]]:
-        try:
-            return client.tables_status(tables)
-        finally:
-            self._pool.release(client)
+        return client.tables_status(tables)
 
     async def table_status(
         self, database: str, table: str
@@ -1090,30 +1098,21 @@ class AsyncClient:
     def _sync_table_status_on(
         self, client: Any, database: str, table: str
     ) -> Optional[Dict[str, Any]]:
-        try:
-            return client.table_status(database, table)
-        finally:
-            self._pool.release(client)
+        return client.table_status(database, table)
 
     async def schema_for_table(self, table: str) -> Dict[str, Any]:
         """Return cached table schema metadata from one pool connection."""
         return await self._run_pooled(self._sync_schema_for_table_on, table)
 
     def _sync_schema_for_table_on(self, client: Any, table: str) -> Dict[str, Any]:
-        try:
-            return client.schema_for_table(table)
-        finally:
-            self._pool.release(client)
+        return client.schema_for_table(table)
 
     async def refresh_schema_for_table(self, table: str) -> Dict[str, Any]:
         """Refresh table schema metadata on one pool connection."""
         return await self._run_pooled(self._sync_refresh_schema_for_table_on, table)
 
     def _sync_refresh_schema_for_table_on(self, client: Any, table: str) -> Dict[str, Any]:
-        try:
-            return client.refresh_schema_for_table(table)
-        finally:
-            self._pool.release(client)
+        return client.refresh_schema_for_table(table)
 
     async def clear_schema_cache(self) -> None:
         """Clear schema metadata caches on all currently allocated pool connections."""
@@ -1144,10 +1143,7 @@ class AsyncClient:
         await self._run_pooled(self._sync_set_setting_on, name, value)
 
     def _sync_set_setting_on(self, client: Any, name: str, value: str) -> None:
-        try:
-            client.set_setting(name, value)
-        finally:
-            self._pool.release(client)
+        client.set_setting(name, value)
 
     async def server_info(self) -> Dict[str, Any]:
         """Get server information from one pool connection.
@@ -1159,10 +1155,7 @@ class AsyncClient:
         return await self._run_pooled(self._sync_server_info_on)
 
     def _sync_server_info_on(self, client: Any) -> Dict[str, Any]:
-        try:
-            return client.server_info()
-        finally:
-            self._pool.release(client)
+        return client.server_info()
 
     async def insert_stream(
         self, query: str, table_name: str = ""
@@ -1358,6 +1351,11 @@ class AsyncClient:
         if not getattr(self, "_closed", True):
             self._closed = True
             self._pool.close()
+            # pool.close() wakes every blocked waiter (they raise and their
+            # worker threads exit), so a non-blocking shutdown drains fast.
+            # Queued-but-unstarted acquires are dropped: their awaiters see
+            # cancellation, and any later op fails via ``_check_open``.
+            self._acquire_executor.shutdown(wait=False, cancel_futures=True)
 
     def __del__(self) -> None:
         self.close()
