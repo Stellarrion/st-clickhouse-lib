@@ -1236,6 +1236,7 @@ impl SyncClient {
             pos: 0,
             stream: cloned,
             read_buffer_size: self.config.read_buffer_size,
+            scratch: Vec::new(),
             compression: self.config.compression,
             negotiated_revision: self.server_info.negotiated_revision,
             chunked_recv: self.server_info.use_chunked_recv,
@@ -1945,6 +1946,8 @@ pub struct QueryStream {
     pos: usize,
     stream: crate::sync::transport::Transport,
     read_buffer_size: usize,
+    /// Reusable fill scratch: avoids a fresh zeroed allocation per fill.
+    scratch: Vec<u8>,
     #[allow(dead_code)]
     compression: Option<crate::sync::compression::CompressionMethod>,
     negotiated_revision: u64,
@@ -1982,7 +1985,13 @@ impl QueryStream {
                 };
                 match packet_type {
                     1 => match parse_block(&self.buffer, &mut self.pos) {
-                        Ok(block) => return Ok(Some(block)),
+                        Ok(block) => {
+                            // Return the block with the consumed prefix
+                            // already dropped (long streams must not retain
+                            // every parsed byte until drop).
+                            self.compact();
+                            return Ok(Some(block));
+                        },
                         Err(Error::Protocol(_)) => {
                             self.pos = saved_pos;
                             self.fill_buffer()?;
@@ -1992,6 +2001,7 @@ impl QueryStream {
                     },
                     5 => {
                         self.done = true;
+                        self.compact();
                         return Ok(None);
                     },
                     2 => match parse_exception_chain(&self.buffer, &mut self.pos) {
@@ -2175,6 +2185,11 @@ impl QueryStream {
                         )));
                     },
                 }
+                // A full packet was consumed from the front of the buffer
+                // (or a fill was queued by rewinding): drop the consumed
+                // prefix so long streams do not retain every byte they have
+                // already parsed.
+                self.compact();
             } else {
                 self.fill_buffer()?;
             }
@@ -2217,8 +2232,13 @@ impl QueryStream {
                 }
             }
         }
-        let mut buf = vec![0u8; self.read_buffer_size];
-        match self.stream.read(&mut buf) {
+        // Reuse one scratch buffer across fills instead of allocating (and
+        // zero-filling) a fresh read_buffer_size Vec every time.
+        if self.scratch.len() != self.read_buffer_size {
+            self.scratch.resize(self.read_buffer_size, 0);
+        }
+        let mut buf = std::mem::take(&mut self.scratch);
+        let result = match self.stream.read(&mut buf) {
             Ok(0) => {
                 self.done = true;
                 Ok(())
@@ -2233,6 +2253,24 @@ impl QueryStream {
             },
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e.into()),
+        };
+        self.scratch = buf;
+        result
+    }
+
+    /// Drop the consumed prefix of the receive buffer so long streams do not
+    /// retain the whole response: `buffer` is append-only otherwise, so a
+    /// 10 GiB export would hold 10 GiB of already-parsed bytes until the
+    /// stream is dropped.
+    fn compact(&mut self) {
+        if self.pos > 0 && self.pos == self.buffer.len() {
+            self.buffer.clear();
+            self.pos = 0;
+        } else if self.pos > 0 {
+            self.buffer.copy_within(self.pos.., 0);
+            let new_len = self.buffer.len() - self.pos;
+            self.buffer.truncate(new_len);
+            self.pos = 0;
         }
     }
 }
@@ -2304,6 +2342,7 @@ mod tests {
                 pos: 0,
                 stream: crate::sync::transport::Transport::new_plain(client),
                 read_buffer_size: 8192,
+                scratch: Vec::new(),
                 compression: None,
                 negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
                 chunked_recv: true,
@@ -2347,6 +2386,7 @@ mod tests {
                 pos: 0,
                 stream: crate::sync::transport::Transport::new_plain(client),
                 read_buffer_size: 8192,
+                scratch: Vec::new(),
                 compression: None,
                 negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
                 chunked_recv: false,
@@ -2355,6 +2395,51 @@ mod tests {
             },
             server,
         )
+    }
+
+    /// Consumed packets must not stay resident: after reading a block, the
+    /// buffer must not retain the already-parsed prefix (the audit's
+    /// "10 GiB export holds 10 GiB" bug class).
+    #[test]
+    fn query_stream_compacts_consumed_prefix() {
+        // One empty Data packet (table name only, 0 cols/rows) plus a
+        // trailing EndOfStream, split so the second packet needs a fill.
+        let mut packet = vec![1u8];
+        put_string(&mut packet, "");
+        wire::write_varint(&mut packet, 0).expect("test write"); // block info end
+        wire::write_varint(&mut packet, 0).expect("test write"); // cols
+        wire::write_varint(&mut packet, 0).expect("test write"); // rows
+        packet.push(5); // EndOfStream
+        let split = packet.len() - 1;
+
+        let (mut stream, mut server) = query_stream_with_buffer(packet[..split].to_vec());
+        let rest = packet[split..].to_vec();
+        let srv = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            server.write_all(&rest).expect("write eos");
+        });
+
+        let block = stream
+            .read_next_block()
+            .expect("read block")
+            .expect("non-empty");
+        assert_eq!(block.row_count(), 0);
+        // After returning the parsed packet, the consumed prefix is gone:
+        // only unconsumed bytes remain buffered.
+        assert!(
+            stream.pos == 0,
+            "compaction must reset pos (pos={})",
+            stream.pos
+        );
+        let buffered_after_block = stream.buffer.len();
+        assert!(
+            buffered_after_block <= 1,
+            "only the partial EoS byte may remain"
+        );
+
+        assert!(stream.read_next_block().expect("read eos").is_none());
+        assert!(stream.buffer.is_empty(), "EoS must leave an empty buffer");
+        srv.join().expect("server thread");
     }
 
     #[test]
