@@ -89,6 +89,9 @@ impl<'a> AnyColumnData<'a> {
     /// string-like values use `String`.
     pub fn into_owned(&self) -> OwnedColumnData {
         let len = self.len();
+        // `unwrap_or(0)` below is unreachable-by-construction: the loop is
+        // bounded by `len == col.len()`, and `get` only errors on
+        // out-of-bounds indices.
         match self {
             Self::UInt8(col) => {
                 let mut v = Vec::with_capacity(len);

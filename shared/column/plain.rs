@@ -386,6 +386,7 @@ include!(concat!(
 /// Scale indicates the number of decimal places (0=seconds, 3=ms, 6=us, 9=ns).
 /// Use `DateTime64Value::to_timestamp(scale)` to get seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct DateTime64Value(pub i64);
 
 impl DateTime64Value {
@@ -408,14 +409,17 @@ impl DateTime64Value {
 
 /// Decimal32 value (4 bytes, precision <= 9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Decimal32(pub i32);
 
 /// Decimal64 value (8 bytes, precision 10-18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Decimal64(pub i64);
 
 /// Decimal128 value (16 bytes, precision 19-38).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Decimal128(pub i128);
 
 /// Decimal256 value (32 bytes, precision 39-76).
