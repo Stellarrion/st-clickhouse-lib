@@ -20,7 +20,7 @@ in Rust with Python bindings via PyO3.
   connection is killed and transparently replaced); `cancel()` fails closed
   with guidance
 - **uvloop compatible** - standard asyncio APIs only
-- **Python 3.12-3.14**, including 3.14t/free-threaded builds. GIL builds use abi3; free-threaded builds use version-specific artifacts.
+- **Python 3.12+** (GIL builds, abi3 wheels) and **free-threaded Python 3.14t+** (version-specific `cp3XXt` wheels). Free threading is supported from 3.14 onward; 3.13 free-threaded builds are not supported (pyo3 0.29 dropped them).
 - **Compression** - LZ4 and ZSTD support
 
 ## Quick Start

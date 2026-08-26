@@ -759,7 +759,7 @@ fn py_tables_to_qualified_names(value: &Bound<'_, PyAny>) -> PyResult<Vec<Qualif
 }
 
 fn py_uuid_to_bytes(value: &Bound<'_, PyAny>) -> PyResult<[u8; 16]> {
-    if let Ok(bytes) = value.downcast::<PyBytes>() {
+    if let Ok(bytes) = value.cast::<PyBytes>() {
         let bytes = bytes.as_bytes();
         if bytes.len() != 16 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(

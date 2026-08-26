@@ -978,7 +978,7 @@ pub fn py_dicts_to_block(
     for (col_name, col_type) in columns {
         let mut buf = Vec::new();
         for row_obj in rows {
-            let row_dict = row_obj.downcast_bound::<PyDict>(py)?;
+            let row_dict = row_obj.bind(py).cast::<PyDict>()?;
             let val = row_dict.get_item(col_name.as_str())?.ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "missing column '{col_name}' in row"

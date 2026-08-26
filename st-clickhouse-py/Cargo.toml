@@ -41,5 +41,10 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "r
 webpki-roots = "1"
 bytes = "1"
 # PyO3 with abi3 (stable ABI) for Python 3.12+ GIL builds.
-# Python free-threaded builds use version-specific extension artifacts.
-pyo3 = { version = "0.28.3", features = ["abi3-py312", "generate-import-lib"] }
+# Python free-threaded builds use version-specific extension artifacts
+# (pyo3 automatically falls back from abi3 to a version-specific
+# free-threaded build when targeting a free-threaded interpreter).
+# NOTE: `generate-import-lib` is deprecated as of pyo3 0.29 (pyo3-ffi uses
+# raw-dylib for Windows linking now); it is kept until it is removed
+# upstream. pyo3 0.29 supports free-threaded Python 3.14t+ only.
+pyo3 = { version = "0.29.2", features = ["abi3-py312", "generate-import-lib"] }

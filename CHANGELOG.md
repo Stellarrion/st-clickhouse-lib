@@ -43,6 +43,23 @@ All notable changes to st-clickhouse are documented here.
   recycling a socket left mid-INSERT.
 
 ### Security
+- **PyO3 upgraded 0.28.3 → 0.29.2, closing RUSTSEC-2026-0176 and
+  RUSTSEC-2026-0177** (`st-clickhouse-py`): the bump pulls in the fixes for a
+  possible out-of-bounds read in `BoundListIterator`/`BoundTupleIterator`
+  `nth`/`nth_back` (RUSTSEC-2026-0176) and a missing `Sync` bound on the
+  closure type in `PyCFunction::new_closure` (RUSTSEC-2026-0177). Neither
+  code path is exercised by our bindings, but the affected code shipped in
+  every wheel built from the old dependency tree. The migration is
+  mechanical: the `PyAnyMethods::downcast` calls removed in pyo3 0.29 became
+  `Bound::cast` (`py_uuid_to_bytes`) and `Py::bind` + `Bound::cast`
+  (`py_dicts_to_block`); behavior is unchanged apart from the `TypeError`
+  message wording for non-dict INSERT rows ("cannot be converted to" ->
+  "is not an instance of"). pyo3 0.29 still satisfies our
+  declared MSRV 1.89 (it declares `rust-version = "1.83"`). Two upstream
+  support notes: pyo3 0.29 drops free-threaded Python 3.13t (3.14t+ remains
+  supported), and deprecates the `generate-import-lib` feature — kept for
+  now, since `pyo3-ffi` links via raw-dylib on Windows and the feature is
+  inert.
 - **Cumulative response-size budget is now enforced (`max_response_size`)**:
   the accumulating query APIs bound the total decoded payload bytes they
   retain — async `fetch`/`all`/`blocks`/`block` (first result block)/raw block
@@ -397,6 +414,31 @@ All notable changes to st-clickhouse are documented here.
   `st-clickhouse-py` (both its `Cargo.toml` and `pyproject.toml`) carry the
   same version, failing fast with a clear message; both release jobs depend
   on it.
+
+### Changed (Python packaging and CI)
+- **`requires-python` upper bound removed** (`st_clickhouse`): metadata now
+  declares `>=3.12` (was `>=3.12,<3.15`). The abi3-py312 wheel is forward
+  compatible with every future CPython 3.x, so the cap only blocked installs
+  on 3.15 pre-releases without protecting anyone; free-threaded installs
+  resolve to the dedicated `cp314-cp314t` wheels.
+- **Classifiers updated** (`st_clickhouse`): added
+  `Programming Language :: Python :: Free Threading :: 3 - Stable` (the
+  standardized trove classifier for the officially supported free-threaded
+  build, 3.14t and newer) and
+  `Programming Language :: Python :: Implementation :: CPython`. The
+  3.12/3.13/3.14 version classifiers were already present; 3.15 is
+  deliberately not claimed yet because nothing in CI exercises it.
+- **Free-threaded wheels are now built and published** (`st_clickhouse`):
+  the release `build-wheels` job gained a `freethreaded` matrix leg per OS
+  that selects the `3.14t` interpreter via `actions/setup-python`; pyo3
+  detects `Py_GIL_DISABLED` and falls back from abi3 to a version-specific
+  build, producing `cp314-cp314t-…` wheels with the unchanged
+  `maturin build --release` invocation. They upload as `wheels-ft-<os>`
+  artifacts next to the unchanged abi3 `wheels-<os>`, and the PyPI publish
+  job already merges both via its `wheels-*` download pattern. Python 3.13t
+  is deliberately not built and stays out of the Python test matrix
+  (`3.12`/`3.13`/`3.14`/`3.14t`): pyo3 0.29 dropped 3.13t support, and
+  free-threading is only officially supported from 3.14t up.
 
 ### Removed
 - **Dead `native` Cargo feature**: `native = []` was referenced by no
