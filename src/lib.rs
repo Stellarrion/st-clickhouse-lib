@@ -22,6 +22,13 @@ pub mod runtime;
 pub mod schema;
 pub mod sync;
 
+/// Internal parser hooks exercised by the in-tree fuzz targets
+/// (`fuzz/fuzz_targets/*`). Not part of the public API; hidden from docs.
+#[doc(hidden)]
+pub mod fuzz_hooks {
+    pub use crate::sync::protocol::response_packets::parse_exception_chain;
+}
+
 pub mod prelude {
     pub use crate::column::{ClickHouseColumn, ClickHouseColumnData, ClickHouseValue};
     pub use crate::compression::CompressionMethod;

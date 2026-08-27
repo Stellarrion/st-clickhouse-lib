@@ -760,7 +760,14 @@ pub(crate) async fn read_exception<
     let mut root = None;
     let mut messages = Vec::new();
     let mut buf = [0u8; 4];
+    let mut depth = 0usize;
     loop {
+        if depth >= crate::limits::MAX_EXCEPTION_CHAIN_DEPTH {
+            return Err(crate::error::Error::Protocol(format!(
+                "exception nesting too deep: more than {} levels",
+                crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+            )));
+        }
         stream.read_exact(&mut buf).await?;
         let code = i32::from_le_bytes(buf);
         let name = read_string_lossy_async(stream).await?;
@@ -770,6 +777,7 @@ pub(crate) async fn read_exception<
             root = Some((code, name.clone()));
         }
         messages.push(format!("{name} (code {code}): {msg}"));
+        depth += 1;
         stream.read_exact(&mut buf[..1]).await?;
         if buf[0] == 0 {
             break;
@@ -868,6 +876,68 @@ mod varint_read_tests {
         tx.write_all(&bytes).await.expect("write varint");
         let result = read_varint_async(&mut rx).await;
         assert!(result.is_err(), "10th-byte overflow must error: {result:?}");
+    }
+}
+
+#[cfg(test)]
+mod exception_chain_depth_tests {
+    use super::{encode_varint, read_exception};
+    use crate::error::Error;
+    use crate::limits::MAX_EXCEPTION_CHAIN_DEPTH;
+    use crate::runtime::io::AsyncWriteExt;
+
+    /// Wire body of an exception chain `levels` deep: per level, i32 LE code
+    /// plus three length-prefixed strings and the 1-byte has_nested flag.
+    fn chain_body(levels: usize) -> Vec<u8> {
+        let mut body = Vec::new();
+        for i in 0..levels {
+            body.extend_from_slice(&46i32.to_le_bytes());
+            for field in ["e", "m", ""] {
+                encode_varint(&mut body, field.len() as u64);
+                body.extend_from_slice(field.as_bytes());
+            }
+            body.push(u8::from(i + 1 < levels));
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn read_exception_accepts_exactly_cap_chain() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let body = chain_body(MAX_EXCEPTION_CHAIN_DEPTH);
+        tokio::spawn(async move {
+            tx.write_all(&body).await.expect("seed chain");
+        });
+        let err = read_exception(&mut rx)
+            .await
+            .expect("chain at cap must parse");
+        let Error::ServerError { code, message, .. } = err else {
+            unreachable!("expected ServerError");
+        };
+        assert_eq!(code, 46);
+        assert_eq!(
+            message.matches(" | nested: ").count(),
+            MAX_EXCEPTION_CHAIN_DEPTH - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn read_exception_rejects_cap_plus_one_chain() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let body = chain_body(MAX_EXCEPTION_CHAIN_DEPTH + 1);
+        tokio::spawn(async move {
+            tx.write_all(&body).await.expect("seed chain");
+        });
+        let err = read_exception(&mut rx)
+            .await
+            .expect_err("chain deeper than cap must be rejected");
+        match err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                format!("exception nesting too deep: more than {MAX_EXCEPTION_CHAIN_DEPTH} levels")
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
     }
 }
 

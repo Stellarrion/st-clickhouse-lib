@@ -53,6 +53,17 @@ pub(crate) const MAX_BLOCK_ROWS: usize = 10_000_000;
 /// Maximum accepted PartUUID count in an ignored PartUUIDs packet.
 pub(crate) const MAX_PART_UUIDS: usize = 1_048_576;
 
+/// Maximum accepted nesting depth of a server Exception chain (the
+/// `has_nested`-flagged chain inside an Exception packet, parsed by the sync
+/// buffer parser, the async packet reader, and both handshake readers).
+/// ClickHouse itself builds nested exception chains only a handful of levels
+/// deep, so 1,000 can never reject a legitimate server chain, while a hostile
+/// peer that keeps the flag set is turned from an unbounded loop with
+/// unbounded message accumulation into a deterministic protocol error.
+/// Minimum wire cost is ~7 bytes per level, so a maximal chain needs ~7 KiB —
+/// the cap adds no measurable work for honest inputs.
+pub(crate) const MAX_EXCEPTION_CHAIN_DEPTH: usize = 1_000;
+
 // ─── Server-controlled byte-length caps ─────────────────────────────────────
 //
 // Native column payloads are also sized from server-controlled values: every

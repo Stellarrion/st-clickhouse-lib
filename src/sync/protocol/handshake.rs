@@ -23,7 +23,7 @@
 //! the client, capped by the server revision.
 
 use crate::sync::config::ClientConfig;
-use crate::sync::error::Result;
+use crate::sync::error::{Error, Result};
 use crate::sync::protocol::packet::{ClientPacket, ServerPacket};
 use crate::sync::protocol::revision;
 use crate::sync::protocol::wire;
@@ -247,7 +247,14 @@ fn perform_ssh_auth(
 
 fn read_exception_chain(stream: &mut impl std::io::Read) -> Result<String> {
     let mut parts = Vec::new();
+    let mut depth = 0usize;
     loop {
+        if depth >= crate::limits::MAX_EXCEPTION_CHAIN_DEPTH {
+            return Err(Error::Protocol(format!(
+                "exception nesting too deep: more than {} levels",
+                crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+            )));
+        }
         let mut code_buf = [0u8; 4];
         stream.read_exact(&mut code_buf)?;
         let code = i32::from_le_bytes(code_buf);
@@ -255,6 +262,7 @@ fn read_exception_chain(stream: &mut impl std::io::Read) -> Result<String> {
         let msg = wire::read_string(stream)?;
         let _stack = wire::read_string(stream)?;
         parts.push(format!("{name} (code {code}): {msg}"));
+        depth += 1;
         let mut has_nested = [0u8; 1];
         stream.read_exact(&mut has_nested)?;
         if has_nested[0] == 0 {
@@ -370,5 +378,54 @@ mod password_rule_limit_tests {
         assert_eq!(info.password_complexity_rules[0].0, "min_len");
         assert_eq!(info.password_complexity_rules[0].1, "too short");
         assert_eq!(info.negotiated_revision, 54461);
+    }
+
+    /// Server bytes for an Exception packet (type 2) carrying a chain
+    /// `levels` deep: per level, i32 LE code plus three length-prefixed
+    /// strings and the 1-byte has_nested flag.
+    fn exception_hello(levels: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, 2).expect("test write"); // ServerPacket::Exception
+        for i in 0..levels {
+            buf.extend_from_slice(&60i32.to_le_bytes());
+            wire::write_string(&mut buf, "DB::Exception").expect("test write");
+            wire::write_string(&mut buf, "auth failed").expect("test write");
+            wire::write_string(&mut buf, "").expect("test write");
+            buf.push(u8::from(i + 1 < levels));
+        }
+        buf
+    }
+
+    #[test]
+    fn hello_exception_chain_exactly_cap_is_authentication_error() {
+        let cap = crate::limits::MAX_EXCEPTION_CHAIN_DEPTH;
+        let err = run_handshake(&exception_hello(cap))
+            .expect_err("exception hello must fail the handshake");
+        match &err {
+            Error::Authentication(msg) => assert_eq!(
+                msg.matches(" | nested: ").count(),
+                cap - 1,
+                "chain at exactly the cap must be fully reported"
+            ),
+            other => unreachable!("expected Authentication error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_exception_chain_cap_plus_one_is_protocol_error() {
+        let err = run_handshake(&exception_hello(
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH + 1,
+        ))
+        .expect_err("chain deeper than the cap must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                &format!(
+                    "exception nesting too deep: more than {} levels",
+                    crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+                )
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
     }
 }

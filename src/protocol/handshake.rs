@@ -272,12 +272,20 @@ async fn perform_ssh_auth<S: AsyncRead + AsyncWrite + Unpin>(
 
 async fn read_exception_chain<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<String> {
     let mut parts = Vec::new();
+    let mut depth = 0usize;
     loop {
+        if depth >= crate::limits::MAX_EXCEPTION_CHAIN_DEPTH {
+            return Err(crate::error::Error::Protocol(format!(
+                "exception nesting too deep: more than {} levels",
+                crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+            )));
+        }
         let code = wire::async_read_i32(stream).await?;
         let name = wire::async_read_string(stream).await?;
         let msg = wire::async_read_string(stream).await?;
         let _stack = wire::async_read_string(stream).await?;
         parts.push(format!("{name} (code {code}): {msg}"));
+        depth += 1;
         let mut has_nested = [0u8; 1];
         stream.read_exact(&mut has_nested).await?;
         if has_nested[0] == 0 {
@@ -385,5 +393,76 @@ mod password_rule_limit_tests {
         assert_eq!(info.password_complexity_rules[0].0, "min_len");
         assert_eq!(info.password_complexity_rules[0].1, "too short");
         assert_eq!(info.negotiated_revision, 54461);
+    }
+
+    /// Like [`run_handshake`] but the server payload is written by a spawned
+    /// task: deep exception chains exceed the duplex buffer, so seeding must
+    /// overlap with the handshake's reads instead of blocking on them.
+    async fn run_handshake_spawned(server_bytes: Vec<u8>) -> Result<ServerInfo> {
+        let (mut server_end, mut client_end) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let _ = server_end.write_all(&server_bytes).await;
+        });
+        handshake(
+            &mut client_end,
+            "client",
+            54461,
+            "default",
+            "user",
+            "pass",
+            None,
+        )
+        .await
+    }
+
+    /// Server bytes for an Exception packet (type 2) carrying a chain
+    /// `levels` deep: per level, i32 LE code plus three length-prefixed
+    /// strings and the 1-byte has_nested flag.
+    fn exception_hello(levels: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, 2).expect("test write"); // ServerPacket::Exception
+        for i in 0..levels {
+            buf.extend_from_slice(&60i32.to_le_bytes());
+            wire::write_string(&mut buf, "DB::Exception").expect("test write");
+            wire::write_string(&mut buf, "auth failed").expect("test write");
+            wire::write_string(&mut buf, "").expect("test write"); // stack trace
+            buf.push(u8::from(i + 1 < levels));
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn hello_exception_chain_exactly_cap_is_authentication_error() {
+        let cap = crate::limits::MAX_EXCEPTION_CHAIN_DEPTH;
+        let err = run_handshake_spawned(exception_hello(cap))
+            .await
+            .expect_err("exception hello must fail the handshake");
+        match &err {
+            Error::Authentication(msg) => assert_eq!(
+                msg.matches(" | nested: ").count(),
+                cap - 1,
+                "chain at exactly the cap must be fully reported"
+            ),
+            other => unreachable!("expected Authentication error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_exception_chain_cap_plus_one_is_protocol_error() {
+        let err = run_handshake_spawned(exception_hello(
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH + 1,
+        ))
+        .await
+        .expect_err("chain deeper than the cap must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                &format!(
+                    "exception nesting too deep: more than {} levels",
+                    crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+                )
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
     }
 }

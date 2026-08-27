@@ -81,11 +81,20 @@ pub fn parse_response_with_revision(
 /// Returns the root exception's `(code, name)` plus the whole nested chain
 /// joined into one message. A truncated or otherwise unparsable body returns
 /// `Err(Error::Protocol(_))` so a malformed packet is never mistaken for a
-/// terminal server exception.
-pub(crate) fn parse_exception_chain(buf: &[u8], pos: &mut usize) -> Result<(i32, String, String)> {
+/// terminal server exception. The chain depth is capped at
+/// [`crate::limits::MAX_EXCEPTION_CHAIN_DEPTH`] levels; a deeper chain is a
+/// protocol error naming the cap.
+pub fn parse_exception_chain(buf: &[u8], pos: &mut usize) -> Result<(i32, String, String)> {
     let mut parts = Vec::new();
     let mut root: Option<(i32, String)> = None;
+    let mut depth = 0usize;
     loop {
+        if depth >= crate::limits::MAX_EXCEPTION_CHAIN_DEPTH {
+            return Err(Error::Protocol(format!(
+                "exception nesting too deep: more than {} levels",
+                crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+            )));
+        }
         let code = parse_i32(buf, pos)?;
         let name = String::from_utf8_lossy(parse_string_bytes(buf, pos)?).into_owned();
         let message = String::from_utf8_lossy(parse_string_bytes(buf, pos)?).into_owned();
@@ -94,6 +103,7 @@ pub(crate) fn parse_exception_chain(buf: &[u8], pos: &mut usize) -> Result<(i32,
         if root.is_none() {
             root = Some((code, name));
         }
+        depth += 1;
         let flag = parse_bytes(buf, pos, 1)?;
         if flag.first().copied().unwrap_or(0) == 0 {
             break;
@@ -337,6 +347,93 @@ mod tests {
         };
         assert!(name.contains('�'));
         assert!(message.contains('�'));
+    }
+
+    // ── Exception-chain nesting-depth cap tests ──────────────────────────
+
+    fn nested_chain_entries(levels: usize) -> Vec<(i32, &'static str, &'static str, bool)> {
+        (0..levels)
+            .map(|i| (60, "DB::Exception", "nested frame", i + 1 < levels))
+            .collect()
+    }
+
+    #[test]
+    fn exception_chain_exactly_cap_depth_parses() {
+        let arena = exception_packet(&nested_chain_entries(
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH,
+        ));
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("chain exactly at the cap must still parse");
+        let Error::ServerError { code, message, .. } = err else {
+            unreachable!("expected ServerError, got {err:?}");
+        };
+        assert_eq!(code, 60);
+        assert_eq!(
+            message.matches(" | nested: ").count(),
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH - 1,
+            "every level up to the cap must be joined into the message"
+        );
+    }
+
+    #[test]
+    fn exception_chain_cap_plus_one_is_protocol_error() {
+        let arena = exception_packet(&nested_chain_entries(
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH + 1,
+        ));
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("chain deeper than the cap must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                &format!(
+                    "exception nesting too deep: more than {} levels",
+                    crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+                )
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    /// Raw chain body (no packet-type prefix) as consumed directly by
+    /// [`parse_exception_chain`] — the same entry point the fuzz target
+    /// exercises via `st_clickhouse::fuzz_hooks`.
+    fn chain_body(entries: &[(i32, &'static str, &'static str, bool)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (code, name, msg, nested) in entries {
+            body.extend_from_slice(&code.to_le_bytes());
+            put_string(&mut body, name);
+            put_string(&mut body, msg);
+            put_string(&mut body, "");
+            body.push(u8::from(*nested));
+        }
+        body
+    }
+
+    #[test]
+    fn parse_exception_chain_direct_cap_boundary() {
+        let cap = crate::limits::MAX_EXCEPTION_CHAIN_DEPTH;
+
+        // Exactly-cap chain parses and keeps the joined message.
+        let mut pos = 0;
+        let (code, _, message) =
+            parse_exception_chain(&chain_body(&nested_chain_entries(cap)), &mut pos)
+                .expect("exactly-cap chain must parse");
+        assert_eq!(code, 60);
+        assert_eq!(message.matches(" | nested: ").count(), cap - 1);
+
+        // One extra nested level (cap + 1) is rejected with the cap named.
+        let mut pos = 0;
+        let err = parse_exception_chain(&chain_body(&nested_chain_entries(cap + 1)), &mut pos)
+            .expect_err("cap + 1 chain must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                &format!("exception nesting too deep: more than {cap} levels")
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
     }
 
     #[test]
