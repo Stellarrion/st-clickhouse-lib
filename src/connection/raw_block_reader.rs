@@ -291,11 +291,16 @@ async fn read_column_body_raw_recorded<
             .await
         },
         Array(inner) => {
+            // Offsets are `rows` contiguous little-endian u64s on the wire —
+            // read them in ONE bulk recorded read (charging rows*8 against the
+            // budget exactly as the per-row loop did), then scan the recorded
+            // slice for monotonicity like the materialized path does.
+            let nbytes = checked_column_len(rows, 8, "array offset")?;
+            let start = out.len();
+            read_exact_recorded(stream, out, nbytes, budget).await?;
             let mut total = 0usize;
-            for _ in 0..rows {
-                let start = out.len();
-                read_exact_recorded(stream, out, 8, budget).await?;
-                let bytes: [u8; 8] = out[start..start + 8].try_into().map_err(|_| {
+            for chunk in out[start..].chunks_exact(8) {
+                let bytes: [u8; 8] = chunk.try_into().map_err(|_| {
                     crate::error::Error::Protocol("array offset length mismatch".into())
                 })?;
                 // Offsets are cumulative prefix sums: non-decreasing, and the
@@ -321,11 +326,14 @@ async fn read_column_body_raw_recorded<
             Ok(())
         },
         Map(key, value) => {
+            // Same bulk conversion as the Array arm: one recorded read of
+            // rows*8 bytes, then a monotonicity scan of the recorded slice.
+            let nbytes = checked_column_len(rows, 8, "map offset")?;
+            let start = out.len();
+            read_exact_recorded(stream, out, nbytes, budget).await?;
             let mut total = 0usize;
-            for _ in 0..rows {
-                let start = out.len();
-                read_exact_recorded(stream, out, 8, budget).await?;
-                let bytes: [u8; 8] = out[start..start + 8].try_into().map_err(|_| {
+            for chunk in out[start..].chunks_exact(8) {
+                let bytes: [u8; 8] = chunk.try_into().map_err(|_| {
                     crate::error::Error::Protocol("map offset length mismatch".into())
                 })?;
                 total = checked_monotonic_offset(total, u64::from_le_bytes(bytes), "map offset")?;

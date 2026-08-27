@@ -42,6 +42,49 @@ All notable changes to st-clickhouse are documented here.
   `AsyncInsertStream.send`/`close` destroys its connection instead of
   recycling a socket left mid-INSERT.
 
+### Performance
+- **Bulk Array/Map offset reads (async raw-capture and discard paths)**: the
+  per-row `read_exact(8)` loops in `raw_block_reader.rs` (raw capture) and
+  `discard_offsets_async` (streaming column skip) read `rows * 8` contiguous
+  little-endian u64 offsets in ONE bulk read (validated by
+  `checked_column_len(rows, 8, ...)`), then scan the buffer for monotonicity —
+  the same shape as the materialized `read_offsets_column` and the sync
+  engine. Recording semantics, budget charge (`rows * 8`), error messages, and
+  the `MAX_BLOCK_ROWS` inner-total check are unchanged. Measured on a release
+  build against a local server: `query_raw` of a 1M-row `Array(UInt8)` column
+  14.9 ms → 4.4 ms (−70%); micro-benchmark poll count 1,000,008 → 985 for the
+  offsets read (raw-capture shape) and 1,000,008 → 985 for the discard shape.
+- **Merged string-column body reads (async streaming decode)**:
+  `read_string_column_with_prefixes` now reads each short value's body bytes
+  together with the next row's first length-varint byte in one `read_exact`
+  (every requested byte is already claimed by the column, so the read can
+  never cross the column end), halving the per-row poll count: single-byte
+  varints no longer cost a poll. Per-value `MAX_STRING_BYTES` cap, cumulative
+  64 MiB column budget (checked before allocation), error messages, and the
+  output layout (prefix + lengths + bodies) are byte-identical; values larger
+  than 4 KiB stream straight into the column buffer tail as before. Measured:
+  `blocks()` of 1M × 16 B `String` 25.2 ms → 16.7 ms (−34%); micro-benchmark
+  poll count 2,001,848 → 1,001,971. (The async raw-capture String loop is
+  unchanged; fully buffered parsing would need stream pushback because bytes
+  past a column belong to the next reader on the same stream.)
+- **Large-read bypass in `StreamWrapper`**: when a caller's read buffer is at
+  least the size of the 8 KiB raw-framing prefetch window and the window is
+  empty, `read_buffered` now polls the socket directly into the caller's
+  buffer instead of bouncing through the window (mirroring `std::io::BufReader`).
+  Chunked-receive mode keeps its own frame-serving path. Measured: 1 MiB
+  `read_exact` through the transport 129 polls → 2 polls; `query_raw` of an
+  8 MiB `FixedString` column 2.69 ms → 2.12–2.47 ms.
+- **Pool try-lock sweep (`SimplePool::get`)**: before blocking on the
+  round-robin-assigned slot, `get()` now sweeps `try_lock` from the assigned
+  index over all slots and takes the first free one, removing head-of-line
+  blocking when the assigned slot is busy and other slots are idle. When the
+  pool is idle the sweep takes exactly the assigned slot (round-robin fairness
+  unchanged); when all slots are busy it awaits the assigned slot as before,
+  with `acquire_timeout` still measured from `get()` entry across the sweep
+  and the wait. Measured with a 2-slot pool, slot 0 busy ~1.5 s and slot 1
+  free: a concurrent acquire completed in 0.6–0.8 ms after the fix vs
+  1.099 s blocked before (~1,400×); micro-scenario 299 ms → 90 ns.
+
 ### Security
 - **PyO3 upgraded 0.28.3 → 0.29.2, closing RUSTSEC-2026-0176 and
   RUSTSEC-2026-0177** (`st-clickhouse-py`): the bump pulls in the fixes for a

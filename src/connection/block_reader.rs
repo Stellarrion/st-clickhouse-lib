@@ -865,14 +865,25 @@ async fn discard_offsets_async<
 >(
     stream: &mut S, rows: usize, name: &str,
 ) -> Result<usize> {
-    let mut offset = [0u8; 8];
+    // Offsets are `rows` contiguous little-endian u64s — discard them in bulk
+    // window reads (the discard_exact_async pattern) instead of one read_exact
+    // per row, validating monotonicity over each filled window. Window and
+    // per-read lengths are multiples of 8 so chunks never straddle reads.
+    let mut remaining = checked_column_len(rows, 8, name)?;
+    let mut window = [0u8; 8 * 1024];
     let mut total = 0usize;
-    for _ in 0..rows {
-        stream.read_exact(&mut offset).await?;
+    while remaining > 0 {
+        let n = remaining.min(window.len());
+        stream.read_exact(&mut window[..n]).await?;
+        remaining -= n;
         // Cumulative prefix sums must be non-decreasing; the last offset is
         // the inner element count, capped at MAX_BLOCK_ROWS before the inner
         // column is read or skipped.
-        total = checked_monotonic_offset(total, u64::from_le_bytes(offset), name)?;
+        for chunk in window[..n].chunks_exact(8) {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(chunk);
+            total = checked_monotonic_offset(total, u64::from_le_bytes(b), name)?;
+        }
     }
     Ok(total)
 }

@@ -549,6 +549,16 @@ pub(crate) async fn read_block_header<
     Ok((columns, rows))
 }
 
+/// Values at most this size use the merged body read — the value's bytes plus
+/// the next row's first varint byte in ONE `read_exact` — halving the per-row
+/// poll count. Every byte of a merged read is already claimed by this column
+/// (the lookahead byte is the next row's length varint's first byte, which
+/// must exist while rows remain), so the read can never cross the column end
+/// into the next column's stream bytes. Larger values stream straight into
+/// the column buffer's tail, where the transport's large-read path serves
+/// them directly.
+const STRING_COL_MERGED_MAX: usize = 4096;
+
 pub(crate) async fn read_string_column_with_prefixes<
     S: crate::runtime::io::AsyncRead + crate::runtime::io::AsyncWrite + Unpin,
 >(
@@ -557,9 +567,49 @@ pub(crate) async fn read_string_column_with_prefixes<
     // Capacity hint only: clamp it so a hostile row count cannot eager-allocate
     // more than one column's byte budget before any data arrives.
     let mut data = Vec::with_capacity(rows.saturating_mul(8).min(crate::limits::MAX_COLUMN_BYTES));
+    if rows == 0 {
+        return Ok(data);
+    }
     let mut total = 0usize;
-    for _ in 0..rows {
-        let len = checked_string_len(read_varint_async(stream).await?, length_name)?;
+    let mut scratch = [0u8; STRING_COL_MERGED_MAX + 1];
+    // First varint byte of the next row when the previous row's merged body
+    // read already pulled it in.
+    let mut pending: Option<u8> = None;
+    for row_idx in 0..rows {
+        // Length varint — same per-byte rules and overflow errors as
+        // read_varint_async, starting from `pending` when available.
+        let first = match pending.take() {
+            Some(b) => b,
+            None => {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                byte[0]
+            },
+        };
+        let value = if first & 0x80 == 0 {
+            u64::from(first)
+        } else {
+            let mut result = u64::from(first & 0x7F);
+            let mut shift = 7u32;
+            loop {
+                if shift >= 64 {
+                    return Err(crate::error::Error::Protocol("varint overflow".into()));
+                }
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                let b = byte[0];
+                if shift == 63 && (b & 0x7F) > 1 {
+                    return Err(crate::error::Error::Protocol("varint overflow".into()));
+                }
+                result |= u64::from(b & 0x7F) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            result
+        };
+        let len = checked_string_len(value, length_name)?;
         let needed = varint_len(len as u64)
             .checked_add(len)
             .ok_or_else(|| crate::error::Error::Protocol("column buffer length overflow".into()))?;
@@ -568,12 +618,29 @@ pub(crate) async fn read_string_column_with_prefixes<
         total = checked_column_bytes(total, needed, length_name)?;
         data.reserve(needed);
         encode_varint(&mut data, len as u64);
-        let start = data.len();
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| crate::error::Error::Protocol("column buffer length overflow".into()))?;
-        data.resize(end, 0);
-        stream.read_exact(&mut data[start..]).await?;
+        let last = row_idx + 1 == rows;
+        if len > STRING_COL_MERGED_MAX {
+            // Large value: one bulk read into the column buffer's tail.
+            let start = data.len();
+            let end = start.checked_add(len).ok_or_else(|| {
+                crate::error::Error::Protocol("column buffer length overflow".into())
+            })?;
+            data.resize(end, 0);
+            stream.read_exact(&mut data[start..]).await?;
+        } else {
+            // Merged read: this value's claimed bytes plus, when another row
+            // follows, exactly one lookahead byte owned by the next row's
+            // length varint. Skipped entirely for the final empty value so no
+            // zero-length read is ever issued.
+            let n = len + usize::from(!last);
+            if n > 0 {
+                stream.read_exact(&mut scratch[..n]).await?;
+                data.extend_from_slice(&scratch[..len]);
+                if !last {
+                    pending = Some(scratch[len]);
+                }
+            }
+        }
     }
     Ok(data)
 }
@@ -884,7 +951,7 @@ mod string_column_limit_tests {
     use super::read_string_column_with_prefixes;
     use crate::error::Error;
     use crate::protocol::wire;
-    use crate::runtime::io::AsyncWriteExt as _;
+    use crate::runtime::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     fn varint(v: u64) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -939,6 +1006,99 @@ mod string_column_limit_tests {
             .await
             .expect("small values parse");
         assert_eq!(data, vec![1, b'a', 0]);
+    }
+
+    #[tokio::test]
+    async fn string_column_does_not_read_past_the_column() {
+        // A String column followed by sentinel bytes on the same stream: the
+        // buffered body reader must never consume beyond the column's last
+        // claimed byte, or the next reader on this stream would desync. The
+        // sentinel is written in the same batch so a greedy refill could grab
+        // it; with tx dropped afterwards, any over-read surfaces as EOF here.
+        let mut wire_bytes = Vec::new();
+        for _ in 0..1000 {
+            wire_bytes.extend_from_slice(&varint(3));
+            wire_bytes.extend_from_slice(b"abc");
+        }
+        wire_bytes.extend_from_slice(&[0xABu8; 8]);
+        let (mut tx, mut rx) = tokio::io::duplex(8192);
+        tx.write_all(&wire_bytes)
+            .await
+            .expect("seed column + sentinel");
+        drop(tx);
+        let data = read_string_column_with_prefixes(&mut rx, 1000, "string value length")
+            .await
+            .expect("column must parse");
+        assert_eq!(data.len(), 1000 * 4, "varint + body per row");
+        let mut sentinel = [0u8; 8];
+        rx.read_exact(&mut sentinel)
+            .await
+            .expect("sentinel must still be on the stream");
+        assert_eq!(sentinel, [0xABu8; 8], "sentinel bytes must be untouched");
+    }
+
+    #[tokio::test]
+    async fn string_column_multi_byte_varint_lengths_parse() {
+        // Length 300 needs a two-byte varint on the wire.
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&varint(300));
+        wire_bytes.extend_from_slice(&[b'z'; 300]);
+        wire_bytes.extend_from_slice(&varint(0));
+        let (mut tx, mut rx) = tokio::io::duplex(1024);
+        tx.write_all(&wire_bytes).await.expect("seed values");
+        drop(tx);
+        let data = read_string_column_with_prefixes(&mut rx, 2, "string value length")
+            .await
+            .expect("multi-byte varint lengths must parse");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&varint(300));
+        expected.extend_from_slice(&[b'z'; 300]);
+        expected.extend_from_slice(&varint(0));
+        assert_eq!(data, expected);
+    }
+
+    #[tokio::test]
+    async fn string_column_truncated_body_is_unexpected_eof() {
+        // Claims 1000 bytes but sends 500, then EOF: the bulk body read must
+        // surface the same UnexpectedEof a per-value read_exact would.
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&varint(1000));
+        wire_bytes.extend_from_slice(&[7u8; 500]);
+        let (mut tx, mut rx) = tokio::io::duplex(1024);
+        tx.write_all(&wire_bytes)
+            .await
+            .expect("seed truncated value");
+        drop(tx);
+        let err = read_string_column_with_prefixes(&mut rx, 1, "string value length")
+            .await
+            .expect_err("truncated body must error");
+        assert!(
+            matches!(
+                &err,
+                Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof
+            ),
+            "expected UnexpectedEof, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn string_column_value_larger_than_window_streams_direct() {
+        // A value larger than the merged-read limit bypasses it and streams
+        // into the column buffer's tail. The duplex capacity exceeds the
+        // whole payload and the sender is dropped before the reader runs, so
+        // the test never depends on a concurrent writer task being scheduled
+        // (send-before-drain would otherwise deadlock at 0% CPU).
+        let big_len = 100_000usize;
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&varint(big_len as u64));
+        wire_bytes.extend_from_slice(&(0..big_len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+        let (mut tx, mut rx) = tokio::io::duplex(1 << 18);
+        tx.write_all(&wire_bytes).await.expect("seed large value");
+        drop(tx);
+        let data = read_string_column_with_prefixes(&mut rx, 1, "string value length")
+            .await
+            .expect("large value must parse");
+        assert_eq!(data, wire_bytes);
     }
 }
 

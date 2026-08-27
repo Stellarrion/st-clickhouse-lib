@@ -185,6 +185,24 @@ fn read_buffered(
     this: &mut StreamWrapper, cx: &mut std::task::Context<'_>,
     buf: &mut crate::runtime::io::ReadBuf<'_>,
 ) -> std::task::Poll<std::io::Result<()>> {
+    // Large-read fast path: when the caller wants at least a full window and
+    // no prefetched bytes are pending, read straight into the caller's buffer
+    // instead of bouncing through the 8 KiB window (mirrors std BufReader).
+    // Chunked receive never reaches this function — poll_read routes it to
+    // its own frame-serving loop above.
+    if this.rd_pos == this.rd_fill && buf.remaining() >= this.rd_buf.len() {
+        let before = buf.remaining();
+        return match poll_inner_read(&mut this.inner, cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let n = before - buf.remaining();
+                if n > 0 {
+                    this.record_bytes(n);
+                }
+                std::task::Poll::Ready(Ok(()))
+            },
+            other => other,
+        };
+    }
     loop {
         if this.rd_pos < this.rd_fill {
             let n = buf.remaining().min(this.rd_fill - this.rd_pos);
@@ -943,21 +961,44 @@ impl SimplePool {
     /// Acquire a connection slot. Waits if all slots are busy.
     #[tracing::instrument(level = "debug", skip_all, fields(slots = self.slots.len()), name = "clickhouse.pool.acquire")]
     pub(crate) async fn get(&self) -> Result<PoolGuard<'_>> {
+        // Entry timestamp for acquire_timeout: the budget is measured across
+        // the try-lock sweep below and the final slot wait.
+        let entered = Instant::now();
         // Round-robin slot selection
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        let mut slot_guard = match self.acquire_timeout {
-            Some(t) => match crate::runtime::time::timeout(t, self.slots[idx].lock()).await {
-                Ok(g) => g,
-                Err(_) => {
-                    if let Some(m) = self.metrics {
-                        m.connection_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Err(crate::error::Error::PoolTimeout(format!(
-                        "no connection slot available within {t:?}"
-                    )));
-                },
+        // Try-lock sweep from the assigned slot: a busy assigned slot no longer
+        // head-of-line blocks the acquire when other slots are free — take the
+        // first free one instead. When the pool is idle the sweep takes exactly
+        // the assigned slot, so round-robin fairness is unchanged. Locked slots
+        // are skipped: they are busy with live queries.
+        let swept = (0..self.slots.len())
+            .map(|i| (idx + i) % self.slots.len())
+            .find_map(|i| self.slots[i].try_lock().ok());
+        let mut slot_guard = match swept {
+            Some(guard) => guard,
+            None => {
+                // All slots busy — await the originally assigned slot. The
+                // acquire timeout keeps its original meaning: it is measured
+                // from get() entry, across the sweep and this wait.
+                match self.acquire_timeout {
+                    Some(t) => {
+                        let remaining = t.saturating_sub(entered.elapsed());
+                        match crate::runtime::time::timeout(remaining, self.slots[idx].lock()).await
+                        {
+                            Ok(g) => g,
+                            Err(_) => {
+                                if let Some(m) = self.metrics {
+                                    m.connection_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                                return Err(crate::error::Error::PoolTimeout(format!(
+                                    "no connection slot available within {t:?}"
+                                )));
+                            },
+                        }
+                    },
+                    None => self.slots[idx].lock().await,
+                }
             },
-            None => self.slots[idx].lock().await,
         };
         if slot_guard.is_none() {
             *slot_guard = Some(self.connect_round_robin().await?);
