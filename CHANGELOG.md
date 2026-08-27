@@ -2,7 +2,7 @@
 
 All notable changes to st-clickhouse are documented here.
 
-## [Unreleased]
+## [0.3.0] — 2026-08-27
 
 ### Fixed
 - **Multi-frame compressed responses now decode correctly (P0)**: ClickHouse

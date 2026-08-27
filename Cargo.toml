@@ -49,7 +49,7 @@ strip = "none"
 
 [package]
 name = "st-clickhouse-lib"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance native protocol ClickHouse client for Rust"
 edition.workspace = true
 rust-version.workspace = true
@@ -117,7 +117,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"], optional = true }
 
 # Derive macro (optional, build-time only)
-st-clickhouse-derive = { version = "0.2", path = "derive", optional = true }
+st-clickhouse-derive = { version = "0.3", path = "derive", optional = true }
 clickhouse = { version = "0.15", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 

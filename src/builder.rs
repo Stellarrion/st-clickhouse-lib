@@ -14,9 +14,10 @@ pub struct Blocking;
 
 /// Unified ClickHouse client builder.
 ///
-/// Use [`Client::builder`](crate::Client::builder) for the async Tokio-backed
-/// client or [`SyncClient::builder`](crate::sync::SyncClient::builder) for the
-/// blocking client.
+/// Use `Client::builder()` for the async Tokio-backed client (requires the
+/// `tokio` feature, enabled by default) or
+/// [`SyncClient::builder`](crate::sync::SyncClient::builder) for the blocking
+/// client.
 #[derive(Debug, Clone)]
 pub struct ClientBuilder<M = Async> {
     opts: BuilderOptions,

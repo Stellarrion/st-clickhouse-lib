@@ -158,7 +158,7 @@ impl Client {
     ///   [`crate::connection::QueryBuilder::rows`] — its detached reader task
     ///   sends `Cancel` and owns its socket.
     #[deprecated(
-        since = "0.2.0",
+        since = "0.3.0",
         note = "Client::cancel cannot reach the connection running the query and always returns Error::Config; use a query timeout, BlockStream::cancel, or drop the RowCursor"
     )]
     pub async fn cancel(&self) -> Result<()> {

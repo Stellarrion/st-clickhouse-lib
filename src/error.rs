@@ -32,7 +32,8 @@ pub enum Error {
     /// budget (`max_response_size`).
     ///
     /// The cumulative decoded payload bytes of the result blocks passed the
-    /// limit set by [`crate::Client::with_max_response_size`]. The read stops
+    /// limit set by `Client::with_max_response_size` (async engine; the sync
+    /// engine reads it from `ClientConfig::max_response_size`). The read stops
     /// at a block boundary and the mid-response socket is discarded; the next
     /// query on the pool reconnects. Raise the limit, or switch to a
     /// streaming API (`Client::query(..).rows()` / `BlockStream`), which is

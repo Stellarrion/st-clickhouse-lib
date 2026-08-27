@@ -8,7 +8,7 @@ build-backend = "maturin"
 # parses it with sed and gates releases on Cargo.toml/pyproject.toml agreement.
 # description uses the exact Cargo.toml string to prevent wording drift.
 name = "st-clickhouse-py"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python bindings for st-clickhouse — ClickHouse native protocol"
 readme = "README.md"
 # abi3-py312 wheels are forward compatible with all future CPython 3.x
