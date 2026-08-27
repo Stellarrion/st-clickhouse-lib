@@ -417,7 +417,23 @@ All notable changes to st-clickhouse are documented here.
   `#[deprecated]` (signature unchanged). Use a query deadline
   (`Client::with_query_timeout` / `QueryBuilder::timeout`), `BlockStream::cancel()` on
   a `begin_select` stream, or drop the `RowCursor` returned by `QueryBuilder::rows()`.
-  The sync engine's `SyncClient::cancel` is unchanged.
+- **Sync `SyncClient::cancel()` is now fail-closed too** (`st_clickhouse`): it used
+  to write a bare `Cancel` packet on the client's single connection and report
+  success. A blocking client holds its `&mut self` borrow for the whole query call,
+  so by the time `cancel()` was callable the only live-response case was a
+  `start_stream` stream left half-read — the `Cancel` write still left the response
+  undrained and the next query desynchronized; called with no response in flight,
+  the stray packet was injected ahead of the next query. `cancel()` now returns
+  `Error::Config` with guidance without touching the connection, and is marked
+  `#[deprecated]` (signature unchanged). Use a response deadline
+  (`ClientConfig::with_query_timeout`, default 30 s), drain a `QueryStream` to
+  `EndOfStream` for a clean stop, or abandon early by shutting the socket down via
+  `QueryStream::shutdown_handle` / `SyncClient::socket_shutdown_handle` (the server
+  aborts the query and a blocked reader is unblocked; the client is closed —
+  reconnect afterwards). Dropping a `QueryStream` alone only closes its duplicated
+  socket: no `Cancel` is sent and the connection stays mid-response. The Python
+  bindings had already removed their sync `cancel()` (it now raises `RuntimeError`
+  with the same guidance; `discard()` is the sanctioned teardown).
 - `PlainColumnData::read_from_bytes` now returns `Result<Self>` and rejects a logical
   element count that exceeds the backing bytes. This closes a safe-constructor
   soundness hole that could lead to an out-of-bounds unsafe read.

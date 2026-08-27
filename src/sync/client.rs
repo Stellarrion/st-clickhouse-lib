@@ -979,10 +979,51 @@ impl SyncClient {
     }
 
     /// Cancel the running query.
+    ///
+    /// **This method never cancels anything and always returns
+    /// [`Error::Config`].** A blocking
+    /// client holds its `&mut self` borrow for the whole query call, so by
+    /// the time `cancel()` is callable no blocking query of yours is running
+    /// — the only live-response case is a [`QueryStream`] from
+    /// [`SyncClient::start_stream`] left half-read, where this method's bare
+    /// `Cancel` write used to report success while the response stayed
+    /// undrained: the connection was left mid-response and the next query
+    /// desynchronized. Called with no response in flight, the stray packet
+    /// was injected into the server's input ahead of the next query. Either
+    /// way a `Cancel` write alone never produced a cancelled-and-clean
+    /// connection, so it now fails closed and touches no connection at all.
+    ///
+    /// To stop a query, use one of these instead:
+    /// - a response deadline —
+    ///   [`ClientConfig::with_query_timeout`](crate::sync::config::ClientConfig::with_query_timeout)
+    ///   (default 30 s) — every response read is deadline-checked and fails
+    ///   with [`Error::Timeout`] on expiry;
+    /// - keep reading a [`QueryStream`] to `EndOfStream` for a clean stop —
+    ///   dropping it alone only closes its duplicated socket (no `Cancel` is
+    ///   sent and the connection stays mid-response), so for an early
+    ///   abandon call [`QueryStream::shutdown_handle`] and
+    ///   [`TcpStream::shutdown`] the shared socket: the
+    ///   server aborts the query, a reader stuck in a blocking read is
+    ///   unblocked, and the client is closed — reconnect afterwards;
+    /// - [`SyncClient::socket_shutdown_handle`] is the same teardown from
+    ///   the client side.
+    #[deprecated(
+        since = "0.3.0",
+        note = "SyncClient::cancel cannot produce a cancelled-and-clean connection and always returns Error::Config; use ClientConfig::with_query_timeout, drain the QueryStream to EndOfStream, or shut the socket down via QueryStream::shutdown_handle / SyncClient::socket_shutdown_handle"
+    )]
     pub fn cancel(&mut self) -> Result<()> {
-        self.write_packet(&[3])?;
-        self.stream.flush()?;
-        Ok(())
+        Err(crate::sync::error::Error::Config(
+            concat!(
+                "SyncClient::cancel cannot cancel a query: a blocking client holds its ",
+                "borrow for the whole query, and a bare Cancel write leaves the ",
+                "response undrained, so no connection is touched. Use a response ",
+                "deadline (ClientConfig::with_query_timeout), drain the QueryStream ",
+                "to EndOfStream, or for an early abandon shut the socket down via ",
+                "QueryStream::shutdown_handle / SyncClient::socket_shutdown_handle ",
+                "(the server aborts the query; reconnect afterwards)"
+            )
+            .into(),
+        ))
     }
 
     /// Duplicate the underlying TCP socket for out-of-band teardown.

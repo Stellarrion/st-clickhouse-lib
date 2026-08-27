@@ -19,6 +19,7 @@ use crate::protocol::parameters::QueryParameter;
 /// # Example
 ///
 /// ```ignore
+/// // ignore: needs a connected `Client` (live server); the shim is deprecated
 /// let block = QueryBuilder::new(&client)
 ///     .query("SELECT * FROM users WHERE id = {uid:UInt64}")
 ///     .bind("uid", "42")

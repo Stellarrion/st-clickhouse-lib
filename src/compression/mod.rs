@@ -106,8 +106,8 @@ pub fn encode_frame(data: &[u8], method: CompressionMethod) -> Result<Vec<u8>> {
 /// (corruption indicator — fail loudly).
 ///
 /// All size fields are server-controlled. `compressed_size` and
-/// `uncompressed_size` are validated against
-/// [`crate::limits::MAX_FRAME_SIZE`] before any buffer is sized, and
+/// `uncompressed_size` are validated against the internal `MAX_FRAME_SIZE`
+/// cap (64 MiB) before any buffer is sized, and
 /// decompression output is bounded to the declared `uncompressed_size`, so a
 /// hostile or corrupt frame cannot drive an oversized allocation even when its
 /// checksum is valid.

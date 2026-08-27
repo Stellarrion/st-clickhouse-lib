@@ -81,9 +81,9 @@ pub fn parse_response_with_revision(
 /// Returns the root exception's `(code, name)` plus the whole nested chain
 /// joined into one message. A truncated or otherwise unparsable body returns
 /// `Err(Error::Protocol(_))` so a malformed packet is never mistaken for a
-/// terminal server exception. The chain depth is capped at
-/// [`crate::limits::MAX_EXCEPTION_CHAIN_DEPTH`] levels; a deeper chain is a
-/// protocol error naming the cap.
+/// terminal server exception. The chain depth is capped at 1,000 levels (the
+/// internal `MAX_EXCEPTION_CHAIN_DEPTH` limit); a deeper chain is a protocol
+/// error naming the cap.
 pub fn parse_exception_chain(buf: &[u8], pos: &mut usize) -> Result<(i32, String, String)> {
     let mut parts = Vec::new();
     let mut root: Option<(i32, String)> = None;

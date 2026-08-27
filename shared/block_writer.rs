@@ -30,7 +30,7 @@ pub fn data_packet_capacity(table_name: &str, block: &Block) -> usize {
 /// Write a Native block to the output buffer.
 ///
 /// Format:
-///   [BlockInfo]        — dim=1, is_overflows, dim=2, bucket_num, dim=0
+///   `BlockInfo`        — dim=1, is_overflows, dim=2, bucket_num, dim=0
 ///   varint(num_columns)
 ///   varint(num_rows)
 ///   For each column:

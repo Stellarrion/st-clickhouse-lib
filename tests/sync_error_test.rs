@@ -80,6 +80,35 @@ fn execute_invalid_query_errs_then_connection_still_works() -> Result<(), Box<dy
 }
 
 #[test]
+fn cancel_is_fail_closed_and_keeps_client_usable() -> Result<(), Box<dyn std::error::Error>> {
+    let Ok(mut client) = connect() else {
+        eprintln!("ClickHouse test server is not available; skipping live test");
+        return Ok(());
+    };
+    // SyncClient::cancel is fail-closed: a bare Cancel write cannot produce
+    // a cancelled-and-drained connection, so it must return Error::Config
+    // with guidance and without touching the socket.
+    #[allow(deprecated)]
+    let cancelled = client.cancel();
+    match cancelled {
+        Err(Error::Config(msg)) => assert!(
+            msg.contains("with_query_timeout") && msg.contains("shutdown_handle"),
+            "cancel error must point at the alternatives: {msg}"
+        ),
+        other => unreachable!("expected Error::Config, got {other:?}"),
+    }
+    // The connection is untouched and stays usable.
+    let blocks = client.query("SELECT toUInt8(42) AS v")?;
+    let block = blocks
+        .iter()
+        .find(|block| block.row_count() > 0)
+        .ok_or("valid query returned no data rows")?;
+    let value: u8 = block.column::<u8>("v")?.get(0)?;
+    assert_eq!(value, 42, "connection must remain usable after cancel()");
+    Ok(())
+}
+
+#[test]
 fn insert_into_missing_table_errs_then_connection_still_works()
 -> Result<(), Box<dyn std::error::Error>> {
     let Ok(mut client) = connect() else {

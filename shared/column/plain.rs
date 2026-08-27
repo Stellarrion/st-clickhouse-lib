@@ -21,6 +21,7 @@ pub struct Int256(pub [u8; 32]);
 /// Use `.as_days()` to get the raw days count.
 /// Convert to `chrono::NaiveDate` with:
 /// ```ignore
+/// // ignore: requires the `chrono` crate, a user-side dependency
 /// let naive_date = chrono::NaiveDate::from_num_days_from_ce(date.as_days() as i32 + 719163);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -58,8 +59,15 @@ impl From<Date> for u16 {
 /// DateTime stored as Unix timestamp (seconds since epoch, UInt32 wire format).
 ///
 /// Convert to `std::time::SystemTime`:
-/// ```ignore
+/// ```rust
+/// let dt = st_clickhouse::DateTime::from_secs(1_700_000_000);
 /// let st = std::time::UNIX_EPOCH + std::time::Duration::from_secs(dt.as_secs() as u64);
+/// assert_eq!(
+///     st.duration_since(std::time::UNIX_EPOCH)
+///         .expect("after the epoch")
+///         .as_secs(),
+///     1_700_000_000,
+/// );
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -98,6 +106,7 @@ impl From<DateTime> for u32 {
 /// Use `.as_bytes()` for byte-level access.
 /// Convert to `uuid::Uuid`:
 /// ```ignore
+/// // ignore: requires the `uuid` crate, a user-side dependency
 /// let u = uuid::Uuid::from_u128(uuid.as_u128());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -171,8 +180,11 @@ impl From<Uuid> for u128 {
 /// IPv4 address stored as a 32-bit integer (UInt32 wire format, LE).
 ///
 /// Convert to `std::net::Ipv4Addr`:
-/// ```ignore
+/// ```rust
+/// let ipv4 = st_clickhouse::Ipv4::from_std("192.0.2.1".parse().expect("valid Ipv4Addr"));
 /// let addr: std::net::Ipv4Addr = ipv4.into();
+/// assert_eq!(addr.to_string(), "192.0.2.1");
+/// assert_eq!(st_clickhouse::Ipv4::from(addr), ipv4);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -225,8 +237,11 @@ impl From<Ipv4> for u32 {
 /// IPv6 address stored as a 128-bit integer (UInt128 wire format, LE).
 ///
 /// Convert to `std::net::Ipv6Addr`:
-/// ```ignore
+/// ```rust
+/// let ipv6 = st_clickhouse::Ipv6::from_std("2001:db8::1".parse().expect("valid Ipv6Addr"));
 /// let addr: std::net::Ipv6Addr = ipv6.into();
+/// assert_eq!(addr.to_string(), "2001:db8::1");
+/// assert_eq!(st_clickhouse::Ipv6::from(addr), ipv6);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -340,7 +355,7 @@ impl<'a> ClickHouseColumnData<'a, JsonValue> for JsonColumnData {
 }
 
 /// Variant value — stored as raw discriminators + sub-columns.
-/// The raw data format: [discriminators: u8 * N] [subcol_0] [subcol_1] ...
+/// The raw data format: `[discriminators: u8 * N] [subcol_0] [subcol_1] ...`
 #[derive(Debug, Clone)]
 pub struct VariantValue(pub Vec<u8>);
 

@@ -41,6 +41,7 @@ st-clickhouse-lib = { version = "0.2", features = ["derive"] }
 ```rust
 use st_clickhouse::Client;
 use st_clickhouse::connection::{QueryResult, RowCount, Scalar};
+use st_clickhouse::protocol::block::{Block, ColumnInfo};
 
 let client = Client::connect("127.0.0.1:9000").await?;
 
@@ -89,12 +90,28 @@ while let Some((n,)) = cursor.next().await? {
     println!("{n}");
 }
 
-// INSERT
-client.execute("CREATE TEMPORARY TABLE events (ts DateTime, value Float64)").await?;
+// INSERT — FORMAT Native blocks (begin_insert → send_data → end)
+client.execute("CREATE TABLE IF NOT EXISTS events (ts DateTime, value Float64) ENGINE = Memory").await?;
 let mut insert = client.begin_insert("events").await?;
-insert.write(("2024-01-01 00:00:00", 1.0)).await?;
-insert.write(("2024-01-01 00:01:00", 2.0)).await?;
-insert.finish().await?;
+let block = Block {
+    columns: vec![
+        ColumnInfo {
+            name: "ts".into(),
+            type_name: "DateTime".into(),
+            data: bytes::Bytes::copy_from_slice(&1_700_000_000u32.to_le_bytes()),
+            lc_materialized: bytes::Bytes::new(),
+        },
+        ColumnInfo {
+            name: "value".into(),
+            type_name: "Float64".into(),
+            data: bytes::Bytes::copy_from_slice(&1.5f64.to_le_bytes()),
+            lc_materialized: bytes::Bytes::new(),
+        },
+    ],
+    rows: 1,
+};
+insert.send_data(&block).await?;
+insert.end().await?;
 ```
 
 ---
@@ -276,9 +293,9 @@ let block = client
 
 // ── Batch queries (single round-trip) ────────────────────────
 let results = client.batch()
-    .append("SELECT 1")
-    .append("SELECT 2")
-    .append("SELECT 3")
+    .query("SELECT 1")
+    .query("SELECT 2")
+    .query("SELECT 3")
     .execute()
     .await?;
 ```
@@ -535,10 +552,12 @@ Lower latency is better. `vs C++` = `st-clickhouse / clickhouse-cpp`, so values 
 | 50 columns × 1K rows | 0.920ms | 0.914ms | 1.01x |
 | 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **0.54x** |
 | 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **0.98x** |
-| INSERT Memory 10K rows | 0.549ms | 0.534ms | 1.03x |
-| ALTER UPDATE 5K/10K rows | 0.525ms | 0.518ms | 1.01x |
+| INSERT Memory 10K rows † | 0.549ms | 0.534ms | 1.03x |
+| ALTER UPDATE 5K/10K rows † | 0.525ms | 0.518ms | 1.01x |
 
 The **UInt64 owned-materialization row** is where st-clickhouse's 0.2.0 PlainColumn bulk-slice fast path (`read_all` / `query_all`) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms (~1.85× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
+
+† *Server-version drift:* these numbers were measured on ClickHouse **26.4**. On **26.7+** the server itself charges a flat ~60 ms per mutation (raw HTTP inserts that bypass the client cost the same), so both rows track the server's mutation path, not client overhead — the client still adds ~0.3 ms or less. All other rows were re-measured on 26.7 at or better than the values shown.
 
 ### Python Materialization (Multiple Output Shapes)
 
@@ -609,6 +628,7 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 - ✅ **Query retry** — configurable retries with exponential backoff + jitter
 - ✅ **Write timeouts** — configurable per-operation timeout
 - ✅ **Query deadlines** — `Client::with_query_timeout` / per-query `QueryBuilder::timeout`; expiry cancels the query server-side and discards the connection
+- ✅ **Fail-closed `cancel()`** — async `Client::cancel` and sync `SyncClient::cancel` never cancel anything: they return `Error::Config` with guidance (deadlines and stream teardown are the real mechanisms)
 - ✅ **Pool acquire timeout** — bounded wait for a free pool slot (`Error::PoolTimeout`)
 - ✅ **Response-size budgets** — `max_response_size` caps the bytes retained by accumulating reads; streaming paths stay unbudgeted by design
 - ✅ **Bounded protocol framing** — every server-controlled count/length is validated before it sizes an allocation (hostile-server safe)
@@ -648,7 +668,7 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 
 ## Compatibility
 
-Tested against ClickHouse **24.8**, **25.8**, and **26.4** in CI.
+Tested against ClickHouse **24.8**, **25.8**, **26.4**, and **`latest`** in CI.
 
 Run locally:
 ```bash

@@ -35,6 +35,7 @@ static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Explicitly batches multiple queries into a single pipelined execution.
 ///
 /// ```ignore
+/// // ignore: needs a connected async `Client` (live server)
 /// let blocks = client.batch()
 ///     .query("SELECT COUNT(*) FROM users")
 ///     .query("SELECT COUNT(*) FROM orders")
@@ -109,7 +110,8 @@ impl<'a> BatchBuilder<'a> {
     /// sequentially. Returns `None` for queries that produce no data blocks.
     ///
     /// Each result set gets its own cumulative response budget
-    /// ([`Client::with_max_response_size`]): the decoded payload bytes of
+    /// ([`Client::with_max_response_size`](crate::Client::with_max_response_size)):
+    /// the decoded payload bytes of
     /// every block the reader materializes for that result set are charged,
     /// and a breach fails the batch with
     /// [`Error::ResponseTooLarge`](crate::error::Error::ResponseTooLarge).

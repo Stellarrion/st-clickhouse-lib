@@ -196,6 +196,12 @@ bench = false
 
 
 
+[dev-dependencies]
+# Doctests construct wire-format `Block`s with public fields; `bytes::Bytes`
+# is already a regular dependency (same version in Cargo.lock), listed here
+# so doctests can name the crate.
+bytes = { workspace = true }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

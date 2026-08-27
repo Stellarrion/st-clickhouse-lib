@@ -3,9 +3,27 @@
 //! The row API allocates per row (owned Strings, Vecs) for convenience.
 //! For zero-allocation access, use the columnar API directly:
 //!
-//! ```ignore
-//! let ages: &[u64] = block.column::<u64>("age")?.as_slice()?;
-//! for age in ages { process(age); }
+//! ```rust
+//! use st_clickhouse::{Block, ColumnInfo};
+//!
+//! let mut block = Block::empty();
+//! block.rows = 3;
+//! block.columns.push(ColumnInfo {
+//!     name: "age".to_owned(),
+//!     type_name: "UInt64".to_owned(),
+//!     data: bytes::Bytes::from(vec![
+//!         10, 0, 0, 0, 0, 0, 0, 0, //
+//!         20, 0, 0, 0, 0, 0, 0, 0, //
+//!         30, 0, 0, 0, 0, 0, 0, 0,
+//!     ]),
+//!     lc_materialized: Default::default(),
+//! });
+//! let ages: &[u64] = block
+//!     .column::<u64>("age")
+//!     .expect("column decodes")
+//!     .as_slice()
+//!     .expect("fixed-width column yields an aligned slice");
+//! assert_eq!(ages, &[10, 20, 30]);
 //! ```
 
 use crate::column::{AnyColumnData, ClickHouseColumn, ClickHouseColumnData};

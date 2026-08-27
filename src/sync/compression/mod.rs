@@ -106,8 +106,8 @@ pub fn encode_frame(data: &[u8], method: CompressionMethod) -> Result<Vec<u8>> {
 /// (corruption indicator — fail loudly).
 ///
 /// All size fields are server-controlled. `compressed_size` and
-/// `uncompressed_size` are validated against
-/// [`crate::limits::MAX_FRAME_SIZE`] before any buffer is sized, and
+/// `uncompressed_size` are validated against the internal `MAX_FRAME_SIZE`
+/// cap (64 MiB) before any buffer is sized, and
 /// decompression output is bounded to the declared `uncompressed_size`, so a
 /// hostile or corrupt frame cannot drive an oversized allocation even when its
 /// checksum is valid.
@@ -296,10 +296,10 @@ impl From<std::io::Error> for DecompressError {
 /// — chunk framing wraps the compressed bytes, so decompression must happen
 /// after de-chunking.
 ///
-/// Budgets: each frame is bounded by [`crate::limits::MAX_FRAME_SIZE`] (via
+/// Budgets: each frame is bounded by the internal `MAX_FRAME_SIZE` cap (via
 /// [`decode_frame`]) and the cumulative decompressed size of the packet body
-/// is charged against the block-level [`crate::limits::MAX_BLOCK_BYTES`]
-/// budget, so a hostile frame sequence cannot grow the buffer without bound.
+/// is charged against the block-level `MAX_BLOCK_BYTES` budget, so a hostile
+/// frame sequence cannot grow the buffer without bound.
 pub struct DecompressingReader<R> {
     inner: R,
     /// Decompressed bytes not yet served.

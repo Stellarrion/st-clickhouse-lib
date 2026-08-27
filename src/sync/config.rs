@@ -3,14 +3,19 @@
 //! [`ClientConfig`] holds ALL connection parameters with sensible defaults.
 //! Use the builder pattern to override only what you need:
 //!
-//! ```ignore
+//! ```rust
+//! use st_clickhouse::sync::compression::CompressionMethod;
+//! use st_clickhouse::sync::config::ClientConfig;
+//!
 //! let config = ClientConfig::default()
 //!     .with_host("clickhouse.example.com")
 //!     .with_user("analytics")
 //!     .with_password("secret")
 //!     .with_compression(CompressionMethod::Lz4)
 //!     .with_setting("max_block_size", "8192");
-//! let client = SyncClient::connect_with_config(config)?;
+//! assert_eq!(config.host, "clickhouse.example.com");
+//! // Connect against a live server:
+//! // let client = SyncClient::connect_with_config(config)?;
 //! ```
 
 use std::collections::HashMap;
