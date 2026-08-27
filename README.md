@@ -35,7 +35,7 @@
 
 ```toml
 [dependencies]
-st-clickhouse-lib = { version = "0.2", features = ["derive"] }
+st-clickhouse-lib = { version = "0.3", features = ["derive"] }
 ```
 
 ```rust
@@ -398,7 +398,7 @@ TLS is provided by `rustls` (no OpenSSL dependency). Enable with the `tls` featu
 
 ```toml
 [dependencies]
-st-clickhouse-lib = { version = "0.2", features = ["tls"] }
+st-clickhouse-lib = { version = "0.3", features = ["tls"] }
 ```
 
 ```rust
@@ -555,7 +555,7 @@ Lower latency is better. `vs C++` = `st-clickhouse / clickhouse-cpp`, so values 
 | INSERT Memory 10K rows † | 0.549ms | 0.534ms | 1.03x |
 | ALTER UPDATE 5K/10K rows † | 0.525ms | 0.518ms | 1.01x |
 
-The **UInt64 owned-materialization row** is where st-clickhouse's 0.2.0 PlainColumn bulk-slice fast path (`read_all` / `query_all`) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms (~1.85× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
+The **UInt64 owned-materialization row** is where st-clickhouse's PlainColumn bulk-slice fast path (`read_all` / `query_all`, since 0.2.0) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms (~1.85× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
 
 † *Server-version drift:* these numbers were measured on ClickHouse **26.4**. On **26.7+** the server itself charges a flat ~60 ms per mutation (raw HTTP inserts that bypass the client cost the same), so both rows track the server's mutation path, not client overhead — the client still adds ~0.3 ms or less. All other rows were re-measured on 26.7 at or better than the values shown.
 
@@ -571,7 +571,7 @@ The **UInt64 owned-materialization row** is where st-clickhouse's 0.2.0 PlainCol
 | 1M rows as blocks | 2.391ms | 2.141ms | 467.1M |
 | 32 concurrent `SELECT 1` | N/A | 5.027ms | — |
 
-Throughput is **stable from 0.1.0 → 0.2.0** (within run-to-run variance): 0.2.0's optimizations live in the Rust materialization core (see *Rust vs C++* above — the UInt64 owned row), which is a small slice of Python end-to-end time, where PyO3 FFI + Python object construction dominate.
+Throughput has been **stable from 0.1.0 onward** (within run-to-run variance): the 0.2.0-era optimizations live in the Rust materialization core (see *Rust vs C++* above — the UInt64 owned row), which is a small slice of Python end-to-end time, where PyO3 FFI + Python object construction dominate.
 
 ### Python vs Official `clickhouse-connect` (HTTP)
 
@@ -680,7 +680,7 @@ Run locally:
 Rust users depend on one public crate:
 
 ```toml
-st-clickhouse-lib = { version = "0.2", features = ["derive", "tls", "lz4"] }
+st-clickhouse-lib = { version = "0.3", features = ["derive", "tls", "lz4"] }
 ```
 
 The Rust import path is `st_clickhouse`. The `st-clickhouse-derive` crate is an implementation detail required by Rust's proc-macro model and is pulled in by the `derive` feature.
