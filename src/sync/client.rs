@@ -8,6 +8,7 @@ use crate::sync::chunked::{
     ChunkedReader, TransportReader, negotiate_chunked_transport, write_chunk_header,
     write_chunked_packet,
 };
+use crate::sync::compression::DecompressingReader;
 use crate::sync::config::ClientConfig;
 use crate::sync::error::{Error, Result};
 use crate::sync::protocol::block::{Block, BlockView};
@@ -69,7 +70,7 @@ use crate::sync::protocol::revision;
 use crate::sync::protocol::table_status::{QualifiedTableName, TableStatus, TablesStatusResponse};
 use crate::sync::protocol::wire;
 use crate::sync::query_packet::{
-    QueryPacketTemplate, build_query_packet_template, write_empty_data_block_to,
+    QueryPacketTemplate, build_query_packet_template, write_empty_data_block_for,
 };
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -721,6 +722,7 @@ impl SyncClient {
         self.stream.flush()?;
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
@@ -730,6 +732,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         } else {
             let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
@@ -739,6 +742,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         }
     }
@@ -759,6 +763,7 @@ impl SyncClient {
         self.stream.flush()?;
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
@@ -767,6 +772,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         } else {
             let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
@@ -775,6 +781,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         }
     }
@@ -835,6 +842,7 @@ impl SyncClient {
         self.stream.flush()?;
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         let mut blocks = Vec::with_capacity(8);
         let mut budget = crate::limits::ResponseBudget::new(self.config.max_response_size);
         // One reader across the read AND any recovery drain: dropping a
@@ -853,6 +861,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
                 &mut budget,
             )
         } else {
@@ -862,6 +871,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
                 &mut budget,
             )
         };
@@ -890,6 +900,7 @@ impl SyncClient {
                             drain_deadline,
                             rev,
                             self.server_info.use_chunked_send,
+                            compressed,
                         )
                         .map(|_| ())
                     } else {
@@ -898,6 +909,7 @@ impl SyncClient {
                             drain_deadline,
                             rev,
                             self.server_info.use_chunked_send,
+                            compressed,
                         )
                         .map(|_| ())
                     }
@@ -924,6 +936,7 @@ impl SyncClient {
     pub fn drain_response(&mut self) -> Result<()> {
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
@@ -932,6 +945,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
             .map(|_| ())
         } else {
@@ -941,6 +955,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
             .map(|_| ())
         }
@@ -1098,7 +1113,10 @@ impl SyncClient {
     }
 
     fn write_empty_data_block(&self, buf: &mut Vec<u8>) {
-        write_empty_data_block_to(buf);
+        // The trailing empty Data block must match the query packet's
+        // compression flag: a plain block after a compressed query wedges the
+        // server (it parses the block header as a compression frame).
+        let _ = write_empty_data_block_for(buf, self.config.compression);
     }
 
     // ── INSERT protocol ──
@@ -1237,7 +1255,7 @@ impl SyncClient {
             stream: cloned,
             read_buffer_size: self.config.read_buffer_size,
             scratch: Vec::new(),
-            compression: self.config.compression,
+            compressed: self.config.compression.is_some(),
             negotiated_revision: self.server_info.negotiated_revision,
             chunked_recv: self.server_info.use_chunked_recv,
             chunked_send: self.server_info.use_chunked_send,
@@ -1250,6 +1268,7 @@ impl SyncClient {
     fn wait_for_insert_table_structure(&mut self) -> Result<()> {
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
@@ -1258,6 +1277,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             );
         }
         let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
@@ -1266,6 +1286,7 @@ impl SyncClient {
             deadline,
             rev,
             self.server_info.use_chunked_send,
+            compressed,
         )
     }
 
@@ -1284,7 +1305,7 @@ impl SyncClient {
 }
 
 fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
-    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool,
+    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool, compressed: bool,
 ) -> Result<()> {
     loop {
         if std::time::Instant::now() > deadline {
@@ -1294,7 +1315,7 @@ fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
         }
         match wire::read_varint(reader)? {
             1 => {
-                let _ = crate::sync::protocol::response::read_block(reader)?;
+                let _ = read_block_from(reader, compressed)?;
                 return Ok(());
             },
             2 => {
@@ -1309,17 +1330,18 @@ fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
             },
             6 => skip_profile_info_packet(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::read_block(reader)?;
+                let _ = read_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::read_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                read_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -1350,6 +1372,100 @@ fn total_row_count(blocks: &[Block]) -> Result<usize> {
     Ok(total)
 }
 
+// ── Compressed response reads ─────────────────────────────────────────────
+//
+// When the query packet's compression flag is set the server compresses
+// every Data/Totals/Extremes/ProfileEvents packet body (TableColumns too),
+// as a SEQUENCE of frames per packet (~1 MiB CompressedWriteBuffer flushes
+// mid-packet). Each helper below wraps `reader` in a fresh
+// DecompressingReader for exactly one packet body; the block parsers consume
+// exactly the block's bytes, so the wrapper never over-reads into the next
+// packet. Log packets (type 10) are protocol-defined UNCOMPRESSED and stay
+// on the raw reader.
+
+/// Construct the per-packet decompressing reader over `reader`.
+fn decompressing<R: std::io::Read>(reader: &mut R) -> Result<DecompressingReader<&mut R>> {
+    DecompressingReader::new(reader).map_err(|err| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            err.to_string(),
+        ))
+    })
+}
+
+/// Read one Data-family packet: the packet-type varint is already consumed.
+/// The table/tag string is NOT compressed — the server compresses only the
+/// block body that follows it (mirrors the async reader, which reads the
+/// table name from the raw stream before wrapping).
+fn read_block_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<Block> {
+    let _table = wire::read_string(reader)?;
+    if compressed {
+        crate::sync::protocol::response::read_block_body(&mut decompressing(reader)?)
+    } else {
+        crate::sync::protocol::response::read_block_body(reader)
+    }
+}
+fn discard_block_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<usize> {
+    let _table = wire::read_string(reader)?;
+    if compressed {
+        crate::sync::protocol::response::discard_block_body(&mut decompressing(reader)?)
+    } else {
+        crate::sync::protocol::response::discard_block_body(reader)
+    }
+}
+
+fn discard_block_body_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<usize> {
+    if compressed {
+        crate::sync::protocol::response::discard_block_body(&mut decompressing(reader)?)
+    } else {
+        crate::sync::protocol::response::discard_block_body(reader)
+    }
+}
+
+/// Read one tagged (ProfileEvents-style) packet: plain tag string, then the
+/// compressed block body.
+fn read_tagged_block_body_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<()> {
+    let _tag = wire::read_string(reader)?;
+    if compressed {
+        let _ = crate::sync::protocol::response::read_block_body(&mut decompressing(reader)?)?;
+    } else {
+        let _ = crate::sync::protocol::response::read_block_body(reader)?;
+    }
+    Ok(())
+}
+
+/// Read a compressed TableColumns packet: unlike Data packets, the whole
+/// payload after the packet-type varint is compressed (mirrors the async
+/// `read_table_columns_packet`).
+fn read_table_columns_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<()> {
+    if compressed {
+        let mut reader = decompressing(reader)?;
+        let _table = wire::read_string(&mut reader)?;
+        let _columns = wire::read_string(&mut reader)?;
+    } else {
+        let _table = wire::read_string(reader)?;
+        let _columns = wire::read_string(reader)?;
+    }
+    Ok(())
+}
+
+fn discard_tagged_block_body_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<()> {
+    let _tag = wire::read_string(reader)?;
+    discard_block_body_from(reader, compressed).map(|_| ())
+}
+
 /// Read response packets until EndOfStream (type 5).
 /// Pushes Data blocks into `blocks`.
 ///
@@ -1360,7 +1476,7 @@ fn total_row_count(blocks: &[Block]) -> Result<usize> {
 /// buffered reader inside the query method).
 fn read_response_blocks<R: std::io::Read + std::io::Write>(
     reader: &mut R, blocks: &mut Vec<Block>, deadline: std::time::Instant, rev: u64,
-    chunked_send: bool, budget: &mut crate::limits::ResponseBudget,
+    chunked_send: bool, compressed: bool, budget: &mut crate::limits::ResponseBudget,
 ) -> Result<()> {
     loop {
         if std::time::Instant::now() > deadline {
@@ -1373,10 +1489,9 @@ fn read_response_blocks<R: std::io::Read + std::io::Write>(
             },
             Err(e) => return Err(e),
         };
-
         match packet_type {
             1 => {
-                let block = crate::sync::protocol::response::read_block(reader)?;
+                let block = read_block_from(reader, compressed)?;
                 budget
                     .charge(block.payload_bytes())
                     .map_err(|_| Error::response_budget_exceeded(budget))?;
@@ -1388,17 +1503,18 @@ fn read_response_blocks<R: std::io::Read + std::io::Write>(
             5 => return Ok(()),
             6 => skip_profile_info_packet_for_revision(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::read_block(reader)?;
+                let _ = read_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::read_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                read_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -1412,6 +1528,7 @@ fn read_response_blocks<R: std::io::Read + std::io::Write>(
 
 fn read_response_block_views<R, F>(
     reader: &mut R, visitor: &mut F, deadline: std::time::Instant, rev: u64, chunked_send: bool,
+    compressed: bool,
 ) -> Result<()>
 where
     R: std::io::Read + std::io::Write,
@@ -1430,24 +1547,35 @@ where
         };
 
         match packet_type {
-            1 => crate::sync::protocol::response::read_block_view(reader, visitor)?,
+            1 => {
+                if compressed {
+                    let _table = wire::read_string(reader)?;
+                    crate::sync::protocol::response::read_block_body_view(
+                        &mut decompressing(reader)?,
+                        visitor,
+                    )?;
+                } else {
+                    crate::sync::protocol::response::read_block_view(reader, visitor)?;
+                }
+            },
             2 => return Err(read_exception_packet(reader)),
             3 => skip_progress_packet_for_revision(reader, rev)?,
             4 => {},
             5 => return Ok(()),
             6 => skip_profile_info_packet_for_revision(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::discard_block(reader)?;
+                let _ = discard_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::discard_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                discard_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -1460,7 +1588,7 @@ where
 }
 
 fn read_response_row_count<R: std::io::Read + std::io::Write>(
-    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool,
+    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool, compressed: bool,
 ) -> Result<usize> {
     let mut rows = 0usize;
     loop {
@@ -1478,7 +1606,7 @@ fn read_response_row_count<R: std::io::Read + std::io::Write>(
         match packet_type {
             1 => {
                 rows = rows
-                    .checked_add(crate::sync::protocol::response::discard_block(reader)?)
+                    .checked_add(discard_block_from(reader, compressed)?)
                     .ok_or_else(|| Error::Protocol("row count overflow".into()))?;
             },
             2 => return Err(read_exception_packet(reader)),
@@ -1487,17 +1615,18 @@ fn read_response_row_count<R: std::io::Read + std::io::Write>(
             5 => return Ok(rows),
             6 => skip_profile_info_packet_for_revision(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::discard_block(reader)?;
+                let _ = discard_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::discard_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                discard_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -1941,6 +2070,105 @@ fn write_all_vectored<W: Write>(writer: &mut W, slices: &mut [std::io::IoSlice<'
 // QueryStream — streaming query result parser
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Incremental byte source for one compressed packet body: serves the
+/// stream's already-buffered (de-chunked) bytes first, then refills from the
+/// transport — reading chunk framing when the negotiated transport is
+/// chunked, because chunk framing wraps the compressed bytes.
+///
+/// Lives only for the duration of one packet's parse; any bytes it reads
+/// beyond the caller's request stay in the stream's own buffer.
+struct StreamBytes<'a> {
+    buffer: &'a mut Vec<u8>,
+    pos: &'a mut usize,
+    scratch: &'a mut Vec<u8>,
+    stream: &'a mut crate::sync::transport::Transport,
+    read_buffer_size: usize,
+    chunked_recv: bool,
+}
+
+impl<'a> StreamBytes<'a> {
+    fn borrow(stream: &'a mut QueryStream) -> Self {
+        Self {
+            buffer: &mut stream.buffer,
+            pos: &mut stream.pos,
+            scratch: &mut stream.scratch,
+            stream: &mut stream.stream,
+            read_buffer_size: stream.read_buffer_size,
+            chunked_recv: stream.chunked_recv,
+        }
+    }
+
+    /// Pull the next chunked frame (length-prefixed) into the buffer.
+    fn refill_chunked(&mut self) -> std::io::Result<usize> {
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 {
+            // Zero-length chunk: keep pulling for the next real chunk.
+            return Ok(0);
+        }
+        if len > crate::limits::MAX_CHUNK_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "chunk length {len} exceeds maximum {}",
+                    crate::limits::MAX_CHUNK_LEN
+                ),
+            ));
+        }
+        let start = self.buffer.len();
+        self.buffer.resize(start + len, 0);
+        self.stream.read_exact(&mut self.buffer[start..])?;
+        Ok(len)
+    }
+
+    /// Pull more raw (or de-chunked) bytes into the buffer. Returns how many
+    /// new bytes became available.
+    fn refill(&mut self) -> std::io::Result<usize> {
+        if self.chunked_recv {
+            loop {
+                let n = self.refill_chunked()?;
+                if n > 0 {
+                    return Ok(n);
+                }
+            }
+        }
+        if self.scratch.len() != self.read_buffer_size {
+            self.scratch.resize(self.read_buffer_size, 0);
+        }
+        let mut buf = std::mem::take(&mut *self.scratch);
+        let result = self.stream.read(&mut buf);
+        let n = match result {
+            Ok(n) => n,
+            Err(err) => {
+                *self.scratch = buf;
+                return Err(err);
+            },
+        };
+        self.buffer.extend_from_slice(&buf[..n]);
+        *self.scratch = buf;
+        Ok(n)
+    }
+}
+
+impl Read for StreamBytes<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if *self.pos >= self.buffer.len() {
+            let n = self.refill()?;
+            if n == 0 {
+                return Ok(0);
+            }
+        }
+        let n = out.len().min(self.buffer.len() - *self.pos);
+        out[..n].copy_from_slice(&self.buffer[*self.pos..*self.pos + n]);
+        *self.pos += n;
+        Ok(n)
+    }
+}
+
 pub struct QueryStream {
     buffer: Vec<u8>,
     pos: usize,
@@ -1948,8 +2176,10 @@ pub struct QueryStream {
     read_buffer_size: usize,
     /// Reusable fill scratch: avoids a fresh zeroed allocation per fill.
     scratch: Vec<u8>,
-    #[allow(dead_code)]
-    compression: Option<crate::sync::compression::CompressionMethod>,
+    /// True when the server compresses this response's Data-family packet
+    /// bodies (Data/Totals/Extremes/ProfileEvents/TableColumns) as
+    /// multi-frame sequences — see `DecompressingReader`.
+    compressed: bool,
     negotiated_revision: u64,
     chunked_recv: bool,
     chunked_send: bool,
@@ -1984,20 +2214,27 @@ impl QueryStream {
                     Err(e) => return Err(e),
                 };
                 match packet_type {
-                    1 => match parse_block(&self.buffer, &mut self.pos) {
-                        Ok(block) => {
-                            // Return the block with the consumed prefix
-                            // already dropped (long streams must not retain
-                            // every parsed byte until drop).
+                    1 => {
+                        if self.compressed {
+                            let block = self.read_compressed_block()?;
                             self.compact();
                             return Ok(Some(block));
-                        },
-                        Err(Error::Protocol(_)) => {
-                            self.pos = saved_pos;
-                            self.fill_buffer()?;
-                            continue;
-                        },
-                        Err(e) => return Err(e),
+                        }
+                        match parse_block(&self.buffer, &mut self.pos) {
+                            Ok(block) => {
+                                // Return the block with the consumed prefix
+                                // already dropped (long streams must not
+                                // retain every parsed byte until drop).
+                                self.compact();
+                                return Ok(Some(block));
+                            },
+                            Err(Error::Protocol(_)) => {
+                                self.pos = saved_pos;
+                                self.fill_buffer()?;
+                                continue;
+                            },
+                            Err(e) => return Err(e),
+                        }
                     },
                     5 => {
                         self.done = true;
@@ -2106,16 +2343,43 @@ impl QueryStream {
                             }
                         }
                     },
-                    7 | 8 => match parse_block(&self.buffer, &mut self.pos) {
-                        Ok(_) => {},
-                        Err(Error::Protocol(_)) => {
+                    7 | 8 => {
+                        if self.compressed {
+                            self.read_compressed_block()?;
+                            continue;
+                        }
+                        match parse_block(&self.buffer, &mut self.pos) {
+                            Ok(_) => {},
+                            Err(Error::Protocol(_)) => {
+                                self.pos = saved_pos;
+                                self.fill_buffer()?;
+                                continue;
+                            },
+                            Err(e) => return Err(e),
+                        }
+                    },
+                    10 => {
+                        // Log blocks are protocol-defined uncompressed.
+                        if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
                             self.pos = saved_pos;
                             self.fill_buffer()?;
                             continue;
-                        },
-                        Err(e) => return Err(e),
+                        }
+                        match parse_block_body(&self.buffer, &mut self.pos) {
+                            Ok(_) => {},
+                            Err(Error::Protocol(_)) => {
+                                self.pos = saved_pos;
+                                self.fill_buffer()?;
+                                continue;
+                            },
+                            Err(e) => return Err(e),
+                        }
                     },
-                    10 | 14 => {
+                    14 => {
+                        if self.compressed {
+                            self.read_compressed_tagged_block()?;
+                            continue;
+                        }
                         if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
                             self.pos = saved_pos;
                             self.fill_buffer()?;
@@ -2132,6 +2396,10 @@ impl QueryStream {
                         }
                     },
                     11 => {
+                        if self.compressed {
+                            self.read_compressed_table_columns()?;
+                            continue;
+                        }
                         if wire::parse_string(&self.buffer, &mut self.pos).is_err()
                             || wire::parse_string(&self.buffer, &mut self.pos).is_err()
                         {
@@ -2194,6 +2462,65 @@ impl QueryStream {
                 self.fill_buffer()?;
             }
         }
+    }
+
+    /// Read one Data-packet body through the decompressing wrapper.
+    ///
+    /// The packet type varint was already consumed from the buffer. The
+    /// wrapper pulls frames from a [`StreamBytes`] adapter (buffered bytes
+    /// first, then the transport — de-chunked when the negotiated transport
+    /// is chunked, since chunk framing wraps the compressed bytes), so the
+    /// block parser consumes exactly this packet's frame sequence and the
+    /// next packet's bytes stay in `self.buffer`/the transport.
+    fn read_compressed_block(&mut self) -> Result<Block> {
+        // The table name precedes the compressed body and stays plain.
+        if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
+            self.fill_buffer()?;
+            wire::parse_string(&self.buffer, &mut self.pos)?;
+        }
+        let mut bytes = StreamBytes::borrow(self);
+        let mut reader = decompressing(&mut bytes)?;
+        let block = crate::sync::protocol::response::read_block_body(&mut reader)?;
+        let pending = reader.into_pending();
+        if !pending.is_empty() {
+            // Non-conforming server packed extra bytes into this packet's
+            // frame sequence: keep them in front of the stream buffer.
+            let rest = self.buffer.split_off(self.pos);
+            self.pos = 0;
+            self.buffer = pending;
+            self.buffer.extend(rest);
+        }
+        Ok(block)
+    }
+
+    /// Read one tagged (ProfileEvents-style) packet body: compressed tag
+    /// string plus block body, both through the wrapper.
+    fn read_compressed_tagged_block(&mut self) -> Result<()> {
+        // The tag string precedes the compressed body and stays plain.
+        if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
+            self.fill_buffer()?;
+            wire::parse_string(&self.buffer, &mut self.pos)?;
+        }
+        let mut bytes = StreamBytes::borrow(self);
+        let mut reader = decompressing(&mut bytes)?;
+        let _block = crate::sync::protocol::response::read_block_body(&mut reader)?;
+        let pending = reader.into_pending();
+        if !pending.is_empty() {
+            let rest = self.buffer.split_off(self.pos);
+            self.pos = 0;
+            self.buffer = pending;
+            self.buffer.extend(rest);
+        }
+        Ok(())
+    }
+
+    /// Read a compressed TableColumns packet (two strings).
+    fn read_compressed_table_columns(&mut self) -> Result<()> {
+        let mut bytes = StreamBytes::borrow(self);
+        let mut reader = decompressing(&mut bytes)?;
+        let _table = wire::read_string(&mut reader)?;
+        let _columns = wire::read_string(&mut reader)?;
+        Ok(())
     }
 
     fn fill_buffer(&mut self) -> Result<()> {
@@ -2343,7 +2670,7 @@ mod tests {
                 stream: crate::sync::transport::Transport::new_plain(client),
                 read_buffer_size: 8192,
                 scratch: Vec::new(),
-                compression: None,
+                compressed: false,
                 negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
                 chunked_recv: true,
                 chunked_send: false,
@@ -2387,7 +2714,7 @@ mod tests {
                 stream: crate::sync::transport::Transport::new_plain(client),
                 read_buffer_size: 8192,
                 scratch: Vec::new(),
-                compression: None,
+                compressed: false,
                 negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
                 chunked_recv: false,
                 chunked_send: false,
@@ -2508,6 +2835,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            false,
             &mut crate::limits::ResponseBudget::new(usize::MAX),
         )
         .expect_err("server exception must surface");
@@ -2524,6 +2852,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            false,
             &mut crate::limits::ResponseBudget::new(usize::MAX),
         )
         .expect("EndOfStream drains to Ok");
@@ -2535,6 +2864,7 @@ mod tests {
             &mut blocks,
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
+            false,
             false,
             &mut crate::limits::ResponseBudget::new(usize::MAX),
         )
@@ -2585,6 +2915,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            false,
             &mut crate::limits::ResponseBudget::new(16),
         )
         .expect_err("second 16-byte block must breach a 16-byte budget");
@@ -2612,6 +2943,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            false,
             &mut crate::limits::ResponseBudget::new(32),
         )
         .expect("cumulative payload exactly at the cap must pass");
@@ -2633,6 +2965,7 @@ mod tests {
             &mut blocks,
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
+            false,
             false,
             &mut crate::limits::ResponseBudget::new(config.max_response_size),
         )
@@ -2657,6 +2990,7 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             revision::DEFAULT_PROTOCOL_REVISION,
             false,
+            false,
             &mut crate::limits::ResponseBudget::new(config.max_response_size),
         )
         .expect("cap raised to the exact payload passes");
@@ -2679,6 +3013,7 @@ mod tests {
                 },
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
                 revision::DEFAULT_PROTOCOL_REVISION,
+                false,
                 false,
             )
         };
@@ -2960,7 +3295,7 @@ mod tests {
         // Deterministic tail: template post-settings bytes + query text +
         // parameters (CUSTOM flag framing) + trailing empty Data block.
         let mut empty_data_block = Vec::new();
-        write_empty_data_block_to(&mut empty_data_block);
+        let _ = write_empty_data_block_for(&mut empty_data_block, None);
         let mut expected_tail = Vec::new();
         expected_tail.extend_from_slice(
             &client.query_template.before_query[client.query_template.settings_len..],

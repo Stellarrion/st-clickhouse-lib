@@ -24,10 +24,12 @@ use std::time::Duration;
 /// materialized JSON carries an 8-byte string-serialization version,
 /// LowCardinality carries its 24-byte header/dictionary/index layout, and
 /// Variant/Dynamic carry their per-subcolumn state prefixes.
+#[cfg(test)]
 fn skip_col_typed(data: &[u8], pos: &mut usize, tn: &str, rows: usize) -> Result<()> {
     crate::protocol::skip_column::skip_column_data_by_name(data, pos, tn, rows)
 }
 
+#[cfg(test)]
 fn advance_pos(data: &[u8], pos: &mut usize, len: usize) -> Result<()> {
     let end = (*pos)
         .checked_add(len)
@@ -222,13 +224,8 @@ async fn discard_data_block_compressed<
     stream: &mut S,
 ) -> Result<usize> {
     let _table_name = read_string_async(stream).await?;
-    match read_compressed_payload_or_plain_prefix(stream).await? {
-        BlockPayload::Compressed(decompressed) => discard_decompressed_block(&decompressed),
-        BlockPayload::PlainPrefix(prefix) => {
-            let mut prefixed = PrefixedStream::new(prefix, stream);
-            discard_data_block_body(&mut prefixed).await
-        },
-    }
+    let mut decompressed = DecompressingStream::new(stream).await?;
+    discard_data_block_body(&mut decompressed).await
 }
 
 async fn read_data_block_compressed<
@@ -237,13 +234,8 @@ async fn read_data_block_compressed<
     stream: &mut S,
 ) -> Result<Block> {
     let _table_name = read_string_async(stream).await?;
-    match read_compressed_payload_or_plain_prefix(stream).await? {
-        BlockPayload::Compressed(decompressed) => parse_decompressed_block(decompressed),
-        BlockPayload::PlainPrefix(prefix) => {
-            let mut prefixed = PrefixedStream::new(prefix, stream);
-            read_data_block_body(&mut prefixed).await
-        },
-    }
+    let mut decompressed = DecompressingStream::new(stream).await?;
+    read_data_block_body(&mut decompressed).await
 }
 
 pub(super) async fn read_table_columns_packet<
@@ -257,133 +249,282 @@ pub(super) async fn read_table_columns_packet<
         return Ok(());
     }
 
-    match read_compressed_payload_or_plain_prefix(stream).await? {
-        BlockPayload::Compressed(payload) => {
-            let mut pos = 0usize;
-            let _name = parse_string(&payload, &mut pos)?;
-            let _types = parse_string(&payload, &mut pos)?;
-        },
-        BlockPayload::PlainPrefix(prefix) => {
-            let mut prefixed = PrefixedStream::new(prefix, stream);
-            let _name = read_string_async(&mut prefixed).await?;
-            let _types = read_string_async(&mut prefixed).await?;
-        },
-    }
+    let mut decompressed = DecompressingStream::new(stream).await?;
+    let _name = read_string_async(&mut decompressed).await?;
+    let _types = read_string_async(&mut decompressed).await?;
     Ok(())
 }
 
-enum BlockPayload {
-    Compressed(bytes::Bytes),
-    PlainPrefix(Vec<u8>),
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-frame decompressing stream
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wire constants of one compression frame (see [`crate::compression`]).
+const CHECKSUM_LEN: usize = 16;
+const COMPRESSED_BODY_HEADER_LEN: usize = 9;
+/// Checksum plus the 9-byte size/method header.
+const FRAME_HEADER_TOTAL: usize = CHECKSUM_LEN + COMPRESSED_BODY_HEADER_LEN;
+/// Offset of the method byte inside a frame (after the 16-byte checksum).
+const METHOD_OFFSET: usize = 16;
+
+/// Async, continuously decompressing view over one Data-packet body.
+///
+/// ClickHouse serializes a Data packet's block through a ~1 MiB
+/// `CompressedWriteBuffer` that flushes mid-packet, so any serialized block
+/// above the threshold arrives as a *sequence* of compression frames, not
+/// one. This wrapper is the async twin of clickhouse-cpp's
+/// `CompressedReadBuffer`: decompressed bytes are served from an internal
+/// buffer, and the next frame is pulled from the wire only when that buffer
+/// is exhausted. A parser that reads exactly one block therefore consumes
+/// exactly the packet body — whether it spans one frame or many — and never
+/// reads into the next packet. (Frames never span packets: the server flushes
+/// the compressed buffer at each packet boundary.)
+///
+/// Construction keeps the historical plain-prefix heuristic: the first byte
+/// plus the following checksum bytes are sniffed — with a short timeout, a
+/// genuinely plain body may be shorter than the checksum — and unless byte
+/// 16 of the payload (the method byte of a frame header) is 0x82/0x90/0x02
+/// the wrapper degrades to a pass-through that replays the sniffed prefix
+/// and then serves the inner stream verbatim. Uncompressed bodies from
+/// non-conforming servers stay parseable.
+///
+/// Budgets: each frame is bounded by [`crate::limits::MAX_FRAME_SIZE`] (via
+/// [`crate::compression::decode_frame`]), and the cumulative decompressed
+/// size of the whole packet body is charged against the block-level
+/// [`crate::limits::MAX_BLOCK_BYTES`] budget so a hostile frame sequence
+/// cannot grow the buffer without bound.
+struct DecompressingStream<'a, S> {
+    inner: &'a mut S,
+    /// Decompressed (or, in plain mode, sniffed) bytes not yet served.
+    buf: Vec<u8>,
+    pos: usize,
+    /// Sniffed as a plain (uncompressed) body: serve `buf`, then delegate.
+    plain: bool,
+    /// Cumulative decompressed bytes produced for this packet body.
+    produced: usize,
+    /// Partial frame accumulator (checksum + header + body) for the frame
+    /// currently being pulled; survives `Poll::Pending` returns.
+    frame: Vec<u8>,
+    /// Validated byte count of `frame` (the 25-byte header arrives first).
+    frame_got: usize,
+    /// Total frame length once the header is parsed (0 until then).
+    frame_len: usize,
 }
 
-async fn read_compressed_payload_or_plain_prefix<
-    S: crate::runtime::io::AsyncRead + crate::runtime::io::AsyncWrite + Unpin,
->(
-    stream: &mut S,
-) -> Result<BlockPayload> {
-    const METHOD_OFFSET: usize = 16;
-    const HEADER_LEN: usize = 25;
-    const COMPRESSED_BODY_HEADER_LEN: usize = 9;
+impl<'a, S: AsyncRead + Unpin> DecompressingStream<'a, S> {
+    /// Sniff the payload and wrap `stream`. See the type documentation for
+    /// the heuristic and its fallbacks.
+    async fn new(stream: &'a mut S) -> Result<Self> {
+        let mut sniff = [0u8; METHOD_OFFSET + 1];
+        stream.read_exact(&mut sniff[..1]).await?;
+        match crate::runtime::time::timeout(
+            Duration::from_millis(50),
+            stream.read_exact(&mut sniff[1..]),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {},
+            Ok(Err(err)) => return Err(err.into()),
+            // The remaining checksum bytes never arrived: treat the payload
+            // as a short plain body (a compression frame always sends 25+).
+            Err(_) => return Ok(Self::plain(stream, sniff[..1].to_vec())),
+        }
 
-    let mut prefix = [0u8; METHOD_OFFSET + 1];
-    stream.read_exact(&mut prefix[..1]).await?;
-    match crate::runtime::time::timeout(
-        Duration::from_millis(50),
-        stream.read_exact(&mut prefix[1..]),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {},
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => return Ok(BlockPayload::PlainPrefix(prefix[..1].to_vec())),
+        match sniff[METHOD_OFFSET] {
+            0x82 | 0x90 | 0x02 => {},
+            _ => return Ok(Self::plain(stream, sniff.to_vec())),
+        }
+
+        let mut frame = sniff.to_vec();
+        let mut rest = [0u8; FRAME_HEADER_TOTAL - METHOD_OFFSET - 1];
+        stream.read_exact(&mut rest).await?;
+        frame.extend_from_slice(&rest);
+
+        let compressed_size =
+            u32::from_le_bytes([frame[17], frame[18], frame[19], frame[20]]) as usize;
+        // The method byte matched, so this looks like a compressed frame.
+        // Sizes below the 9-byte header remain ambiguous with plain payloads
+        // and keep the plain fallback; an oversized claim is rejected
+        // outright: it must never reach the frame-body read below.
+        if compressed_size < COMPRESSED_BODY_HEADER_LEN {
+            return Ok(Self::plain(stream, frame));
+        }
+        if compressed_size > crate::limits::MAX_FRAME_SIZE {
+            return Err(crate::error::Error::Compression(format!(
+                "compressed_size {compressed_size} exceeds {} byte frame cap",
+                crate::limits::MAX_FRAME_SIZE
+            )));
+        }
+
+        Ok(Self {
+            inner: stream,
+            buf: Vec::new(),
+            pos: 0,
+            plain: false,
+            produced: 0,
+            frame,
+            frame_got: FRAME_HEADER_TOTAL,
+            frame_len: CHECKSUM_LEN + compressed_size,
+        })
     }
 
-    match prefix[METHOD_OFFSET] {
-        0x82 | 0x90 | 0x02 => {},
-        _ => return Ok(BlockPayload::PlainPrefix(prefix.to_vec())),
-    }
-
-    let mut frame = Vec::with_capacity(HEADER_LEN);
-    frame.extend_from_slice(&prefix);
-    let mut rest = [0u8; HEADER_LEN - METHOD_OFFSET - 1];
-    stream.read_exact(&mut rest).await?;
-    frame.extend_from_slice(&rest);
-
-    let compressed_size = u32::from_le_bytes([frame[17], frame[18], frame[19], frame[20]]) as usize;
-    // The method byte matched, so this is a compressed frame. Sizes below the
-    // 9-byte header remain ambiguous with plain payloads and keep the plain
-    // fallback, but an oversized claim is rejected outright: it must never
-    // reach the resize below, which previously allowed up to 1 GiB.
-    if compressed_size < COMPRESSED_BODY_HEADER_LEN {
-        return Ok(BlockPayload::PlainPrefix(frame));
-    }
-    if compressed_size > crate::limits::MAX_FRAME_SIZE {
-        return Err(crate::error::Error::Compression(format!(
-            "compressed_size {compressed_size} exceeds {} byte frame cap",
-            crate::limits::MAX_FRAME_SIZE
-        )));
-    }
-
-    let body_len = compressed_size - COMPRESSED_BODY_HEADER_LEN;
-    let start = frame.len();
-    frame.resize(start + body_len, 0);
-    stream.read_exact(&mut frame[start..]).await?;
-
-    let decompressed = crate::compression::decode_frame_bytes(&frame)?;
-    Ok(BlockPayload::Compressed(bytes::Bytes::from(decompressed)))
-}
-
-struct PrefixedStream<'a, S> {
-    prefix: Vec<u8>,
-    prefix_pos: usize,
-    stream: &'a mut S,
-}
-
-impl<'a, S> PrefixedStream<'a, S> {
-    fn new(prefix: Vec<u8>, stream: &'a mut S) -> Self {
+    fn plain(stream: &'a mut S, prefix: Vec<u8>) -> Self {
         Self {
-            prefix,
-            prefix_pos: 0,
-            stream,
+            inner: stream,
+            buf: prefix,
+            pos: 0,
+            plain: true,
+            produced: 0,
+            frame: Vec::new(),
+            frame_got: 0,
+            frame_len: 0,
         }
     }
-}
 
-impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<'_, S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if self.prefix_pos < self.prefix.len() {
-            let n = buf
-                .remaining()
-                .min(self.prefix.len().saturating_sub(self.prefix_pos));
-            if n > 0 {
-                buf.put_slice(&self.prefix[self.prefix_pos..self.prefix_pos + n]);
-                self.prefix_pos += n;
+    /// Pull the next frame to completion, resuming across `Poll::Pending`.
+    ///
+    /// Reads exactly the bytes of one frame from the inner stream (never
+    /// more), verifies it, and swaps its decompressed body into the serving
+    /// buffer. Returns `Ok(())` only with fresh bytes available in `buf`.
+    fn poll_pull_frame(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // Phase 1: complete the 16-byte checksum + 9-byte size/method header.
+        while self.frame_got < FRAME_HEADER_TOTAL {
+            self.frame.resize(FRAME_HEADER_TOTAL, 0);
+            let got = self.frame_got;
+            let mut rb = ReadBuf::new(&mut self.frame[got..FRAME_HEADER_TOTAL]);
+            match Pin::new(&mut *self.inner).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "compression frame header truncated",
+                        )));
+                    }
+                    self.frame_got += n;
+                },
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
-            return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut *self.stream).poll_read(cx, buf)
+
+        // Phase 2: once per frame, validate the server-controlled size and
+        // fix the total frame length before any body byte is read.
+        if self.frame_len == 0 {
+            let compressed_size = u32::from_le_bytes([
+                self.frame[17],
+                self.frame[18],
+                self.frame[19],
+                self.frame[20],
+            ]) as usize;
+            if compressed_size < COMPRESSED_BODY_HEADER_LEN {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "compressed_size {compressed_size} < header length \
+                         {COMPRESSED_BODY_HEADER_LEN}"
+                    ),
+                )));
+            }
+            if compressed_size > crate::limits::MAX_FRAME_SIZE {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "compressed_size {compressed_size} exceeds {} byte frame cap",
+                        crate::limits::MAX_FRAME_SIZE
+                    ),
+                )));
+            }
+            self.frame_len = CHECKSUM_LEN + compressed_size;
+        }
+
+        // Phase 3: complete the compressed body.
+        while self.frame_got < self.frame_len {
+            self.frame.resize(self.frame_len, 0);
+            let got = self.frame_got;
+            let end = self.frame_len;
+            let mut rb = ReadBuf::new(&mut self.frame[got..end]);
+            match Pin::new(&mut *self.inner).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "compression frame body truncated",
+                        )));
+                    }
+                    self.frame_got += n;
+                },
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Phase 4: verify + decode, then charge the block-level budget
+        // before the decompressed bytes become servable.
+        let frame = std::mem::take(&mut self.frame);
+        self.frame_got = 0;
+        self.frame_len = 0;
+        let decompressed = crate::compression::decode_frame_bytes(&frame)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+        self.produced = crate::limits::checked_block_bytes(
+            self.produced,
+            decompressed.len(),
+            "decompressed block",
+        )
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+        self.buf = decompressed;
+        self.pos = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<'_, S> {
+impl<S: AsyncRead + Unpin> AsyncRead for DecompressingStream<'_, S> {
+    fn poll_read(
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            // Serve buffered decompressed (or sniffed plain) bytes first.
+            if this.pos < this.buf.len() {
+                let n = buf.remaining().min(this.buf.len() - this.pos);
+                let start = this.pos;
+                buf.put_slice(&this.buf[start..start + n]);
+                this.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if this.plain {
+                return Pin::new(&mut *this.inner).poll_read(cx, buf);
+            }
+            match this.poll_pull_frame(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for DecompressingStream<'_, S> {
     fn poll_write(
         mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut *self.stream).poll_write(cx, buf)
+        Pin::new(&mut *self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.stream).poll_flush(cx)
+        Pin::new(&mut *self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.stream).poll_shutdown(cx)
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }
 
+#[cfg(test)]
 fn parse_decompressed_block(shared: bytes::Bytes) -> Result<Block> {
     let mut pos = 0usize;
     parse_block_info(&shared, &mut pos)?;
@@ -472,6 +613,7 @@ fn parse_decompressed_block(shared: bytes::Bytes) -> Result<Block> {
 /// the streaming `read_lc_async`: consume the 24-byte header, the dictionary
 /// column (`num_keys` inner rows), the 8-byte index count, and the index
 /// bytes, then decode the indexes against the dictionary.
+#[cfg(test)]
 fn lc_materialized_from_buffer(
     shared: &bytes::Bytes, pos: &mut usize, inner: &type_parser::ColumnType, rows: usize,
 ) -> Result<bytes::Bytes> {
@@ -520,6 +662,7 @@ fn lc_materialized_from_buffer(
 }
 
 /// Read `len` bytes from a buffer at `pos`, advancing the position.
+#[cfg(test)]
 fn parse_fixed_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = (*pos)
         .checked_add(len)
@@ -532,6 +675,7 @@ fn parse_fixed_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn discard_decompressed_block(shared: &[u8]) -> Result<usize> {
     let mut pos = 0usize;
     parse_block_info(shared, &mut pos)?;
@@ -565,6 +709,7 @@ fn discard_decompressed_block(shared: &[u8]) -> Result<usize> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn parse_block_info(data: &[u8], pos: &mut usize) -> Result<()> {
     loop {
         let d = parse_varint(data, pos)?;
@@ -955,16 +1100,18 @@ async fn read_lc_async<
 // Sync parsing helpers
 // ═══════════════════════════════════════════════
 
+#[cfg(test)]
 fn parse_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
     crate::protocol::wire::parse_varint(data, pos)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn parse_string<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a str> {
     let bytes = parse_bytes(data, pos)?;
     std::str::from_utf8(bytes).map_err(|e| crate::error::Error::Protocol(format!("utf8: {e}")))
 }
 
+#[cfg(test)]
 fn parse_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let len = usize::try_from(parse_varint(data, pos)?)
         .map_err(|_| crate::error::Error::Protocol("byte string too large".into()))?;
@@ -977,19 +1124,6 @@ fn parse_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let bytes = &data[*pos..end];
     *pos = end;
     Ok(bytes)
-}
-
-#[allow(dead_code)]
-fn parse_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
-    let end = (*pos)
-        .checked_add(4)
-        .ok_or_else(|| crate::error::Error::Protocol("i32 length overflow".into()))?;
-    if end > data.len() {
-        return Err(crate::error::Error::Protocol("eof".into()));
-    }
-    let v = i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-    *pos = end;
-    Ok(v)
 }
 
 #[cfg(test)]
@@ -1365,65 +1499,216 @@ mod tests {
             .await
             .expect("send hostile frame header");
 
-        match read_compressed_payload_or_plain_prefix(&mut client).await {
-            Err(err) => {
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("exceeds") && msg.contains("frame cap"),
-                    "expected frame cap error, got: {msg}"
-                );
-            },
-            Ok(BlockPayload::PlainPrefix(p)) => {
-                unreachable!(
-                    "oversized frame must not fall back to plain, got {} bytes",
-                    p.len()
-                )
-            },
-            Ok(BlockPayload::Compressed(_)) => {
-                unreachable!("oversized frame must be rejected before body read/allocation")
-            },
-        }
+        let err = match DecompressingStream::new(&mut client).await {
+            Err(err) => err,
+            Ok(_) => unreachable!("oversized frame must be rejected before body read/allocation"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("frame cap"),
+            "expected frame cap error, got: {msg}"
+        );
     }
 
     /// A well-formed frame below the cap still decompresses through the
-    /// block reader after the cap was added.
+    /// decompressing stream after the cap was added.
     #[tokio::test]
     async fn valid_compressed_frame_still_decodes() {
-        let payload = b"block-body-bytes".to_vec();
+        let payload = block_body_bytes(0, 0); // BlockInfo end, 0 cols, 0 rows
         let frame =
             crate::compression::encode_frame(&payload, crate::compression::CompressionMethod::None)
                 .expect("encode test frame");
         let (mut server, mut client) = crate::runtime::io::duplex(64);
         server.write_all(&frame).await.expect("send valid frame");
 
-        match read_compressed_payload_or_plain_prefix(&mut client).await {
-            Ok(BlockPayload::Compressed(bytes)) => assert_eq!(&bytes[..], &payload[..]),
-            Ok(BlockPayload::PlainPrefix(p)) => {
-                unreachable!(
-                    "expected compressed payload, got plain prefix of {} bytes",
-                    p.len()
-                )
-            },
-            Err(e) => unreachable!("expected compressed payload, got error: {e}"),
-        }
+        let mut decompressed = DecompressingStream::new(&mut client)
+            .await
+            .expect("sniff must classify the frame as compressed");
+        let block = read_data_block_body(&mut decompressed)
+            .await
+            .expect("block body must parse from the decompressed stream");
+        assert_eq!(block.rows, 0);
+        assert!(block.columns.is_empty());
     }
 
-    /// The plain-payload fallback survives the cap change: a body whose
-    /// 17th byte is not a compression method byte is still returned as a
-    /// plain prefix instead of being treated as a compressed frame.
+    /// The plain-payload fallback survives: a body whose 17th byte is not a
+    /// compression method byte is still served verbatim instead of being
+    /// treated as a compressed frame.
     #[tokio::test]
     async fn non_compressed_prefix_still_falls_back_to_plain() {
         let wire = vec![0x01u8; 17];
         let (mut server, mut client) = crate::runtime::io::duplex(64);
         server.write_all(&wire).await.expect("send plain prefix");
 
-        match read_compressed_payload_or_plain_prefix(&mut client).await {
-            Ok(BlockPayload::PlainPrefix(prefix)) => assert_eq!(prefix.len(), 17),
-            Ok(BlockPayload::Compressed(_)) => {
-                unreachable!("plain prefix must not be decoded as a compressed frame")
-            },
-            Err(e) => unreachable!("expected plain prefix, got error: {e}"),
-        }
+        let mut decompressed = DecompressingStream::new(&mut client)
+            .await
+            .expect("sniff must fall back to plain for a non-method byte");
+        let mut served = vec![0u8; 17];
+        use crate::runtime::io::AsyncReadExt;
+        decompressed
+            .read_exact(&mut served)
+            .await
+            .expect("plain prefix bytes must be served verbatim");
+        assert_eq!(served, wire);
+    }
+
+    /// Build a one-column UInt8 block body with `rows` rows of `0x5A`.
+    fn uint8_block_body(rows: usize) -> Vec<u8> {
+        let mut data = block_body_bytes(1, rows as u64);
+        crate::protocol::wire::write_string(&mut data, "c").expect("test write");
+        crate::protocol::wire::write_string(&mut data, "UInt8").expect("test write");
+        data.push(0); // custom serialization
+        data.extend(std::iter::repeat_n(0x5Au8, rows));
+        data
+    }
+
+    /// THE multi-frame regression: a packet body split across two frames must
+    /// parse as one block, and the wrapper must not consume any byte beyond
+    /// the last frame (the sentinel stays readable on the raw stream).
+    #[tokio::test]
+    async fn two_frame_compressed_packet_parses_completely() {
+        two_frame_case(crate::compression::CompressionMethod::None).await;
+    }
+
+    #[cfg(feature = "lz4")]
+    #[tokio::test]
+    async fn two_frame_compressed_packet_parses_completely_lz4() {
+        two_frame_case(crate::compression::CompressionMethod::Lz4).await;
+    }
+
+    async fn two_frame_case(method: crate::compression::CompressionMethod) {
+        let body = uint8_block_body(1000);
+        // Split mid-column (inside the 1000 payload bytes) exactly like the
+        // server's ~1 MiB flush does mid-packet.
+        let split = body.len() - 371;
+        let frame_a =
+            crate::compression::encode_frame(&body[..split], method).expect("encode first frame");
+        let frame_b =
+            crate::compression::encode_frame(&body[split..], method).expect("encode second frame");
+        let mut wire = [frame_a, frame_b].concat();
+        wire.push(0xEE); // sentinel: first byte of the NEXT packet
+
+        let (mut server, mut client) = crate::runtime::io::duplex(8192);
+        server
+            .write_all(&wire)
+            .await
+            .expect("send two frames + sentinel");
+
+        let mut decompressed = DecompressingStream::new(&mut client)
+            .await
+            .expect("sniff must classify the first frame as compressed");
+        let block = read_data_block_body(&mut decompressed)
+            .await
+            .expect("both frames must be consumed as one logical body");
+        assert_eq!(block.rows, 1000);
+        assert_eq!(block.columns.len(), 1);
+        assert_eq!(block.columns[0].name, "c");
+        assert_eq!(block.columns[0].type_name, "UInt8");
+        assert_eq!(&block.columns[0].data[..], &vec![0x5Au8; 1000][..]);
+
+        // The wrapper must stop exactly at the packet end: the sentinel is
+        // still pending on the raw stream, not buffered inside the wrapper.
+        use crate::runtime::io::AsyncReadExt;
+        let mut sentinel = [0u8; 1];
+        client
+            .read_exact(&mut sentinel)
+            .await
+            .expect("sentinel must remain on the raw stream");
+        assert_eq!(sentinel[0], 0xEE);
+    }
+
+    /// Three frames with boundaries inside a String column's length varint
+    /// and value bytes: the streaming parser's read_exact calls must pull
+    /// frames transparently at arbitrary boundaries.
+    #[tokio::test]
+    async fn three_frame_packet_with_string_column_splits_mid_value() {
+        let value = "v".repeat(900);
+        let mut data = block_body_bytes(1, 1);
+        crate::protocol::wire::write_string(&mut data, "s").expect("test write");
+        crate::protocol::wire::write_string(&mut data, "String").expect("test write");
+        data.push(0);
+        crate::protocol::wire::write_string(&mut data, &value).expect("test write");
+
+        // Splits: inside the value and near the varint length prefix.
+        let a = 20;
+        let b = data.len() - 111;
+        let frame_a = crate::compression::encode_frame(
+            &data[..a],
+            crate::compression::CompressionMethod::None,
+        )
+        .expect("encode frame a");
+        let frame_b = crate::compression::encode_frame(
+            &data[a..b],
+            crate::compression::CompressionMethod::None,
+        )
+        .expect("encode frame b");
+        let frame_c = crate::compression::encode_frame(
+            &data[b..],
+            crate::compression::CompressionMethod::None,
+        )
+        .expect("encode frame c");
+
+        let (mut server, mut client) = crate::runtime::io::duplex(8192);
+        server
+            .write_all(&[frame_a, frame_b, frame_c].concat())
+            .await
+            .expect("send three frames");
+
+        let mut decompressed = DecompressingStream::new(&mut client)
+            .await
+            .expect("sniff must classify as compressed");
+        let block = read_data_block_body(&mut decompressed)
+            .await
+            .expect("three frames must parse as one body");
+        assert_eq!(block.rows, 1);
+        // String column data keeps the per-value length varint prefix.
+        assert_eq!(block.columns[0].data.len(), 902);
+        assert_eq!(&block.columns[0].data[..2], &[132, 7]); // varint(900)
+        assert!(block.columns[0].data[2..].iter().all(|&b| b == b'v'));
+    }
+
+    /// A second Data packet following a multi-frame one on the same stream:
+    /// both packets parse and the packet boundary is respected exactly.
+    #[tokio::test]
+    async fn consecutive_multiframe_packets_each_parse() {
+        let body1 = uint8_block_body(700);
+        let body2 = uint8_block_body(11);
+        let frames1 = [
+            crate::compression::encode_frame(
+                &body1[..123],
+                crate::compression::CompressionMethod::None,
+            )
+            .expect("encode"),
+            crate::compression::encode_frame(
+                &body1[123..],
+                crate::compression::CompressionMethod::None,
+            )
+            .expect("encode"),
+        ]
+        .concat();
+        let frames2 =
+            crate::compression::encode_frame(&body2, crate::compression::CompressionMethod::None)
+                .expect("encode");
+
+        let (mut server, mut client) = crate::runtime::io::duplex(8192);
+        server
+            .write_all(&[frames1, frames2].concat())
+            .await
+            .expect("send two multi/multi packets");
+
+        let mut first = DecompressingStream::new(&mut client)
+            .await
+            .expect("first packet sniff");
+        let block1 = read_data_block_body(&mut first).await.expect("first body");
+        assert_eq!(block1.rows, 700);
+
+        let mut second = DecompressingStream::new(&mut client)
+            .await
+            .expect("second packet sniff");
+        let block2 = read_data_block_body(&mut second)
+            .await
+            .expect("second body");
+        assert_eq!(block2.rows, 11);
     }
 
     #[test]

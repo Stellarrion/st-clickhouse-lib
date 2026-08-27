@@ -4,6 +4,42 @@ All notable changes to st-clickhouse are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Multi-frame compressed responses now decode correctly (P0)**: ClickHouse
+  flushes its ~1 MiB `CompressedWriteBuffer` mid-packet, so any Data packet
+  whose serialized body exceeds ~1 MiB arrives as a *sequence* of compression
+  frames. The async reader consumed exactly ONE frame per Data packet and
+  left the remaining frames' bytes in the stream, producing
+  `protocol error: unexpected end of buffer skipping column data` or a
+  downstream desync. Deterministic at >= 15,000 rows x ~73 B
+  (`SELECT number, repeat('x', 64) FROM system.numbers LIMIT 15000`); the
+  failing frame decompresses to exactly 1,048,576 bytes; `max_block_size=8000`
+  masked it, `max_block_size=20000` forced it. Reproduced on ClickHouse 24.8
+  and 26.7 under both LZ4 and Zstd. The reader now keeps a continuous
+  decompressing stream per packet body (the clickhouse-cpp
+  `CompressedReadBuffer` model): the next frame is pulled only when the
+  current one is drained, so a block parse consumes exactly the packet's
+  frame sequence and never over-reads into the next packet. The cumulative
+  decompressed size of a packet body is bounded by a new block-level budget
+  (`MAX_BLOCK_BYTES`, 1 GiB) on top of the existing per-frame cap.
+- **The sync client now decompresses compressed SELECT responses (P0)**: the sync
+  query packet has always set the compression flag, but the response read
+  path never decompressed — ANY compressed SELECT failed (small queries with
+  an I/O error; a 20,000-row query wedged until the server's 300 s read
+  timeout because the client also sent its trailing empty Data block
+  uncompressed, which the server tried to parse as a compression frame).
+  `ping()` kept working because Pong is uncompressed, which is why the
+  existing compression tests never caught it. Response reads
+  (`query`, `query_with_block_view`, row-count/drain paths, INSERT
+  table-structure waits, and `QueryStream`) now route Data/Totals/Extremes/
+  ProfileEvents/TableColumns packet bodies through a sync
+  `DecompressingReader` (the same multi-frame model as the async fix, sitting
+  above chunked framing), and the client's trailing empty Data block is
+  compressed whenever the query packet's compression flag is set — on every
+  path that sends one: plain and parameterized queries, block INSERT
+  (`insert`/`end_insert`), and `execute`-style statements — matching the
+  async write path. The Python wheel inherits both fixes.
+
 ### Changed (BREAKING, Python bindings)
 - **Python `cancel()` is now fail-closed** (`st_clickhouse`): `Client.cancel()`,
   `AsyncClient.cancel()`, and `AsyncSession.cancel()` always raise `RuntimeError`

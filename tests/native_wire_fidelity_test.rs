@@ -331,21 +331,26 @@ async fn array_round_trip_table_compressed_and_plain() {
         .expect("cleanup table");
 }
 
-/// Nested JSON inside Array keeps its string-serialization version inside the
-/// buffered slice, which decoders misread: the compressed-materialized path
-/// must reject it loudly instead of returning silently wrong data.
+/// Nested JSON inside Array now decodes correctly under compression: the
+/// multi-frame fix replaced the buffered compressed-block parser with the
+/// streaming reader (the same code path uncompressed reads use), which
+/// handles the nested string-serialization version the buffered parser
+/// could not. The result must match the plain (uncompressed) query instead
+/// of being rejected.
 #[tokio::test]
 #[cfg(feature = "lz4")]
-async fn nested_json_array_compressed_is_rejected_loudly_not_silently_wrong() {
+async fn nested_json_array_compressed_matches_plain() {
     let client = common::connect_client().await;
-    let err = client
-        .query("SELECT [cast('{\"a\":1}','JSON')] AS j")
+    let sql = "SELECT [cast('{\"a\":1}','JSON')] AS j";
+    let expected: Vec<(Vec<String>,)> = client.query(sql).all().await.expect("plain nested JSON");
+    let compressed = client
+        .query(sql)
         .with_compression(CompressionMethod::Lz4)
         .all::<(Vec<String>,)>()
         .await
-        .expect_err("nested JSON must be rejected in buffered reads");
-    assert!(
-        err.to_string().contains("nested JSON"),
-        "expected nested JSON rejection, got: {err}"
+        .expect("nested JSON under compression must decode via the streaming reader");
+    assert_eq!(
+        compressed, expected,
+        "compressed nested JSON must match plain"
     );
 }

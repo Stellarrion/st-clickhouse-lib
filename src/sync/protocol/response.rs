@@ -274,6 +274,7 @@ where
     })
 }
 
+#[expect(dead_code)]
 pub(crate) fn discard_block<R: Read>(reader: &mut R) -> Result<usize> {
     let _table = wire::read_string(reader)?;
     discard_block_body(reader)

@@ -53,7 +53,13 @@ pub(super) fn build_query_packet_template(config: &ClientConfig, rev: u64) -> Qu
     }
 
     let mut select_suffix = insert_suffix.clone();
-    write_empty_data_block_to(&mut select_suffix);
+    // The empty-block encode only fails when the matching codec feature is
+    // not compiled in (an invalid configuration); mirror the async path's
+    // debug_assert so release builds still surface a deterministic protocol
+    // error instead of silently wedging the connection.
+    if let Err(err) = write_empty_data_block_for(&mut select_suffix, config.compression) {
+        debug_assert!(false, "failed to encode empty compressed block: {err}");
+    }
 
     let client_info_len = client_info
         .as_ref()
@@ -128,10 +134,34 @@ pub(super) fn write_serialized_settings_overlay(
     buf.len() - start
 }
 
-pub(super) fn write_empty_data_block_to(buf: &mut Vec<u8>) {
+/// Serialize the client's trailing empty Data block.
+///
+/// When the query packet's compression flag is set, the server expects this
+/// block's body in compressed form exactly like every other client Data
+/// packet — sending it plain makes the server try to parse the plain bytes as
+/// a compression frame and stall until its read timeout (the sync-side
+/// symptom of the P0 compression defect). Mirrors the async
+/// `write_empty_data_for`.
+pub(super) fn write_empty_data_block_for(
+    buf: &mut Vec<u8>, compression: Option<crate::sync::compression::CompressionMethod>,
+) -> crate::sync::error::Result<()> {
     encode_varint(buf, 2); // Data packet
-    wire::write_string_to_vec(buf, ""); // table name
-    write_empty_block_body_to(buf);
+    wire::write_string_to_vec(buf, ""); // table name (never compressed)
+    let mut block = Vec::with_capacity(16);
+    write_empty_block_body_to(&mut block);
+    match compression {
+        Some(
+            method @ (crate::sync::compression::CompressionMethod::Lz4
+            | crate::sync::compression::CompressionMethod::Zstd),
+        ) => {
+            let frame = crate::sync::compression::encode_frame(&block, method)?;
+            buf.extend_from_slice(&frame);
+        },
+        Some(crate::sync::compression::CompressionMethod::None) | None => {
+            buf.extend_from_slice(&block);
+        },
+    }
+    Ok(())
 }
 
 fn write_empty_block_body_to(buf: &mut Vec<u8>) {

@@ -226,6 +226,267 @@ pub fn decode_frame_bytes(data: &[u8]) -> Result<Vec<u8>> {
     decode_frame(&mut cursor)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-frame decompressing reader (response side)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wire constants of one compression frame (see the module docs above).
+/// `CHECKSUM_LEN` and `HEADER_LEN` are defined at the top of this module.
+const COMPRESSED_BODY_HEADER_LEN: usize = HEADER_LEN;
+/// Checksum plus the 9-byte size/method header.
+const FRAME_HEADER_TOTAL: usize = CHECKSUM_LEN + HEADER_LEN;
+/// Offset of the method byte inside a frame (after the 16-byte checksum).
+const METHOD_OFFSET: usize = CHECKSUM_LEN;
+
+/// Errors surfaced by [`DecompressingReader`]: compression/protocol failures
+/// with enough context to identify the offending frame, and plain I/O from
+/// the inner reader.
+#[derive(Debug)]
+pub enum DecompressError {
+    /// Compression frame decode failure (checksum, caps, codec).
+    Compression(String),
+    /// The block-level decompressed-size budget was exceeded.
+    Budget(String),
+    /// Underlying transport I/O failure.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for DecompressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compression(msg) => write!(f, "compressed response: {msg}"),
+            Self::Budget(msg) => write!(f, "compressed response: {msg}"),
+            Self::Io(err) => write!(f, "compressed response I/O: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DecompressError {}
+
+impl From<DecompressError> for crate::sync::error::Error {
+    fn from(err: DecompressError) -> Self {
+        match err {
+            DecompressError::Io(io) => crate::sync::error::Error::Io(io),
+            DecompressError::Compression(msg) => crate::sync::error::Error::Compression(msg),
+            DecompressError::Budget(msg) => crate::sync::error::Error::Protocol(msg),
+        }
+    }
+}
+
+impl From<std::io::Error> for DecompressError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+/// A continuously decompressing [`Read`] over one Data-packet body.
+///
+/// The sync twin of the async `DecompressingStream`
+/// (`src/connection/block_reader.rs`) and of clickhouse-cpp's
+/// `CompressedReadBuffer`: ClickHouse flushes its ~1 MiB
+/// `CompressedWriteBuffer` mid-packet, so a Data packet body larger than the
+/// threshold arrives as a *sequence* of frames. This reader serves
+/// decompressed bytes from an internal buffer and pulls the next frame from
+/// the wrapped reader only when that buffer is drained, so a caller that
+/// reads exactly one block consumes exactly the packet body — whether it
+/// spans one frame or many — and never reads into the next packet. (Frames
+/// never span packets: the server flushes at each packet boundary.)
+///
+/// Placement: the wrapper sits ABOVE any chunked framing (`ChunkedReader`)
+/// — chunk framing wraps the compressed bytes, so decompression must happen
+/// after de-chunking.
+///
+/// Budgets: each frame is bounded by [`crate::limits::MAX_FRAME_SIZE`] (via
+/// [`decode_frame`]) and the cumulative decompressed size of the packet body
+/// is charged against the block-level [`crate::limits::MAX_BLOCK_BYTES`]
+/// budget, so a hostile frame sequence cannot grow the buffer without bound.
+pub struct DecompressingReader<R> {
+    inner: R,
+    /// Decompressed bytes not yet served.
+    buf: Vec<u8>,
+    pos: usize,
+    /// Sniffed as a plain (uncompressed) body: replay `buf`, then delegate.
+    plain: bool,
+    /// Cumulative decompressed bytes produced for this packet body.
+    produced: usize,
+}
+
+impl<R: Read> DecompressingReader<R> {
+    /// Sniff the payload start and wrap `inner`.
+    ///
+    /// Heuristic (identical to the async wrapper's): read the first byte and
+    /// the following checksum bytes, then look at byte 16 of the payload (the
+    /// method byte of a frame header). Unless it is 0x82/0x90/0x02 — and the
+    /// compressed-size field covers at least the 9-byte frame header — the
+    /// sniffed bytes are replayed verbatim and the reader degrades to a
+    /// pass-through, so uncompressed bodies from non-conforming servers stay
+    /// parseable. An oversized size claim is rejected outright.
+    ///
+    /// Unlike the async wrapper there is no sniff timeout: the sync socket
+    /// has a blocking read timeout and the 17 sniff bytes of a real frame
+    /// arrive together.
+    pub fn new(mut inner: R) -> std::result::Result<Self, DecompressError> {
+        let mut sniff = [0u8; METHOD_OFFSET + 1];
+        inner.read_exact(&mut sniff[..1])?;
+        inner.read_exact(&mut sniff[1..])?;
+
+        match sniff[METHOD_OFFSET] {
+            0x82 | 0x90 | 0x02 => {},
+            _ => {
+                return Ok(Self {
+                    inner,
+                    buf: sniff.to_vec(),
+                    pos: 0,
+                    plain: true,
+                    produced: 0,
+                });
+            },
+        }
+
+        let mut frame = sniff.to_vec();
+        let mut rest = [0u8; FRAME_HEADER_TOTAL - METHOD_OFFSET - 1];
+        inner.read_exact(&mut rest)?;
+        frame.extend_from_slice(&rest);
+
+        let compressed_size =
+            u32::from_le_bytes([frame[17], frame[18], frame[19], frame[20]]) as usize;
+        // The method byte matched, so this looks like a compressed frame.
+        // Sizes below the 9-byte header remain ambiguous with plain payloads
+        // and keep the plain fallback; an oversized claim is rejected.
+        if compressed_size < COMPRESSED_BODY_HEADER_LEN {
+            return Ok(Self {
+                inner,
+                buf: frame,
+                pos: 0,
+                plain: true,
+                produced: 0,
+            });
+        }
+        if compressed_size > crate::limits::MAX_FRAME_SIZE {
+            return Err(DecompressError::Compression(format!(
+                "compressed_size {compressed_size} exceeds {} byte frame cap",
+                crate::limits::MAX_FRAME_SIZE
+            )));
+        }
+
+        let mut reader = Self {
+            inner,
+            buf: Vec::new(),
+            pos: 0,
+            plain: false,
+            produced: 0,
+        };
+        // Complete + decode the first frame now, so construction fails fast
+        // on a corrupt frame and the first read always has bytes to serve.
+        frame.resize(CHECKSUM_LEN + compressed_size, 0);
+        reader.inner.read_exact(&mut frame[FRAME_HEADER_TOTAL..])?;
+        reader.swap_in_decoded(frame)?;
+        Ok(reader)
+    }
+
+    /// Decode one complete frame, charge the block budget, and stage its
+    /// decompressed body as the serving buffer.
+    fn swap_in_decoded(&mut self, frame: Vec<u8>) -> std::result::Result<(), DecompressError> {
+        let decompressed = decode_frame_bytes(&frame)
+            .map_err(|err| DecompressError::Compression(err.to_string()))?;
+        self.produced = crate::limits::checked_block_bytes(
+            self.produced,
+            decompressed.len(),
+            "decompressed block",
+        )
+        .map_err(DecompressError::Budget)?;
+        self.buf = decompressed;
+        self.pos = 0;
+        Ok(())
+    }
+
+    /// Pull the next frame to completion from the inner reader.
+    ///
+    /// A clean end-of-stream between frames is surfaced as `Ok(0)` (EOF) to
+    /// the caller: the block parsers stop at the block end, so this only
+    /// happens for over-reads after the final block — which are EOF by
+    /// definition. A PARTIAL frame header (truncated response) stays an
+    /// `UnexpectedEof` error, because at least one byte arrived: the
+    /// distinction is made by probing one byte before committing to the
+    /// header read.
+    fn pull_next_frame(&mut self) -> std::io::Result<bool> {
+        let mut first = [0u8; 1];
+        match self.inner.read(&mut first) {
+            Ok(0) => return Ok(false), // clean EOF at a frame boundary
+            Ok(_) => {},
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "interrupted between compression frames",
+                ));
+            },
+            Err(err) => return Err(err),
+        }
+        let mut frame = vec![0u8; FRAME_HEADER_TOTAL];
+        frame[0] = first[0];
+        self.inner.read_exact(&mut frame[1..])?;
+
+        let compressed_size =
+            u32::from_le_bytes([frame[17], frame[18], frame[19], frame[20]]) as usize;
+        if compressed_size < COMPRESSED_BODY_HEADER_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "compressed_size {compressed_size} < header length {COMPRESSED_BODY_HEADER_LEN}"
+                ),
+            ));
+        }
+        if compressed_size > crate::limits::MAX_FRAME_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "compressed_size {compressed_size} exceeds {} byte frame cap",
+                    crate::limits::MAX_FRAME_SIZE
+                ),
+            ));
+        }
+        frame.resize(CHECKSUM_LEN + compressed_size, 0);
+        self.inner.read_exact(&mut frame[FRAME_HEADER_TOTAL..])?;
+        self.swap_in_decoded(frame)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+        Ok(true)
+    }
+}
+
+impl<R> DecompressingReader<R> {
+    /// Take any decompressed (or replayed plain) bytes the caller has not
+    /// consumed. For a conforming server this is empty — the block parsers
+    /// consume exactly the packet body — but if a server ever packs bytes
+    /// past the block into the same frame sequence, returning them keeps the
+    /// caller's parse position correct instead of silently dropping them.
+    pub fn into_pending(self) -> Vec<u8> {
+        self.buf[self.pos..].to_vec()
+    }
+}
+
+impl<R: Read> Read for DecompressingReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.pos < self.buf.len() {
+                let n = out.len().min(self.buf.len() - self.pos);
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            if self.plain {
+                return self.inner.read(out);
+            }
+            match self.pull_next_frame()? {
+                true => continue,
+                false => return Ok(0),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +611,105 @@ mod tests {
             msg.contains(&declared.to_string()),
             "error must name the declared size, got: {msg}"
         );
+    }
+
+    /// THE multi-frame regression (server-free): a packet body split across
+    /// two frames must reassemble into one logical decompressed stream, and
+    /// the reader must stop exactly at the end of the frame sequence (the
+    /// sentinel stays unread on the inner reader's remaining bytes).
+    #[test]
+    fn decompressing_reader_concatenates_two_frames() {
+        decompressing_reader_case(CompressionMethod::None);
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn decompressing_reader_concatenates_two_frames_lz4() {
+        decompressing_reader_case(CompressionMethod::Lz4);
+    }
+
+    fn decompressing_reader_case(method: CompressionMethod) {
+        let body: Vec<u8> = b"block-body-bytes-".repeat(64); // 1,088 bytes
+        let split = body.len() - 371; // split mid-payload like the ~1 MiB flush
+        let frame_a = encode_frame(&body[..split], method).expect("encode first frame");
+        let frame_b = encode_frame(&body[split..], method).expect("encode second frame");
+        let wire = [frame_a, frame_b].concat();
+
+        let mut cursor = std::io::Cursor::new(wire.clone());
+        let mut reader = DecompressingReader::new(&mut cursor).expect("sniff as compressed");
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).expect("read both frames");
+        assert_eq!(out, body, "both frames must decode as one stream");
+
+        // Exactly the two frames were consumed: nothing more, nothing less.
+        assert_eq!(
+            cursor.position() as usize,
+            wire.len(),
+            "reader must stop at the end of the frame sequence"
+        );
+    }
+
+    /// Three frames split inside a payload: every pull boundary must be
+    /// transparent to the caller.
+    #[test]
+    fn decompressing_reader_concatenates_three_frames() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(3000).collect();
+        let frame_a = encode_frame(&body[..97], CompressionMethod::None).expect("encode");
+        let frame_b = encode_frame(&body[97..2001], CompressionMethod::None).expect("encode");
+        let frame_c = encode_frame(&body[2001..], CompressionMethod::None).expect("encode");
+        let mut cursor = std::io::Cursor::new([frame_a, frame_b, frame_c].concat());
+        let mut reader = DecompressingReader::new(&mut cursor).expect("sniff as compressed");
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).expect("read all frames");
+        assert_eq!(out, body);
+    }
+
+    /// The plain-prefix heuristic survives: a body whose 17th byte is not a
+    /// compression method byte is served verbatim, and bytes after the
+    /// sniffed prefix still come from the inner reader.
+    #[test]
+    fn decompressing_reader_falls_back_to_plain() {
+        let wire = vec![0x01u8; 40];
+        let mut cursor = std::io::Cursor::new(wire.clone());
+        let mut reader = DecompressingReader::new(&mut cursor).expect("construct");
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).expect("plain passthrough");
+        assert_eq!(out, wire, "plain bytes must be served verbatim");
+    }
+
+    /// A frame header whose compressed_size is u32::MAX must be rejected by
+    /// the frame cap before any body buffer is sized.
+    #[test]
+    fn decompressing_reader_rejects_oversized_frame() {
+        let frame = build_frame(0x82, u32::MAX, 0, b"");
+        let mut cursor = std::io::Cursor::new(frame);
+        let err = match DecompressingReader::new(&mut cursor) {
+            Err(err) => err,
+            Ok(_) => unreachable!("oversized frame must be rejected"),
+        };
+        assert!(
+            err.to_string().contains("frame cap"),
+            "expected frame cap error, got: {err}"
+        );
+    }
+
+    /// A clean EOF between frames surfaces as EOF, not an error: the block
+    /// parsers stop at the block end, so an over-read after the final block
+    /// must look like a normal end of stream.
+    #[test]
+    fn decompressing_reader_clean_eof_between_frames() {
+        let payload = b"single-frame-payload".to_vec();
+        let frame = encode_frame(&payload, CompressionMethod::None).expect("encode");
+        let mut cursor = std::io::Cursor::new(frame);
+        let mut reader = DecompressingReader::new(&mut cursor).expect("sniff");
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).expect("decode");
+        assert_eq!(out, payload);
+        // Reading again after everything was consumed: EOF (Ok(0)), not an
+        // error — the pull probes one byte and sees clean end of stream.
+        let mut byte = [0u8; 1];
+        let n = reader.read(&mut byte).expect("over-read must be clean EOF");
+        assert_eq!(n, 0);
     }
 
     #[test]

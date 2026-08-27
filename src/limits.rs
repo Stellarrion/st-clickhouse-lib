@@ -75,6 +75,22 @@ pub(crate) const MAX_STRING_BYTES: usize = 0x00FF_FFFF;
 /// response may legally deliver many columns and many blocks.
 pub(crate) const MAX_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 
+/// Maximum accepted total decompressed size of one Data-packet body (one
+/// native block), in bytes.
+///
+/// This is the block-level budget enforced by the decompressing stream
+/// wrappers: a compressed packet body is a *sequence* of frames (ClickHouse
+/// flushes its ~1 MiB `CompressedWriteBuffer` mid-packet), so the per-frame
+/// [`MAX_FRAME_SIZE`] cap alone no longer bounds the total. The value is an
+/// explicit block cap: 1 GiB = 16x [`MAX_FRAME_SIZE`] and 16x the per-column
+/// [`MAX_COLUMN_BYTES`] cap, far above any block a default-configured server
+/// emits (default `max_block_size`/`preferred_block_size_bytes` target
+/// single-digit MiB blocks) while still turning a hostile frame sequence into
+/// a deterministic protocol error instead of an unbounded allocation. Like
+/// the column caps it bounds one block only — a streamed response may
+/// legally deliver many blocks, each up to this size.
+pub(crate) const MAX_BLOCK_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Validates a server-controlled per-value string length (String/JSON column
 /// value) against [`MAX_STRING_BYTES`] before it sizes any buffer.
 pub(crate) fn checked_string_len(value: u64, what: &str) -> Result<usize, String> {
@@ -105,6 +121,23 @@ pub(crate) fn checked_column_bytes(acc: usize, add: usize, what: &str) -> Result
 /// Validates a `rows * width` fixed-width / offset / index buffer byte length
 /// with checked multiplication and the [`MAX_COLUMN_BYTES`] cap, before any
 /// `Vec::with_capacity`/`resize` sized from it.
+/// Adds `add` decompressed bytes to a packet body's running total with
+/// checked addition and the [`MAX_BLOCK_BYTES`] cap. The decompressing stream
+/// wrappers call this per decoded frame, so a compressed body that expands
+/// past the block cap fails with a deterministic error instead of growing
+/// without bound.
+pub(crate) fn checked_block_bytes(acc: usize, add: usize, what: &str) -> Result<usize, String> {
+    let total = acc
+        .checked_add(add)
+        .ok_or_else(|| format!("{what} cumulative byte length overflow"))?;
+    if total > MAX_BLOCK_BYTES {
+        return Err(format!(
+            "{what} cumulative byte length {total} exceeds limit {MAX_BLOCK_BYTES}"
+        ));
+    }
+    Ok(total)
+}
+
 pub(crate) fn checked_column_len(rows: usize, width: usize, what: &str) -> Result<usize, String> {
     let len = rows
         .checked_mul(width)
@@ -325,8 +358,9 @@ mod count_tests {
 #[cfg(test)]
 mod byte_limit_tests {
     use super::{
-        MAX_COLUMN_BYTES, MAX_STRING_BYTES, checked_column_bytes, checked_column_len,
-        checked_monotonic_offset, checked_nested_total, checked_string_len,
+        MAX_BLOCK_BYTES, MAX_COLUMN_BYTES, MAX_STRING_BYTES, checked_block_bytes,
+        checked_column_bytes, checked_column_len, checked_monotonic_offset, checked_nested_total,
+        checked_string_len,
     };
 
     #[test]
@@ -379,6 +413,31 @@ mod byte_limit_tests {
     #[test]
     fn column_bytes_overflow_is_rejected() {
         assert!(checked_column_bytes(usize::MAX, 1, "string value").is_err());
+    }
+
+    #[test]
+    fn block_bytes_accumulate_to_cap() {
+        let mut acc = 0usize;
+        for _ in 0..16 {
+            acc = checked_block_bytes(acc, 64 * 1024 * 1024, "decompressed block")
+                .expect("sixteen 64 MiB frames fit the 1 GiB block cap");
+        }
+        assert_eq!(acc, MAX_BLOCK_BYTES);
+    }
+
+    #[test]
+    fn block_bytes_cap_plus_one_is_rejected() {
+        let err = checked_block_bytes(MAX_BLOCK_BYTES, 1, "decompressed block")
+            .expect_err("cap + 1 cumulative claim must be rejected");
+        assert_eq!(
+            err,
+            "decompressed block cumulative byte length 1073741825 exceeds limit 1073741824"
+        );
+    }
+
+    #[test]
+    fn block_bytes_overflow_is_rejected() {
+        assert!(checked_block_bytes(usize::MAX, 1, "decompressed block").is_err());
     }
 
     #[test]
