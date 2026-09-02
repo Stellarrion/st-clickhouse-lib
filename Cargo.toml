@@ -50,7 +50,7 @@ strip = "none"
 [package]
 name = "st-clickhouse-lib"
 version = "0.3.0"
-description = "High-performance native protocol ClickHouse client for Rust"
+description = "Fast, memory-safe native-protocol ClickHouse client for Rust (async + sync) and Python"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

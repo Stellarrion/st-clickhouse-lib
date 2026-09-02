@@ -1,7 +1,7 @@
 [package]
 name = "st-clickhouse-py"
 version = "0.3.0"
-description = "Python bindings for st-clickhouse — ClickHouse native protocol"
+description = "Python bindings for st-clickhouse — fast, memory-safe ClickHouse native-protocol client"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"

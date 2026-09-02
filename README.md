@@ -1,7 +1,7 @@
 # st-clickhouse-lib
 
-> **Zero-copy ClickHouse native protocol client** — Rust + Python.  
-> Native TCP, typed Rust rows, columnar Python output shapes, TLS, compression, pooling, and protocol coverage for ClickHouse 24.x onward.
+> **A fast, memory-safe ClickHouse client speaking the native TCP protocol.**  
+> Zero-copy columnar reads and streaming cursors in Rust; dict / tuple / column / block output shapes and free-threaded-capable bindings in Python. TLS, LZ4/Zstd compression, pooled connections with failover — every server-controlled byte bounded, from handshake to EndOfStream. Works with ClickHouse 24.8 onward.
 
 [![CI](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/st-clickhouse-lib.svg)](https://crates.io/crates/st-clickhouse-lib)
