@@ -40,12 +40,32 @@ st-clickhouse-lib = { version = "0.3", features = ["derive"] }
 
 ```rust
 use st_clickhouse::Client;
-use st_clickhouse::connection::{QueryResult, RowCount, Scalar};
-use st_clickhouse::protocol::block::{Block, ColumnInfo};
 
 let client = Client::connect("127.0.0.1:9000").await?;
 
-// Blocks — all server blocks, preserving zero-copy columnar payloads
+// 1. Rows — anything tuple-shaped works, including derive structs (see below)
+let rows: Vec<(u64, String)> = client
+    .query("SELECT number, toString(number) FROM system.numbers LIMIT 10")
+    .fetch()
+    .await?;
+
+// Single row, optional row, single value — all from the same builder
+let one: (u64,) = client.query("SELECT toUInt64(1)").fetch().await?;
+let maybe: Option<(u64,)> = client.query("SELECT toUInt64(1) WHERE 0").fetch().await?;
+let count: u64 = client.query("SELECT count() FROM system.numbers").scalar().await?;
+
+// 2. Derived rows — name-based column mapping, no positional fragility
+#[derive(Debug, Clone, st_clickhouse::Row)]
+struct Event {
+    ts: u32,
+    value: f64,
+}
+let events: Vec<Event> = client
+    .query("SELECT ts, value FROM events LIMIT 100")
+    .fetch()
+    .await?;
+
+// 3. Blocks — zero-copy columnar payloads when you want the raw columns
 let blocks = client
     .query("SELECT number FROM system.numbers LIMIT 100000")
     .blocks()
@@ -53,63 +73,25 @@ let blocks = client
 for block in &blocks {
     let nums = block.column::<u64>("number")?;
     if let Some(slice) = nums.as_slice() {
-        println!("received {} values", slice.len());
+        println!("received {} values", slice.len()); // borrowed, no copy
     }
 }
 
-// Vec — owned rows, ergonomic
-let rows: Vec<(u64, String)> = client
-    .query("SELECT number, toString(number) FROM system.numbers LIMIT 10")
-    .fetch().await?;
-
-// One — single row
-let one: (u64,) = client.query("SELECT toUInt64(1)").fetch().await?;
-
-// Optional — 0-or-1 rows
-let maybe: Option<(u64,)> = client
-    .query("SELECT toUInt64(1) WHERE 0")
-    .fetch().await?;
-
-// Scalar — single value, wrapped for type safety
-let count: Scalar<u64> = client
-    .query("SELECT count() FROM system.numbers LIMIT 1000000")
-    .fetch().await?;
-println!("{}", count.into_inner());
-
-// RowCount — scan without materializing columns
-let scanned: RowCount = client
-    .query("SELECT number FROM system.numbers LIMIT 1000000")
-    .fetch().await?;
-println!("{} rows", scanned.get());
-
-// Streaming rows — constant memory, background I/O prefetch
+// 4. Streaming — constant memory over any result size
 let mut cursor = client
-    .query("SELECT number FROM system.numbers LIMIT 100")
-    .rows::<(u64,)>().await?;
+    .query("SELECT number FROM system.numbers LIMIT 1000000")
+    .rows::<(u64,)>()
+    .await?;
 while let Some((n,)) = cursor.next().await? {
-    println!("{n}");
+    // process n
 }
 
-// INSERT — FORMAT Native blocks (begin_insert → send_data → end)
-client.execute("CREATE TABLE IF NOT EXISTS events (ts DateTime, value Float64) ENGINE = Memory").await?;
-let mut insert = client.begin_insert("events").await?;
-let block = Block {
-    columns: vec![
-        ColumnInfo {
-            name: "ts".into(),
-            type_name: "DateTime".into(),
-            data: bytes::Bytes::copy_from_slice(&1_700_000_000u32.to_le_bytes()),
-            lc_materialized: bytes::Bytes::new(),
-        },
-        ColumnInfo {
-            name: "value".into(),
-            type_name: "Float64".into(),
-            data: bytes::Bytes::copy_from_slice(&1.5f64.to_le_bytes()),
-            lc_materialized: bytes::Bytes::new(),
-        },
-    ],
-    rows: 1,
-};
+// 5. INSERT — native block protocol
+client
+    .execute("CREATE TABLE IF NOT EXISTS events (ts DateTime, value Float64) ENGINE = Memory")
+    .await?;
+let mut insert = client.begin_insert("INSERT INTO events (ts, value) VALUES").await?;
+// Build a Block with the table's columns (see API Reference / tests/insert_test.rs)
 insert.send_data(&block).await?;
 insert.end().await?;
 ```
@@ -125,45 +107,44 @@ pip install st-clickhouse-py
 ```python
 from st_clickhouse import Client
 
-client = Client("localhost:9000")
+client = Client("127.0.0.1:9000")
 
-# Row dicts — ergonomic, best for <100K rows
+# 1. Dicts — ergonomic, best for small results
 rows = client.query("SELECT count() AS cnt FROM system.tables")
-print(rows[0]["cnt"])  # 42
+print(rows[0]["cnt"])
 
-# With server-side parameters
+# Parameters and per-query settings are keyword arguments
 rows = client.query(
     "SELECT {id:UInt64} AS val, {name:String} AS label",
     params={"id": 1, "name": "hello"},
 )
+client.query("SELECT * FROM big_table", settings={"max_threads": "8"})
 
-# With per-query settings (applied to that query only)
-rows = client.query("SELECT * FROM big_table", settings={"max_threads": "8"})
-
-# Tuples — faster than dicts for large results
-rows = client.query_tuples("SELECT number, toString(number) LIMIT 10")
-
-# Columns — columnar access, 41M rows/s
-col_nums, col_strs = client.query_columns(
-    "SELECT number, toString(number) FROM system.numbers LIMIT 100000"
-)
-
-# Blocks — rawest/fastest, 147M rows/s
-blocks = client.query_blocks(
-    "SELECT number FROM system.numbers LIMIT 100000"
-)
+# 2. Tuples / columns / blocks — progressively faster, same queries
+tuples = client.query_tuples("SELECT number, toString(number) FROM system.numbers LIMIT 10")
+cols = client.query_columns("SELECT number FROM system.numbers LIMIT 100000")
+blocks = client.query_blocks("SELECT number FROM system.numbers LIMIT 100000")
 for block in blocks:
-    col = block["number"]         # Column object
-    values = col.to_list()        # list[int]
+    values = block["number"].to_list()   # list[int]
 
-# Streaming — low memory for large results
+# 3. Streaming — constant memory for very large results
 for block in client.query_stream("SELECT number FROM system.numbers"):
     for row in block.rows():
-        print(row)
+        pass  # row is a dict
 
-# INSERT
+# 4. INSERT — list of dicts, types inferred via DESCRIBE
 client.execute("CREATE TABLE IF NOT EXISTS test (x Int32) ENGINE Memory")
 client.insert("INSERT INTO test VALUES", [{"x": 1}, {"x": 2}, {"x": 3}])
+
+# 5. Async client with pooling, cancellation that works, and free-threaded support
+import asyncio
+from st_clickhouse import AsyncClient
+
+async def main():
+    async with AsyncClient("127.0.0.1:9000", pool_min_size=2, pool_max_size=8) as c:
+        rows = await c.query("SELECT count() FROM system.tables")
+
+asyncio.run(main())
 
 # TLS
 client = Client(
@@ -173,7 +154,6 @@ client = Client(
     tls_ca_file="/path/to/ca.crt",
 )
 
-# Cleanup
 client.close()
 ```
 
@@ -205,9 +185,9 @@ client.close()
 |--------|---------|--------|----------|
 | `query()` | `list[dict]` | 7.6M | Ergonomics, small results |
 | `query_tuples()` | `list[tuple]` | 14.1M | Large flat results |
-| `query_columns()` | `list[list]` | 47.4M | Columnar processing |
-| `query_blocks()` | `list[Block]` | 136.7M | Rawest, least allocation |
-| `query_stream()` | `Iterator[Block]` | 349.8M | Very large, streaming |
+| `query_columns()` | `list[list]` | 73.9M | Columnar processing |
+| `query_blocks()` | `list[Block]` | 188.5M | Rawest, least allocation |
+| `query_stream()` | `Iterator[Block]` | 490.2M | Very large, streaming |
 
 **Rule of thumb:**
 - **Result < 10K rows** → `query()` — dicts are convenient
@@ -579,12 +559,12 @@ The **UInt64 owned-materialization row** is where st-clickhouse's PlainColumn bu
 | `SELECT 1` (row dict) | 0.465ms | 0.569ms | — |
 | 100K rows as dicts | 13.208ms | 12.796ms | 7.6M |
 | 100K rows as **tuples** | 9.485ms | 7.085ms | 14.1M |
-| 100K rows as **columns** | 2.426ms | 2.111ms | 47.4M |
-| 100K rows as **blocks** | 0.679ms | 0.732ms | 147.3M |
-| 1M rows as blocks | 2.391ms | 2.141ms | 467.1M |
-| 32 concurrent `SELECT 1` | N/A | 5.027ms | — |
+| 100K rows as **columns** | 2.426ms | 2.111ms | 73.9M |
+| 100K rows as **blocks** | 0.679ms | 0.732ms | 188.5M |
+| 1M rows as blocks | 2.391ms | 2.141ms | 644.8M |
+| 1M rows streamed | 490.2M rows/s (sync) | 354.5M (async) | — |
 
-Throughput has been **stable from 0.1.0 onward** (within run-to-run variance): the 0.2.0-era optimizations live in the Rust materialization core (see *Rust vs C++* above — the UInt64 owned row), which is a small slice of Python end-to-end time, where PyO3 FFI + Python object construction dominate.
+The rows/s figures are medians from the post-0.3 perf pass (`target/bench-results.md`); the millisecond columns are min-of-many from the original harness, so they read slightly faster than the median-derived rows/s. The 32-concurrent row from older READMEs is obsolete — the pool-acquire starvation it exposed was fixed in 0.3.0 and is covered by a dedicated regression test.
 
 ### Python vs Official `clickhouse-connect` (HTTP)
 
