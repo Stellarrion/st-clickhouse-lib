@@ -189,7 +189,7 @@ client.close()
 | `.blocks()` | `Vec<Block>` | 60M+ | Zero-copy payloads | Multi-block columnar results without dropped rows |
 | `.all::<T>()` | `Vec<T>` | 20M+ | Owned rows | Small results, ergonomic access |
 | `.rows::<T>()` | `RowCursor<T>` | 10M+ | Streaming | Large results, low memory |
-| `.execute(sql)` | `()` | N/A | N/A | DDL, INSERT (no return data) |
+| `.execute(sql)` | `()` | N/A | N/A | DDL/DML with no result rows: `CREATE`, `ALTER`, `DROP`, `INSERT ... VALUES` (for native-block INSERT use `begin_insert()` + `send_data()` + `end()`) |
 
 **Rule of thumb:**
 - **Result < 10K rows** → `.all::<T>()` — ergonomic, no borrow lifetime issues
@@ -501,24 +501,24 @@ Top critical risks addressed in v0.1:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                  st-clickhouse-lib (async)                    │
-│  Client · QueryBuilder · InsertSession · BatchBuilder         │
-│  RowCursor · Pool · Metrics · Callbacks                       │
-│  Tokio async I/O · Connection pool · DNS rotation             │
-│  Circuit breaker · Write timeouts · Query retry               │
+│                  st-clickhouse-lib (async)                   │
+│  Client · QueryBuilder · InsertSession · BatchBuilder        │
+│  RowCursor · Pool · Metrics · Callbacks                      │
+│  Tokio async I/O · Connection pool · DNS rotation            │
+│  Circuit breaker · Write timeouts · Query retry              │
 └───────────────────────┬──────────────────────────────────────┘
                         │ depends on
 ┌───────────────────────▼──────────────────────────────────────┐
-│                st-clickhouse-lib sync core                    │
-│  SyncClient · ClientConfig · Transport (TCP/TLS)              │
-│  Handshake (password + SSH) · Protocol negotiation            │
-│  Wire format (varint · string · checksummed blocks)           │
-│  LZ4/ZSTD compression with CityHash128 integrity              │
+│                st-clickhouse-lib sync core                   │
+│  SyncClient · ClientConfig · Transport (TCP/TLS)             │
+│  Handshake (password + SSH) · Protocol negotiation           │
+│  Wire format (varint · string · checksummed blocks)          │
+│  LZ4/ZSTD compression with CityHash128 integrity             │
 └───────────────────────┬──────────────────────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────────────────┐
-│               st-clickhouse-py (PyO3)                         │
-│  Client · AsyncClient · Block · InsertSession                 │
+│               st-clickhouse-py (PyO3)                        │
+│  Client · AsyncClient · Block · InsertSession                │
 │  Thread-per-query bridge · asyncio integration               │
 │  dict/tuple/column/block output shapes                       │
 └──────────────────────────────────────────────────────────────┘
@@ -538,24 +538,24 @@ Top critical risks addressed in v0.1:
 
 These are local benchmark-harness results, not universal performance guarantees. Both columns run **identical** `numbers(N)` queries against the same local ClickHouse over native TCP (`127.0.0.1:9000`), with `output_format_native_write_json_as_string=1`, `ratio_of_defaults_for_sparse_serialization=0`. (`numbers(N)` is used instead of `system.numbers LIMIT` because `clickhouse-cpp` mishandles that aggregate plan and blocks.) Re-run yourself: `cargo run --release --bin bench_all_workloads` (Rust) and `benches/cpp/st_bench.cpp` built against `clickhouse-cpp -O3` — see `benches/README.md`.
 
-Lower latency is better. `vs C++` = `st-clickhouse / clickhouse-cpp`, so values below `1.00x` are faster than C++. Values are the min of ~15-30 runs; the owned-materialization row is cache-sensitive and varies a few %.
+Lower latency is better. **Rust vs C++** is the relative latency advantage: `+N%` means st-clickhouse is N% faster than `clickhouse-cpp`; `−N%` means N% slower. Values are the min of ~15-30 runs; the owned-materialization row is cache-sensitive and varies a few %.
 
 ### Rust vs C++
 
-| Workload | st-clickhouse | clickhouse-cpp `-O3` | vs C++ |
-|----------|---------------|----------------------|--------|
-| `SELECT 1` | 0.400ms | 0.416ms | **0.96x** |
-| `COUNT()` over 1M rows | 0.805ms | 0.796ms | 1.01x |
-| `GROUP BY` 1K groups | 2.664ms | 3.011ms | **0.89x** |
-| `ORDER BY ... LIMIT 100` | 1.255ms | 1.337ms | **0.94x** |
-| JSON materialization (1K) | 0.551ms | 0.526ms | 1.05x |
-| 50 columns × 1K rows | 0.920ms | 0.914ms | 1.01x |
-| 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **0.54x** |
-| 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **0.98x** |
-| INSERT Memory 10K rows † | 0.549ms | 0.534ms | 1.03x |
-| ALTER UPDATE 5K/10K rows † | 0.525ms | 0.518ms | 1.01x |
+| Workload | st-clickhouse | clickhouse-cpp `-O3` | Rust vs C++ |
+|----------|---------------|----------------------|-------------|
+| `SELECT 1` | 0.400ms | 0.416ms | **+3.85%** |
+| `COUNT()` over 1M rows | 0.805ms | 0.796ms | −1.13% |
+| `GROUP BY` 1K groups | 2.664ms | 3.011ms | **+11.52%** |
+| `ORDER BY ... LIMIT 100` | 1.255ms | 1.337ms | **+6.13%** |
+| JSON materialization (1K) | 0.551ms | 0.526ms | −4.75% |
+| 50 columns × 1K rows | 0.920ms | 0.914ms | −0.66% |
+| 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **+45.86%** |
+| 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **+2.16%** |
+| INSERT Memory 10K rows † | 0.549ms | 0.534ms | −2.81% |
+| ALTER UPDATE 5K/10K rows † | 0.525ms | 0.518ms | −1.35% |
 
-The **UInt64 owned-materialization row** is where st-clickhouse's PlainColumn bulk-slice fast path (`read_all` / `query_all`, since 0.2.0) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms (~1.85× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
+The **UInt64 owned-materialization row** is where st-clickhouse's PlainColumn bulk-slice fast path (`read_all` / `query_all`, since 0.2.0) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms — **+45.86%** (nearly 2× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
 
 † *Server-version drift:* these numbers were measured on ClickHouse **26.4**. On **26.7+** the server itself charges a flat ~60 ms per mutation (raw HTTP inserts that bypass the client cost the same), so both rows track the server's mutation path, not client overhead — the client still adds ~0.3 ms or less. All other rows were re-measured on 26.7 at or better than the values shown.
 
