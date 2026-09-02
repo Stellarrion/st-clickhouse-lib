@@ -681,7 +681,7 @@ fn skip_offsets(buf: &[u8], pos: &mut usize, rows: usize, name: &str) -> Result<
         ));
     }
     let mut total = 0usize;
-    for chunk in buf[*pos..off_end].chunks_exact(8) {
+    for chunk in buf[*pos..off_end].as_chunks::<8>().0 {
         let mut offset_bytes = [0u8; 8];
         offset_bytes.copy_from_slice(chunk);
         total = checked_monotonic_offset(total, u64::from_le_bytes(offset_bytes), name)?;

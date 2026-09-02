@@ -214,8 +214,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install maturin pytest pytest-asyncio pytest-timeout
-          maturin build --release --out dist
-          python -m pip install --force-reinstall dist/*.whl
+          maturin develop --release
           python -m pytest tests/ -v --timeout=60
         env:
           CLICKHOUSE_HOST: "127.0.0.1:9000"

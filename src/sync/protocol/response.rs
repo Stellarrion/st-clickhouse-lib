@@ -634,7 +634,7 @@ fn read_offsets_into<R: Read>(
     let start = data.len();
     read_exact_into(reader, data, nbytes, budget)?;
     let mut total = 0usize;
-    for chunk in data[start..].chunks_exact(8) {
+    for chunk in data[start..].as_chunks::<8>().0 {
         let mut b = [0u8; 8];
         b.copy_from_slice(chunk);
         total = checked_monotonic_offset(total, u64::from_le_bytes(b), name)?;

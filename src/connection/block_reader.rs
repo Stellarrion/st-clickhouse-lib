@@ -1024,7 +1024,7 @@ async fn discard_offsets_async<
         // Cumulative prefix sums must be non-decreasing; the last offset is
         // the inner element count, capped at MAX_BLOCK_ROWS before the inner
         // column is read or skipped.
-        for chunk in window[..n].chunks_exact(8) {
+        for chunk in window[..n].as_chunks::<8>().0 {
             let mut b = [0u8; 8];
             b.copy_from_slice(chunk);
             total = checked_monotonic_offset(total, u64::from_le_bytes(b), name)?;

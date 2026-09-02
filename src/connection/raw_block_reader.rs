@@ -299,10 +299,8 @@ async fn read_column_body_raw_recorded<
             let start = out.len();
             read_exact_recorded(stream, out, nbytes, budget).await?;
             let mut total = 0usize;
-            for chunk in out[start..].chunks_exact(8) {
-                let bytes: [u8; 8] = chunk.try_into().map_err(|_| {
-                    crate::error::Error::Protocol("array offset length mismatch".into())
-                })?;
+            for chunk in out[start..].as_chunks::<8>().0 {
+                let bytes: [u8; 8] = *chunk;
                 // Offsets are cumulative prefix sums: non-decreasing, and the
                 // running maximum (the last offset) is the inner element row
                 // count, capped at MAX_BLOCK_ROWS before the inner read.
@@ -332,10 +330,8 @@ async fn read_column_body_raw_recorded<
             let start = out.len();
             read_exact_recorded(stream, out, nbytes, budget).await?;
             let mut total = 0usize;
-            for chunk in out[start..].chunks_exact(8) {
-                let bytes: [u8; 8] = chunk.try_into().map_err(|_| {
-                    crate::error::Error::Protocol("map offset length mismatch".into())
-                })?;
+            for chunk in out[start..].as_chunks::<8>().0 {
+                let bytes: [u8; 8] = *chunk;
                 total = checked_monotonic_offset(total, u64::from_le_bytes(bytes), "map offset")?;
             }
             if total > 0 {

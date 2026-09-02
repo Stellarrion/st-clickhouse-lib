@@ -124,11 +124,28 @@ async fn compressed_materialized_map_matches_plain() {
 }
 
 /// Materialized JSON carries an 8-byte string-serialization version that the
-/// compressed parser must consume as framing (not column data).
+/// compressed parser must consume as framing (not column data). Requires
+/// native JSON type support (ClickHouse 25.x+; 24.8 rejects the cast).
 #[tokio::test]
 #[cfg(feature = "lz4")]
 async fn compressed_materialized_json_matches_plain() {
     let client = common::connect_client().await;
+    // Skip on servers without native JSON support (24.8: "Cannot create column")
+    let version: Vec<(String,)> = client
+        .query("SELECT version()")
+        .all()
+        .await
+        .expect("read version");
+    let major: u32 = version[0]
+        .0
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    if major < 25 {
+        eprintln!("server lacks native JSON type (major {major}); skipping");
+        return;
+    }
     let sql = "SELECT cast('{\"x\":1}', 'JSON') AS j, 'tail' AS s";
     let expected: Vec<(st_clickhouse::column::JsonValue, String)> = client
         .query(sql)

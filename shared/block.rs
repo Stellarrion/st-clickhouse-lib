@@ -322,12 +322,10 @@ impl<'a> ReadColumnContext<'a> {
         }
         let bytes = self.read_rows_bytes(8)?;
         Ok(bytes
-            .chunks_exact(8)
-            .map(|c| {
-                let mut offset = [0u8; 8];
-                offset.copy_from_slice(c);
-                u64::from_le_bytes(offset)
-            })
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect())
     }
 }

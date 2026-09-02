@@ -656,7 +656,7 @@ pub(crate) async fn read_offsets_column<
     let mut offsets = vec![0u8; nbytes];
     stream.read_exact(&mut offsets).await?;
     let mut total = 0usize;
-    for chunk in offsets.chunks_exact(8) {
+    for chunk in offsets.as_chunks::<8>().0 {
         let mut b = [0u8; 8];
         b.copy_from_slice(chunk);
         // Cumulative prefix sums must be non-decreasing; the running maximum
