@@ -536,26 +536,39 @@ Top critical risks addressed in v0.1:
 
 ## Performance
 
-These are local benchmark-harness results, not universal performance guarantees. Both columns run **identical** `numbers(N)` queries against the same local ClickHouse over native TCP (`127.0.0.1:9000`), with `output_format_native_write_json_as_string=1`, `ratio_of_defaults_for_sparse_serialization=0`. (`numbers(N)` is used instead of `system.numbers LIMIT` because `clickhouse-cpp` mishandles that aggregate plan and blocks.) Re-run yourself: `cargo run --release --bin bench_all_workloads` (Rust) and `benches/cpp/st_bench.cpp` built against `clickhouse-cpp -O3` — see `benches/README.md`.
+How these numbers were produced:
 
-Lower latency is better. **Rust vs C++** is the relative latency advantage: `+N%` means st-clickhouse is N% faster than `clickhouse-cpp`; `−N%` means N% slower. Values are the min of ~15-30 runs; the owned-materialization row is cache-sensitive and varies a few %.
+- Both clients run **identical** `numbers(N)` queries against the same local
+  ClickHouse over native TCP. Latencies are the minimum of ~15–30 runs —
+  lower is better.
+- Re-run them yourself: `cargo run --release --bin bench_all_workloads`
+  (Rust) and `benches/cpp/st_bench.cpp` built against `clickhouse-cpp -O3`;
+  see `benches/README.md`.
+- `numbers(N)` is used instead of `system.numbers LIMIT` because
+  `clickhouse-cpp` mishandles that aggregate plan and blocks.
 
 ### Rust vs C++
 
-| Workload | st-clickhouse | clickhouse-cpp `-O3` | Rust vs C++ |
-|----------|---------------|----------------------|-------------|
-| `SELECT 1` | 0.400ms | 0.416ms | **+3.85%** |
-| `COUNT()` over 1M rows | 0.805ms | 0.796ms | −1.13% |
-| `GROUP BY` 1K groups | 2.664ms | 3.011ms | **+11.52%** |
-| `ORDER BY ... LIMIT 100` | 1.255ms | 1.337ms | **+6.13%** |
-| JSON materialization (1K) | 0.551ms | 0.526ms | −4.75% |
-| 50 columns × 1K rows | 0.920ms | 0.914ms | −0.66% |
-| 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **+45.86%** |
-| 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **+2.16%** |
-| INSERT Memory 10K rows † | 0.549ms | 0.534ms | −2.81% |
-| ALTER UPDATE 5K/10K rows † | 0.525ms | 0.518ms | −1.35% |
+The **C++ / Rust** column is `clickhouse-cpp` latency divided by
+`st-clickhouse` latency — above `1.00x` means Rust is faster, and the
+number reads directly as "how many times faster". These are local
+benchmark-harness results, not universal guarantees; the
+owned-materialization row is cache-sensitive and varies a few percent.
 
-The **UInt64 owned-materialization row** is where st-clickhouse's PlainColumn bulk-slice fast path (`read_all` / `query_all`, since 0.2.0) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms — **+45.86%** (nearly 2× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
+| Workload | st-clickhouse | clickhouse-cpp `-O3` | C++ / Rust |
+|----------|---------------|----------------------|------------|
+| `SELECT 1` | 0.400ms | 0.416ms | **1.04x** |
+| `COUNT()` over 1M rows | 0.805ms | 0.796ms | 0.99x |
+| `GROUP BY` 1K groups | 2.664ms | 3.011ms | **1.13x** |
+| `ORDER BY ... LIMIT 100` | 1.255ms | 1.337ms | **1.07x** |
+| JSON materialization (1K) | 0.551ms | 0.526ms | 0.95x |
+| 50 columns × 1K rows | 0.920ms | 0.914ms | 0.99x |
+| 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **1.85x** |
+| 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **1.02x** |
+| INSERT Memory 10K rows † | 0.549ms | 0.534ms | 0.97x |
+| ALTER UPDATE 5K/10K rows † | 0.525ms | 0.518ms | 0.99x |
+
+The **UInt64 owned-materialization row** is where st-clickhouse's PlainColumn bulk-slice fast path (`read_all` / `query_all`, since 0.2.0) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms — **1.85x faster** — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
 
 † *Server-version drift:* these numbers were measured on ClickHouse **26.4**. On **26.7+** the server itself charges a flat ~60 ms per mutation (raw HTTP inserts that bypass the client cost the same), so both rows track the server's mutation path, not client overhead — the client still adds ~0.3 ms or less. All other rows were re-measured on 26.7 at or better than the values shown.
 
@@ -669,6 +682,16 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 ## Compatibility
 
 Tested against ClickHouse **24.8**, **25.8**, **26.4**, and **`latest`** in CI.
+
+End-to-end coverage spans the native client surface: connection and
+authentication (TCP, TLS, SSH-key), the full type matrix, bidirectional
+LZ4/Zstd compression (including multi-frame blocks above 1 MiB), streaming
+reads and block insertions, batched and parameterized queries, per-query
+settings, progress/log/profile callbacks, connection pooling with failover
+and circuit breaking, connect/query/acquire timeouts, and query cancellation
+— across both Rust engines and the Python bindings. Not covered: external
+tables (API present, e2e test pending), Kerberos/interserver
+authentication, and the HTTP interface (native protocol only by design).
 
 Run locally:
 ```bash
