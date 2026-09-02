@@ -299,7 +299,7 @@ jobs:
           echo "All crate versions agree: $LIB_VERSION"
 
   # ── Version bump gate (PRs) ──────────────────────────────────
-  # Enforces docs/versioning.md: the PR's own manifests (the merge-ref
+  # Enforces CONTRIBUTING.md (Versioning): the PR's own manifests (the merge-ref
   # checkout) must carry a version strictly greater than the one currently
   # published on crates.io, and CHANGELOG.md must already contain the
   # section header for that version. Mark this check required in branch
@@ -330,7 +330,7 @@ jobs:
             | sort -V | tail -n 1)"
           if [ "$PR_VERSION" = "$REGISTRY_VERSION" ] || [ "$HIGHER" = "$REGISTRY_VERSION" ]; then
             echo "::error::This PR does not bump the version (PR: $PR_VERSION, published: $REGISTRY_VERSION)."
-            echo "::error::Merging to main IS the release (docs/versioning.md): bump the version in"
+            echo "::error::Merging to main IS the release (see CONTRIBUTING.md): bump the version in"
             echo "::error::Cargo.toml, derive/Cargo.toml, st-clickhouse-py/Cargo.toml and pyproject.toml,"
             echo "::error::and add a '## [$PR_VERSION] — YYYY-MM-DD' section to CHANGELOG.md."
             exit 1
@@ -340,7 +340,7 @@ jobs:
           PR_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           if ! grep -q "^## \[$PR_VERSION\] — " CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no '## [$PR_VERSION] — YYYY-MM-DD' section."
-            echo "::error::Every released version must be documented (docs/versioning.md)."
+            echo "::error::Every released version must be documented (see CONTRIBUTING.md)."
             exit 1
           fi
           echo "CHANGELOG section for $PR_VERSION present."

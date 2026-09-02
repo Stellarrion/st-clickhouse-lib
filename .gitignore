@@ -15,6 +15,9 @@ target/
 /fuzz/artifacts/
 /fuzz/corpus/
 
+# Internal docs (local-only; not published, not tracked)
+/docs/
+
 # Python build/test artifacts
 __pycache__/
 *.py[cod]

@@ -65,7 +65,6 @@ exclude = [
     ".gitignore",
     "benches/**",
     "deny.toml",
-    "docs/**",
     "fuzz/**",
     "st-clickhouse-py/**",
 ]
