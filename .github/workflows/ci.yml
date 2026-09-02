@@ -384,23 +384,17 @@ jobs:
           } >> "$GITHUB_ENV"
         env:
           FALLBACK_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - name: Check if derive version is already published
-        id: derive_exists
-        run: |
-          DERIVE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' derive/Cargo.toml | head -n 1)"
-          if [ -z "$DERIVE_VERSION" ]; then
-            echo "Failed to parse st-clickhouse-derive version from derive/Cargo.toml"
-            exit 1
-          fi
-          if curl -sf "https://crates.io/api/v1/crates/st-clickhouse-derive" | jq -e ".versions[] | select(.num == \"$DERIVE_VERSION\")" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "st-clickhouse-derive $DERIVE_VERSION already on crates.io; publish step will be skipped"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Publish derive helper
-        if: steps.derive_exists.outputs.exists != 'true'
-        run: cargo publish -p st-clickhouse-derive
+        run: |
+          output=$(cargo publish -p st-clickhouse-derive 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "st-clickhouse-derive already published; skipping"
+              exit 0
+            fi
+            echo "$output"
+            exit 1
+          }
+          echo "$output"
       - name: Wait for derive helper in crates.io index
         run: |
           DERIVE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' derive/Cargo.toml | head -n 1)"
@@ -410,7 +404,7 @@ jobs:
           fi
           echo "Waiting for st-clickhouse-derive $DERIVE_VERSION in the crates.io index"
           for i in $(seq 1 90); do
-            if curl -sf "https://crates.io/api/v1/crates/st-clickhouse-derive" | jq -e ".versions[] | select(.num == \"$DERIVE_VERSION\")" > /dev/null 2>&1; then
+            if cargo search st-clickhouse-derive --limit 1 | grep -q "^st-clickhouse-derive = \"$DERIVE_VERSION\""; then
               echo "st-clickhouse-derive $DERIVE_VERSION is available in the crates.io index"
               exit 0
             fi
@@ -418,23 +412,17 @@ jobs:
           done
           echo "st-clickhouse-derive $DERIVE_VERSION did not appear in the crates.io index in time"
           exit 1
-      - name: Check if lib version is already published
-        id: lib_exists
-        run: |
-          LIB_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          if [ -z "$LIB_VERSION" ]; then
-            echo "Failed to parse st-clickhouse-lib version from Cargo.toml"
-            exit 1
-          fi
-          if curl -sf "https://crates.io/api/v1/crates/st-clickhouse-lib" | jq -e ".versions[] | select(.num == \"$LIB_VERSION\")" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "st-clickhouse-lib $LIB_VERSION already on crates.io; publish step will be skipped"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Publish user-facing crate
-        if: steps.lib_exists.outputs.exists != 'true'
-        run: cargo publish -p st-clickhouse-lib
+        run: |
+          output=$(cargo publish -p st-clickhouse-lib 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "st-clickhouse-lib already published; skipping"
+              exit 0
+            fi
+            echo "$output"
+            exit 1
+          }
+          echo "$output"
 
   # ── Release (PyPI) ──────────────────────────────────────────
   build-wheels:
