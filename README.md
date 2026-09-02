@@ -4,9 +4,13 @@
 > Zero-copy columnar reads and streaming cursors in Rust; dict / tuple / column / block output shapes and free-threaded-capable bindings in Python. TLS, LZ4/Zstd compression, pooled connections with failover — every server-controlled byte bounded, from handshake to EndOfStream. Works with ClickHouse 24.8 onward.
 
 [![CI](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/st-clickhouse-lib.svg)](https://crates.io/crates/st-clickhouse-lib)
-[![PyPI](https://img.shields.io/pypi/v/st-clickhouse-py.svg)](https://pypi.org/project/st-clickhouse-py/)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
+[![crates.io](https://img.shields.io/crates/v/st-clickhouse-lib.svg?style=flat-square)](https://crates.io/crates/st-clickhouse-lib)
+[![crates.io downloads](https://img.shields.io/crates/d/st-clickhouse-lib.svg?style=flat-square)](https://crates.io/crates/st-clickhouse-lib)
+[![PyPI](https://img.shields.io/pypi/v/st-clickhouse-py.svg?style=flat-square)](https://pypi.org/project/st-clickhouse-py/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/st-clickhouse-py.svg?style=flat-square)](https://pypi.org/project/st-clickhouse-py/)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](#license)
+[![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-orange.svg?style=flat-square)](./CONTRIBUTING.md)
+[![Releases](https://img.shields.io/github/v/release/Stellarrion/st-clickhouse-lib.svg?style=flat-square)](https://github.com/Stellarrion/st-clickhouse-lib/releases)
 
 ---
 
@@ -25,7 +29,8 @@
 - [Benchmarks](#benchmarks)
 - [Features](#features)
 - [Compatibility](#compatibility)
-- [Release](#release)
+- [Changelog](https://github.com/Stellarrion/st-clickhouse-lib/blob/main/CHANGELOG.md)
+- [Releases](https://github.com/Stellarrion/st-clickhouse-lib/releases)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -168,16 +173,24 @@ client.close()
 | `.block()` | `Block` | 60M+ | Zero-copy (borrowed) | Results guaranteed to contain exactly one server block |
 | `.blocks()` | `Vec<Block>` | 60M+ | Zero-copy payloads | Multi-block columnar results without dropped rows |
 | `.all::<T>()` | `Vec<T>` | 20M+ | Owned rows | Small results, ergonomic access |
-| `.rows::<T>()` | `RowCursor<T>` | 10M+ | Streaming | Large results, low memory |
+| `.rows::<T>()` | `RowCursor<T>` | 10M+ | Streaming | Any result size — safe default; constant memory, early stop, server-side cancel |
 | `.execute(sql)` | `()` | N/A | N/A | DDL/DML with no result rows: `CREATE`, `ALTER`, `DROP`, `INSERT ... VALUES` (for native-block INSERT use `begin_insert()` + `send_data()` + `end()`) |
 
 **Rule of thumb:**
-- **Result < 10K rows** → `.all::<T>()` — ergonomic, no borrow lifetime issues
-- **Result 10K–1M rows** → `.blocks()` — all columnar blocks, fastest materialized path
-- **Result > 1M rows** → `.rows::<T>()` — streaming, constant memory
-- **Need one known server block** → `.block()` — errors rather than truncating if another block arrives
-- **Need column slices** → iterate `.blocks()` and call `block.column::<T>("name")`
-- **Need owned rows** → `.all::<(u64, String)>()`
+- **Know the result is small** → `.all::<T>()` — ergonomic, no borrow lifetime issues
+- **Need columnar access** → `.blocks()` — fastest materialized path
+- **Everything else** → `.rows::<T>()` — streaming is the safe default, not just for large results
+
+**When streaming (`.rows::<T>()`) is the right choice even for small results:**
+- **Unknown result size** — always safe; memory stays constant whether the answer is 10 rows or 10 billion
+- **Early termination** — stop consuming after N rows; the server gets a `Cancel` and stops the query
+- **Pipeline processing** — transform, filter, or forward rows as they arrive (ETL, real-time analytics)
+- **Progressive rendering** — start processing the first rows immediately instead of waiting for the full result
+- **Backpressure** — the bounded channel means a slow consumer can't be overwhelmed by a fast server
+- **Server-side cancellation** — dropping the cursor sends `Cancel` to ClickHouse; the query actually stops
+
+- **Need exactly one server block** → `.block()` — errors rather than truncating if another block arrives
+- **Need raw column slices** → iterate `.blocks()` and call `block.column::<T>("name")`
 
 ### Python
 
@@ -187,14 +200,12 @@ client.close()
 | `query_tuples()` | `list[tuple]` | 14.1M | Large flat results |
 | `query_columns()` | `list[list]` | 73.9M | Columnar processing |
 | `query_blocks()` | `list[Block]` | 188.5M | Rawest, least allocation |
-| `query_stream()` | `Iterator[Block]` | 490.2M | Very large, streaming |
+| `query_stream()` | `Iterator[Block]` | 490.2M | Safe default — constant memory, early stop, cancel on break |
 
 **Rule of thumb:**
-- **Result < 10K rows** → `query()` — dicts are convenient
-- **Result 10K–1M rows** → `query_columns()` or `query_blocks()`
-- **Result > 1M rows** → `query_stream()` — constant memory
-- **Need column slices** → `query_columns()`
-- **Need dicts** → `query()` (but beware: 2x overhead vs tuples)
+- **Know the result is small and want dicts** → `query()` — ergonomic
+- **Need columnar access** → `query_columns()` or `query_blocks()`
+- **Everything else** → `query_stream()` — safe default for any size; constant memory, early termination, server-side cancellation on break
 
 ---
 
@@ -680,6 +691,8 @@ Run locally:
 
 ## Release
 
+**[Changelog](https://github.com/Stellarrion/st-clickhouse-lib/blob/main/CHANGELOG.md)** · **[All Releases](https://github.com/Stellarrion/st-clickhouse-lib/releases)**
+
 Rust users depend on one public crate:
 
 ```toml
@@ -688,11 +701,7 @@ st-clickhouse-lib = { version = "0.3", features = ["derive", "tls", "lz4"] }
 
 The Rust import path is `st_clickhouse`. The `st-clickhouse-derive` crate is an implementation detail required by Rust's proc-macro model and is pulled in by the `derive` feature.
 
-Release tags (`v*`) publish:
-
-- `st-clickhouse-derive` to crates.io first.
-- `st-clickhouse-lib` to crates.io after the derive crate appears in the index.
-- `st-clickhouse-py` wheels to PyPI via Trusted Publishing / OIDC.
+Merging to `main` **is** the release: CI validates, publishes to crates.io + PyPI (idempotent — skips versions already on the registries), and creates the `vX.Y.Z` tag. Pushing a `v*` tag also triggers publishing. See [CONTRIBUTING.md](CONTRIBUTING.md) for the versioning strategy.
 
 ---
 

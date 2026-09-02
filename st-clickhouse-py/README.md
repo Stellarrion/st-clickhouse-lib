@@ -1,5 +1,13 @@
 # st-clickhouse-py
 
+[![PyPI](https://img.shields.io/pypi/v/st-clickhouse-py.svg?style=flat-square)](https://pypi.org/project/st-clickhouse-py/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/st-clickhouse-py.svg?style=flat-square)](https://pypi.org/project/st-clickhouse-py/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg?style=flat-square)](https://pypi.org/project/st-clickhouse-py/)
+[![Free Threading 3.14t+](https://img.shields.io/badge/free--threading-3.14t%2B-green.svg?style=flat-square)](#free-threaded-python-314t)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](https://github.com/Stellarrion/st-clickhouse-lib/blob/main/NOTICE)
+[![CI](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml)
+[![Releases](https://img.shields.io/github/v/release/Stellarrion/st-clickhouse-lib.svg?style=flat-square)](https://github.com/Stellarrion/st-clickhouse-lib/releases)
+
 **Python bindings for the ClickHouse native TCP protocol - 100% Rust core via PyO3.**
 
 A high-performance ClickHouse client that speaks the native protocol directly.
