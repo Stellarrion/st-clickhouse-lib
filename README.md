@@ -4,9 +4,13 @@
 > Zero-copy columnar reads and streaming cursors in Rust; dict / tuple / column / block output shapes and free-threaded-capable bindings in Python. TLS, LZ4/Zstd compression, pooled connections with failover — every server-controlled byte bounded, from handshake to EndOfStream. Works with ClickHouse 24.8 onward.
 
 [![CI](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/st-clickhouse-lib.svg)](https://crates.io/crates/st-clickhouse-lib)
-[![PyPI](https://img.shields.io/pypi/v/st-clickhouse-py.svg)](https://pypi.org/project/st-clickhouse-py/)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
+[![crates.io](https://img.shields.io/crates/v/st-clickhouse-lib.svg?style=flat-square)](https://crates.io/crates/st-clickhouse-lib)
+[![crates.io downloads](https://img.shields.io/crates/d/st-clickhouse-lib.svg?style=flat-square)](https://crates.io/crates/st-clickhouse-lib)
+[![PyPI](https://img.shields.io/pypi/v/st-clickhouse-py.svg?style=flat-square)](https://pypi.org/project/st-clickhouse-py/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/st-clickhouse-py.svg?style=flat-square)](https://pypi.org/project/st-clickhouse-py/)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](#license)
+[![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-orange.svg?style=flat-square)](./CONTRIBUTING.md)
+[![Releases](https://img.shields.io/github/v/release/Stellarrion/st-clickhouse-lib.svg?style=flat-square)](https://github.com/Stellarrion/st-clickhouse-lib/releases)
 
 ---
 
@@ -25,7 +29,8 @@
 - [Benchmarks](#benchmarks)
 - [Features](#features)
 - [Compatibility](#compatibility)
-- [Release](#release)
+- [Changelog](https://github.com/Stellarrion/st-clickhouse-lib/blob/main/CHANGELOG.md)
+- [Releases](https://github.com/Stellarrion/st-clickhouse-lib/releases)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -680,6 +685,8 @@ Run locally:
 
 ## Release
 
+**[Changelog](https://github.com/Stellarrion/st-clickhouse-lib/blob/main/CHANGELOG.md)** · **[All Releases](https://github.com/Stellarrion/st-clickhouse-lib/releases)**
+
 Rust users depend on one public crate:
 
 ```toml
@@ -688,11 +695,7 @@ st-clickhouse-lib = { version = "0.3", features = ["derive", "tls", "lz4"] }
 
 The Rust import path is `st_clickhouse`. The `st-clickhouse-derive` crate is an implementation detail required by Rust's proc-macro model and is pulled in by the `derive` feature.
 
-Release tags (`v*`) publish:
-
-- `st-clickhouse-derive` to crates.io first.
-- `st-clickhouse-lib` to crates.io after the derive crate appears in the index.
-- `st-clickhouse-py` wheels to PyPI via Trusted Publishing / OIDC.
+Merging to `main` **is** the release: CI validates, publishes to crates.io + PyPI (idempotent — skips versions already on the registries), and creates the `vX.Y.Z` tag. Pushing a `v*` tag also triggers publishing. See [CONTRIBUTING.md](CONTRIBUTING.md) for the versioning strategy.
 
 ---
 
