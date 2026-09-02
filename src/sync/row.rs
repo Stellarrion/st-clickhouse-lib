@@ -3,9 +3,27 @@
 //! The row API allocates per row (owned Strings, Vecs) for convenience.
 //! For zero-allocation access, use the columnar API directly:
 //!
-//! ```ignore
-//! let ages: &[u64] = block.column::<u64>("age")?.as_slice()?;
-//! for age in ages { process(age); }
+//! ```rust
+//! use st_clickhouse::sync::{Block, ColumnInfo};
+//!
+//! let mut block = Block::empty();
+//! block.rows = 3;
+//! block.columns.push(ColumnInfo {
+//!     name: "age".to_owned(),
+//!     type_name: "UInt64".to_owned(),
+//!     data: bytes::Bytes::from(vec![
+//!         10, 0, 0, 0, 0, 0, 0, 0, //
+//!         20, 0, 0, 0, 0, 0, 0, 0, //
+//!         30, 0, 0, 0, 0, 0, 0, 0,
+//!     ]),
+//!     lc_materialized: Default::default(),
+//! });
+//! let ages: &[u64] = block
+//!     .column::<u64>("age")
+//!     .expect("column decodes")
+//!     .as_slice()
+//!     .expect("fixed-width column yields an aligned slice");
+//! assert_eq!(ages, &[10, 20, 30]);
 //! ```
 
 use crate::sync::column::{AnyColumnData, ClickHouseColumn, ClickHouseColumnData};
@@ -21,6 +39,16 @@ pub trait Row: Sized {
     const COLUMN_COUNT: usize;
 
     fn from_row(block: &Block, row_index: usize) -> Result<Self>;
+
+    /// Whether [`from_columns`](Self::from_columns) expects columns in
+    /// [`COLUMN_NAMES`](Self::COLUMN_NAMES) order rather than block order.
+    ///
+    /// The derive opts in because derived structs map fields by name. The
+    /// default stays positional for compatibility with existing manual
+    /// implementations and tuple rows.
+    fn from_columns_by_name() -> bool {
+        false
+    }
 
     /// Fast path: construct from pre-extracted column data.
     /// Override for zero per-row column dispatch overhead.

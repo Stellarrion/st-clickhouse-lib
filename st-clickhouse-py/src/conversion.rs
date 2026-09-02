@@ -836,6 +836,9 @@ fn parse_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
         }
         let b = data[*pos];
         *pos += 1;
+        if shift == 63 && (b & 0x7f) > 1 {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
         result |= u64::from(b & 0x7f) << shift;
         if b & 0x80 == 0 {
             return Ok(result);
@@ -975,7 +978,7 @@ pub fn py_dicts_to_block(
     for (col_name, col_type) in columns {
         let mut buf = Vec::new();
         for row_obj in rows {
-            let row_dict = row_obj.downcast_bound::<PyDict>(py)?;
+            let row_dict = row_obj.bind(py).cast::<PyDict>()?;
             let val = row_dict.get_item(col_name.as_str())?.ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "missing column '{col_name}' in row"

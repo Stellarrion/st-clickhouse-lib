@@ -279,6 +279,9 @@ fn parse_varint_checked(data: &[u8], pos: &mut usize) -> Result<u64> {
         }
         let b = data[*pos];
         *pos += 1;
+        if shift == 63 && (b & 0x7f) > 1 {
+            return Err(Error::Protocol("varint overflow".into()));
+        }
         result |= u64::from(b & 0x7f) << shift;
         if b & 0x80 == 0 {
             return Ok(result);

@@ -3,14 +3,19 @@
 //! [`ClientConfig`] holds ALL connection parameters with sensible defaults.
 //! Use the builder pattern to override only what you need:
 //!
-//! ```ignore
+//! ```rust
+//! use st_clickhouse::sync::compression::CompressionMethod;
+//! use st_clickhouse::sync::config::ClientConfig;
+//!
 //! let config = ClientConfig::default()
 //!     .with_host("clickhouse.example.com")
 //!     .with_user("analytics")
 //!     .with_password("secret")
 //!     .with_compression(CompressionMethod::Lz4)
 //!     .with_setting("max_block_size", "8192");
-//! let client = SyncClient::connect_with_config(config)?;
+//! assert_eq!(config.host, "clickhouse.example.com");
+//! // Connect against a live server:
+//! // let client = SyncClient::connect_with_config(config)?;
 //! ```
 
 use std::collections::HashMap;
@@ -53,7 +58,10 @@ pub struct ClientConfig {
     pub client_version_patch: u64,
     /// Protocol revision (defines which features the server enables).
     pub client_revision: u64,
-    /// Timeout for establishing the TCP connection.
+    /// Timeout for each per-address connection attempt: TCP establishment
+    /// plus the whole setup phase (TLS handshake, native handshake,
+    /// addendum). Must be greater than zero; see
+    /// [`SyncClient::connect_with_config`](crate::sync::SyncClient::connect_with_config).
     pub connect_timeout: Duration,
     /// Read timeout for queries (applied to the TCP stream).
     pub query_timeout: Duration,
@@ -73,7 +81,17 @@ pub struct ClientConfig {
     pub initial_user: String,
     /// Initial address sent in every ClientInfo block.
     pub initial_address: String,
-    /// Maximum response size before truncation (default: 256 MiB).
+    /// Cumulative response-size budget for accumulating query APIs, in
+    /// decoded block payload bytes (default: 256 MiB).
+    ///
+    /// The metric is the sum of each retained block's decoded payload bytes
+    /// (`Block::payload_bytes`; raw capture sums the native `RawBlock` body
+    /// length). Applies to `query`/`query_all`-style APIs and each `batch`
+    /// result set on the async engine; a response passing the limit fails
+    /// with [`Error::ResponseTooLarge`](crate::sync::error::Error::ResponseTooLarge)
+    /// naming the limit, and the connection is recovered or discarded so it
+    /// is never reused mid-response. Streaming APIs (`start_stream`,
+    /// `query_with_block_view`) are deliberately not budgeted.
     pub max_response_size: usize,
     /// Size of the internal read buffer for streaming (default: 64 KiB).
     pub read_buffer_size: usize,
@@ -119,7 +137,7 @@ impl Default for ClientConfig {
             initial_query_id: String::new(),
             initial_user: String::new(),
             initial_address: "0.0.0.0:0".to_string(),
-            max_response_size: 256 * 1024 * 1024,
+            max_response_size: crate::limits::DEFAULT_MAX_RESPONSE_SIZE,
             read_buffer_size: 65536,
             ping_before_query: false,
             validate_schema: false,
@@ -186,6 +204,13 @@ impl ClientConfig {
         self.client_revision = rev;
         self
     }
+    /// Set the connect timeout (see [`ClientConfig::connect_timeout`]).
+    ///
+    /// Each resolved address gets the full timeout for TCP establishment and
+    /// connection setup; expiry returns
+    /// [`Error::Timeout`](crate::sync::error::Error::Timeout) for setup or TCP
+    /// stalls. `Duration::ZERO` is rejected with
+    /// [`Error::Config`](crate::sync::error::Error::Config) at connect time.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
@@ -212,6 +237,15 @@ impl ClientConfig {
             if enabled { "1" } else { "0" },
         )
     }
+    /// Set the cumulative response-size budget (see
+    /// [`ClientConfig::max_response_size`]).
+    ///
+    /// The budget is measured in decoded block payload bytes accumulated by
+    /// buffering APIs (`query`, `query_all`, `fetch`-style reads). A result
+    /// whose cumulative decoded payload passes `size` fails with
+    /// [`Error::ResponseTooLarge`](crate::sync::error::Error::ResponseTooLarge);
+    /// raise the limit or switch to a streaming API. Default 256 MiB;
+    /// `usize::MAX` disables the limit.
     pub fn with_max_response_size(mut self, size: usize) -> Self {
         self.max_response_size = size;
         self

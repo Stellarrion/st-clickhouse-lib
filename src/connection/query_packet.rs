@@ -10,12 +10,8 @@ use crate::protocol::parameters::{
 };
 use crate::protocol::revision;
 use crate::protocol::wire;
-use crate::query_id::next_query_id_with_prefix;
+use crate::query_id::next_query_id;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
-
-static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-static QUERY_ID_PROCESS_PREFIX: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueryPacketTemplate {
@@ -31,6 +27,9 @@ pub(crate) struct QueryPacketTemplate {
     insert_capacity: usize,
 }
 
+/// Resolve the query ID bytes for a Query packet: the caller-supplied custom
+/// ID when present, otherwise the next ID from the process-wide standard
+/// generator shared with the sync engine (see `crate::query_id`).
 pub(crate) fn query_id_bytes<'a>(custom: Option<&'a str>, buf: &'a mut [u8; 22]) -> &'a [u8] {
     if let Some(id) = custom {
         id.as_bytes()
@@ -38,10 +37,6 @@ pub(crate) fn query_id_bytes<'a>(custom: Option<&'a str>, buf: &'a mut [u8; 22])
         let len = next_query_id(buf);
         &buf[..len]
     }
-}
-
-pub(crate) fn next_query_id(buf: &mut [u8; 22]) -> usize {
-    next_query_id_with_prefix(buf, b"st-ch-", &QUERY_ID_PROCESS_PREFIX, &QUERY_ID_COUNTER)
 }
 
 pub(crate) fn build_query_packet_template(

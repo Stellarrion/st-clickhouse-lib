@@ -2,6 +2,12 @@
 //!
 //! Wraps [`Client`] and adds SQL helpers for server-side
 //! `{name:Type}` placeholders (ClickHouse 54459+).
+//!
+//! This builder is a thin convenience shim over the richer
+//! [`crate::connection::QueryBuilder`] returned by [`Client::query`], which
+//! additionally supports settings,
+//! compression, callbacks, query IDs, timeouts, external tables, and
+//! streaming reads.
 
 use crate::Client;
 use crate::error::Result;
@@ -13,18 +19,26 @@ use crate::protocol::parameters::QueryParameter;
 /// # Example
 ///
 /// ```ignore
+/// // ignore: needs a connected `Client` (live server); the shim is deprecated
 /// let block = QueryBuilder::new(&client)
 ///     .query("SELECT * FROM users WHERE id = {uid:UInt64}")
 ///     .bind("uid", "42")
 ///     .block()
 ///     .await?;
 /// ```
+#[deprecated(
+    since = "0.3.0",
+    note = "thin shim over the richer builder returned by Client::query; use st_clickhouse::connection::QueryBuilder (settings, timeouts, callbacks, streaming) or Client::execute_with_params for parameterized DDL"
+)]
 pub struct QueryBuilder<'a> {
     client: &'a Client,
     sql: String,
     params: Vec<QueryParameter>,
 }
 
+// The shim's own methods reference the deprecated struct's fields; the
+// deprecation is aimed at external users, not at this delegation code.
+#[allow(deprecated)]
 impl<'a> QueryBuilder<'a> {
     /// Create a new empty query builder for the given client.
     pub fn new(client: &'a Client) -> Self {
@@ -68,9 +82,20 @@ impl<'a> QueryBuilder<'a> {
             .await
     }
 
-    /// Execute a SELECT query and return the first data block.
+    /// Execute a SELECT that must return exactly one non-empty data block.
     ///
+    /// Returns an error instead of silently dropping rows if the server emits
+    /// more than one block. Use [`blocks`](Self::blocks) for general results.
     pub async fn block(self) -> Result<Block> {
+        self.into_connection_query().block().await
+    }
+
+    /// Execute a SELECT and return every non-empty server block.
+    pub async fn blocks(self) -> Result<Vec<Block>> {
+        self.into_connection_query().blocks().await
+    }
+
+    fn into_connection_query(self) -> crate::connection::QueryBuilder<'a> {
         let mut query = self.client.query(&self.sql);
         for param in self.params {
             query = match param.value {
@@ -78,7 +103,7 @@ impl<'a> QueryBuilder<'a> {
                 None => query.bind_null(param.name),
             };
         }
-        query.block().await
+        query
     }
 }
 
@@ -87,6 +112,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn test_query_builder_bind_chaining() {
         // Test that the builder API compiles and chains correctly.
         // We can't construct a real Client here, but the type system

@@ -12,8 +12,17 @@ use crate::connection::server_packets::{
     unsupported_server_packet,
 };
 use crate::error::Result;
+use crate::limits::ResponseBudget;
 use crate::protocol::block::{Block, RawBlock};
 use std::time::Duration;
+
+/// Charge `block`'s decoded payload bytes against `budget`, mapping a breach
+/// to the actionable `ResponseTooLarge` error.
+fn charge_block(budget: &mut ResponseBudget, payload_bytes: usize) -> Result<()> {
+    budget
+        .charge(payload_bytes)
+        .map_err(|_| crate::error::Error::response_budget_exceeded(budget))
+}
 
 #[allow(async_fn_in_trait)]
 pub(super) trait SelectResponseHandler {
@@ -61,17 +70,20 @@ pub(super) async fn read_select_response<H: SelectResponseHandler>(
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
                         if deadline.is_some() {
-                            cancel_and_drain(stream, recv_timeout, response_compressed).await?;
+                            let _ =
+                                cancel_and_drain(stream, recv_timeout, response_compressed).await;
                             return Err(crate::error::Error::Timeout(
                                 "query exceeded deadline".into(),
                             ));
                         }
-                        return Err(crate::error::Error::Protocol("timeout".into()));
+                        return Err(crate::error::Error::Timeout(
+                            "receive timeout while reading query response".into(),
+                        ));
                     },
                 }
             },
             None => {
-                cancel_and_drain(stream, recv_timeout, response_compressed).await?;
+                let _ = cancel_and_drain(stream, recv_timeout, response_compressed).await;
                 return Err(crate::error::Error::Timeout(
                     "query exceeded deadline".into(),
                 ));
@@ -115,9 +127,32 @@ pub(super) async fn read_select_response<H: SelectResponseHandler>(
     }
 }
 
-#[derive(Default)]
+/// Single-block terminal: returns the query's one non-empty Data block.
+///
+/// Exact-one-block semantics: a second non-empty Data block is an error, never
+/// a silent truncation. Once the first block is captured, later Data blocks
+/// are discarded (without materializing their columns) so the response is
+/// still read through EndOfStream and the pooled connection stays clean;
+/// `finish` then surfaces the error. Backs [`QueryBuilder::block`] and
+/// `fetch::<Block>()`.
+///
+/// The retained block's decoded payload bytes are charged against the
+/// response budget (`max_response_size`); discarded extra blocks are not.
 pub(super) struct FirstBlockHandler {
     first: Option<Block>,
+    extra_blocks: bool,
+    budget: ResponseBudget,
+}
+
+impl FirstBlockHandler {
+    /// Budgeted handler allowing `limit` decoded payload bytes.
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            first: None,
+            extra_blocks: false,
+            budget: ResponseBudget::new(limit),
+        }
+    }
 }
 
 impl SelectResponseHandler for FirstBlockHandler {
@@ -126,26 +161,93 @@ impl SelectResponseHandler for FirstBlockHandler {
     async fn on_data(
         &mut self, stream: &mut crate::pool::StreamWrapper, response_compressed: bool,
     ) -> Result<()> {
+        if self.first.is_some() {
+            // Keep the stream aligned by consuming (not materializing) the
+            // extra block, then flag it so `finish` errors out.
+            let rows = discard_data_block_maybe_compressed(stream, response_compressed).await?;
+            if rows > 0 {
+                self.extra_blocks = true;
+            }
+            return Ok(());
+        }
         let block = read_data_block_maybe_compressed(stream, response_compressed).await?;
-        if block.row_count() > 0 && self.first.is_none() {
+        if block.row_count() > 0 {
+            charge_block(&mut self.budget, block.payload_bytes())?;
             self.first = Some(block);
         }
         Ok(())
     }
 
     fn finish(self) -> Result<Self::Output> {
+        if self.extra_blocks {
+            return Err(crate::error::Error::Protocol(
+                "query returned multiple non-empty data blocks; use .blocks() to fetch all of them"
+                    .into(),
+            ));
+        }
         self.first
             .ok_or_else(|| crate::error::Error::Protocol("no data blocks".into()))
     }
 }
 
-pub(super) struct AllRowsHandler<T> {
-    rows: Vec<T>,
+/// Multi-block terminal: collects every non-empty Data block, preserving
+/// block boundaries. Column payloads are moved into the `Block` values, not
+/// copied. Backs [`QueryBuilder::blocks`].
+///
+/// Each retained block's decoded payload bytes are charged against the
+/// response budget (`max_response_size`); the cumulative total crossing the
+/// limit aborts the read with `Error::ResponseTooLarge` (the mid-response
+/// socket is then discarded by the pool).
+pub(super) struct BlocksHandler {
+    blocks: Vec<Block>,
+    budget: ResponseBudget,
 }
 
-impl<T> Default for AllRowsHandler<T> {
-    fn default() -> Self {
-        Self { rows: Vec::new() }
+impl BlocksHandler {
+    /// Budgeted handler allowing `limit` decoded payload bytes.
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            blocks: Vec::new(),
+            budget: ResponseBudget::new(limit),
+        }
+    }
+}
+
+impl SelectResponseHandler for BlocksHandler {
+    type Output = Vec<Block>;
+
+    async fn on_data(
+        &mut self, stream: &mut crate::pool::StreamWrapper, response_compressed: bool,
+    ) -> Result<()> {
+        let block = read_data_block_maybe_compressed(stream, response_compressed).await?;
+        if block.row_count() > 0 {
+            charge_block(&mut self.budget, block.payload_bytes())?;
+            self.blocks.push(block);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self::Output> {
+        Ok(self.blocks)
+    }
+}
+
+/// Row-vector terminal backing [`QueryBuilder::all`] and
+/// `fetch::<Vec<T>>()`. Every non-empty block is decoded and its payload
+/// bytes charged against the response budget (`max_response_size`) before the
+/// rows are retained, so the budget metric matches the block-based APIs.
+pub(super) struct AllRowsHandler<T> {
+    rows: Vec<T>,
+    budget: ResponseBudget,
+}
+
+impl<T> AllRowsHandler<T> {
+    /// Budgeted handler allowing `limit` decoded payload bytes.
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            rows: Vec::new(),
+            budget: ResponseBudget::new(limit),
+        }
     }
 }
 
@@ -157,6 +259,7 @@ impl<T: crate::row::Row> SelectResponseHandler for AllRowsHandler<T> {
     ) -> Result<()> {
         let block = read_data_block_maybe_compressed(stream, response_compressed).await?;
         if block.row_count() > 0 {
+            charge_block(&mut self.budget, block.payload_bytes())?;
             self.rows.extend(crate::row::read_all::<T>(&block)?);
         }
         Ok(())
@@ -216,9 +319,22 @@ impl SelectResponseHandler for RowCountHandler {
     }
 }
 
-#[derive(Default)]
+/// Raw-capture terminal backing [`QueryBuilder::raw`] and
+/// `fetch::<RawBlocks>()`. Each retained `RawBlock`'s native payload length
+/// is charged against the response budget (`max_response_size`).
 pub(super) struct RawBlocksHandler {
     blocks: Vec<RawBlock>,
+    budget: ResponseBudget,
+}
+
+impl RawBlocksHandler {
+    /// Budgeted handler allowing `limit` decoded payload bytes.
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            blocks: Vec::new(),
+            budget: ResponseBudget::new(limit),
+        }
+    }
 }
 
 impl SelectResponseHandler for RawBlocksHandler {
@@ -229,6 +345,7 @@ impl SelectResponseHandler for RawBlocksHandler {
     ) -> Result<()> {
         let block = read_raw_data_block(stream).await?;
         if block.rows > 0 {
+            charge_block(&mut self.budget, block.payload_bytes())?;
             self.blocks.push(block);
         }
         Ok(())

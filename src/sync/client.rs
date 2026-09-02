@@ -8,12 +8,14 @@ use crate::sync::chunked::{
     ChunkedReader, TransportReader, negotiate_chunked_transport, write_chunk_header,
     write_chunked_packet,
 };
+use crate::sync::compression::DecompressingReader;
 use crate::sync::config::ClientConfig;
 use crate::sync::error::{Error, Result};
 use crate::sync::protocol::block::{Block, BlockView};
 use crate::sync::protocol::parameters::{
     QueryParameter, query_parameters_capacity, write_query_parameters_to_vec,
 };
+use crate::sync::protocol::response_packets::parse_exception_chain;
 use crate::sync::schema::{
     TableColumn, TableSchema, query_may_change_schema, quote_identifier_path,
 };
@@ -29,6 +31,18 @@ fn take_buf(capacity: usize) -> Vec<u8> {
         let mut pool = pool.borrow_mut();
         pool.pop().unwrap_or_else(|| Vec::with_capacity(capacity))
     })
+}
+
+/// Upper bound for a merged settings block: varint + bytes per string, plus
+/// flags and the terminator per entry. Used only for buffer pre-sizing.
+fn serialized_settings_capacity(
+    base: &HashMap<String, String>, overlay: &HashMap<String, String>,
+) -> usize {
+    base.iter()
+        .chain(overlay.iter())
+        .map(|(name, value)| name.len() + value.len() + 24)
+        .sum::<usize>()
+        + 24
 }
 
 /// Parse a `host:port` string into (host, port) components.
@@ -49,17 +63,120 @@ pub fn parse_host_port_addr(addr: &str) -> Result<(String, u16)> {
         )))
     }
 }
+use crate::query_id::next_query_id;
 use crate::sync::protocol::handshake::{self, ServerInfo};
 use crate::sync::protocol::response::{parse_block, parse_block_body};
 use crate::sync::protocol::revision;
 use crate::sync::protocol::table_status::{QualifiedTableName, TableStatus, TablesStatusResponse};
 use crate::sync::protocol::wire;
 use crate::sync::query_packet::{
-    QueryPacketTemplate, build_query_packet_template, next_query_id, write_empty_data_block_to,
+    QueryPacketTemplate, build_query_packet_template, write_empty_data_block_for,
 };
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
+/// Reject a zero `connect_timeout` clearly: it cannot mean "no deadline"
+/// (that is the hang this timeout exists to prevent).
+fn validate_connect_timeout(config: &ClientConfig) -> Result<()> {
+    if config.connect_timeout.is_zero() {
+        return Err(Error::Config(
+            "connect_timeout must be greater than zero; Duration::ZERO would remove the connect deadline".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an I/O error is a socket read/write deadline expiry.
+///
+/// A blocking socket with a timeout reports `TimedOut` on most platforms, but
+/// Linux reports `WouldBlock`; both mean the configured deadline expired.
+fn is_socket_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Classify a failed connection setup: an expired wall-clock deadline (or its
+/// socket timeout fallback) becomes a distinct [`Error::Timeout`].
+fn classify_setup_error(
+    result: Result<ServerInfo>, config: &ClientConfig, deadline_expired: bool,
+) -> Result<ServerInfo> {
+    match result {
+        _ if deadline_expired => Err(Error::Timeout(format!(
+            "connection setup to {} did not complete within {:?}",
+            config.addr(),
+            config.connect_timeout
+        ))),
+        Err(Error::Io(ref e)) if is_socket_timeout(e) => Err(Error::Timeout(format!(
+            "connection setup to {} did not complete within {:?}",
+            config.addr(),
+            config.connect_timeout
+        ))),
+        other => other,
+    }
+}
+
+/// Wall-clock guard for blocking sync setup. Socket timeouts alone reset on
+/// every read/write and can be defeated by a peer that drip-feeds bytes. The
+/// watchdog shuts down a cloned socket at the absolute deadline, interrupting
+/// TLS/native handshake I/O. It is disarmed and joined before a client escapes.
+struct SetupWatchdog {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: std::time::Instant,
+    budget: Duration,
+}
+
+impl SetupWatchdog {
+    fn start(tcp: &TcpStream, budget: Duration) -> Result<Self> {
+        let tcp = tcp.try_clone()?;
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let expired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expired_in_thread = expired.clone();
+        let join = std::thread::Builder::new()
+            .name("st-clickhouse-connect-timeout".into())
+            .spawn(move || {
+                if matches!(
+                    stopped.recv_timeout(budget),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    expired_in_thread.store(true, std::sync::atomic::Ordering::Release);
+                    let _ = tcp.shutdown(std::net::Shutdown::Both);
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            join: Some(join),
+            expired,
+            started: std::time::Instant::now(),
+            budget,
+        })
+    }
+
+    fn finish(mut self) -> bool {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        self.expired.load(std::sync::atomic::Ordering::Acquire)
+            || self.started.elapsed() >= self.budget
+    }
+}
+
+impl Drop for SetupWatchdog {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
 
 /// A synchronous ClickHouse native protocol client.
 ///
@@ -88,20 +205,67 @@ impl SyncClient {
 
     /// Connect to a ClickHouse server using a full [`ClientConfig`].
     ///
-    /// Handles handshake, addendum, ping/pong, and sets read timeout
-    /// from `config.query_timeout`.
+    /// Resolves `config.addr()` and tries every socket address in order. Each
+    /// address gets one wall-clock `config.connect_timeout` budget shared by
+    /// TCP establishment and subsequent TLS/native setup. Transient TCP/setup
+    /// I/O and timeout failures move to the next address; deterministic setup
+    /// errors surface immediately. See [`SyncClient::connect_stream`]. A
+    /// `connect_timeout` of [`Duration::ZERO`](std::time::Duration::ZERO) is
+    /// rejected with [`Error::Config`].
+    ///
+    /// On success the connection is left in normal query mode: the socket read
+    /// timeout is `config.query_timeout` and the write timeout is unset.
     pub fn connect_with_config(config: ClientConfig) -> Result<Self> {
         revision::validate_supported_revision(config.client_revision).map_err(Error::Protocol)?;
+        validate_connect_timeout(&config)?;
 
-        // Native connect() produces a clean blocking socket with no
-        // non-blocking flags left over from connect_timeout.
-        let addr = config
-            .addr()
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| Error::Protocol("no address resolved".into()))?;
-        let stream = TcpStream::connect(addr)?;
-        Self::connect_stream(stream, config)
+        let timeout = config.connect_timeout;
+        let mut last_err = None;
+        // Collect first: `ToSocketAddrs` resolves lazily and each `next()` can
+        // touch the resolver, which must not happen inside the loop.
+        let addrs: Vec<std::net::SocketAddr> = config.addr().to_socket_addrs()?.collect();
+        if addrs.is_empty() {
+            return Err(Error::Protocol("no address resolved".into()));
+        }
+        for addr in addrs {
+            let attempt_started = std::time::Instant::now();
+            // `connect_timeout` returns a plain blocking socket — no
+            // non-blocking flags left over from the timed connect.
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(stream) => {
+                    let Some(setup_budget) = timeout.checked_sub(attempt_started.elapsed()) else {
+                        last_err = Some(Error::Timeout(format!(
+                            "connect to {addr} timed out after {timeout:?}"
+                        )));
+                        continue;
+                    };
+                    if setup_budget.is_zero() {
+                        last_err = Some(Error::Timeout(format!(
+                            "connect to {addr} timed out after {timeout:?}"
+                        )));
+                        continue;
+                    }
+                    let transport = crate::sync::transport::Transport::new_plain(stream);
+                    match Self::connect_transport_with_budget(
+                        transport,
+                        config.clone(),
+                        setup_budget,
+                    ) {
+                        Ok(client) => return Ok(client),
+                        Err(e @ (Error::Io(_) | Error::Timeout(_))) => last_err = Some(e),
+                        Err(e) => return Err(e),
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(if is_socket_timeout(&e) {
+                        Error::Timeout(format!("TCP connect to {addr} timed out after {timeout:?}"))
+                    } else {
+                        Error::Io(e)
+                    });
+                },
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Protocol("no address resolved".into())))
     }
 
     /// Connect to a ClickHouse server at `host:port`.
@@ -144,6 +308,21 @@ impl SyncClient {
         SyncClient::connect_with_config(config)
     }
 
+    /// Complete the connection setup over an already-established TCP stream.
+    ///
+    /// The stream must be a fresh blocking socket to a ClickHouse native
+    /// endpoint — nothing may have been written to or read from it yet
+    /// (`TCP_NODELAY` is set here). The whole setup phase — optional TLS
+    /// handshake, native protocol handshake, and the handshake addendum — is
+    /// bounded by one absolute `config.connect_timeout` deadline. A watchdog
+    /// interrupts the socket at that deadline (temporary socket timeouts are a
+    /// fallback), so even a byte-dripping peer cannot extend setup. On success,
+    /// the normal query read timeout (`config.query_timeout`) is restored and
+    /// writes are unbounded.
+    ///
+    /// Setup expiry surfaces as [`Error::Timeout`]; a `connect_timeout` of
+    /// [`Duration::ZERO`](std::time::Duration::ZERO) is rejected up front with
+    /// [`Error::Config`].
     pub fn connect_stream(stream: TcpStream, config: ClientConfig) -> Result<Self> {
         let transport = crate::sync::transport::Transport::new_plain(stream);
         Self::connect_transport(transport, config)
@@ -153,8 +332,29 @@ impl SyncClient {
     fn connect_transport(
         transport: crate::sync::transport::Transport, config: ClientConfig,
     ) -> Result<Self> {
+        validate_connect_timeout(&config)?;
+        let budget = config.connect_timeout;
+        Self::connect_transport_with_budget(transport, config, budget)
+    }
+
+    /// Complete setup within one absolute wall-clock budget.
+    fn connect_transport_with_budget(
+        transport: crate::sync::transport::Transport, config: ClientConfig, budget: Duration,
+    ) -> Result<Self> {
+        validate_connect_timeout(&config)?;
+        if budget.is_zero() {
+            return Err(Error::Timeout(format!(
+                "connection setup to {} had no remaining connect timeout",
+                config.addr()
+            )));
+        }
         transport.set_nodelay(true)?;
-        let _ = transport.set_read_timeout(Some(config.query_timeout));
+        // Socket deadlines are a fallback for platforms where shutdown does
+        // not promptly interrupt a blocking syscall. The watchdog below owns
+        // the absolute wall-clock deadline and defeats byte-drip peers.
+        transport.set_read_timeout(Some(budget))?;
+        transport.set_write_timeout(Some(budget))?;
+        let watchdog = SetupWatchdog::start(transport.raw_tcp(), budget)?;
 
         #[cfg(feature = "tls")]
         let mut transport = if let Some(ref tls_config) = config.tls_config {
@@ -174,10 +374,41 @@ impl SyncClient {
         #[cfg(not(feature = "tls"))]
         let mut transport = transport;
 
-        let mut server_info = handshake::handshake(&mut transport, &config)?;
+        let setup = Self::handshake_and_negotiate(&mut transport, &config);
+        let deadline_expired = watchdog.finish();
+        let setup = classify_setup_error(setup, &config, deadline_expired);
+
+        // Back to normal query semantics. A successful setup is not allowed to
+        // escape with stale setup deadlines if either restoration fails.
+        if setup.is_ok() {
+            transport.set_read_timeout(Some(config.query_timeout))?;
+            transport.set_write_timeout(None)?;
+        } else {
+            // The failed socket is discarded; restoration is best effort only.
+            let _ = transport.set_read_timeout(Some(config.query_timeout));
+            let _ = transport.set_write_timeout(None);
+        }
+        let server_info = setup?;
+
+        let query_template = build_query_packet_template(&config, server_info.negotiated_revision);
+
+        Ok(SyncClient {
+            stream: transport,
+            server_info,
+            config,
+            query_template,
+            schema_cache: HashMap::new(),
+        })
+    }
+
+    /// Native handshake plus handshake addendum over an established transport.
+    fn handshake_and_negotiate(
+        transport: &mut crate::sync::transport::Transport, config: &ClientConfig,
+    ) -> Result<ServerInfo> {
+        let mut server_info = handshake::handshake(transport, config)?;
 
         if server_info.negotiated_revision >= revision::DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM {
-            let chunked = negotiate_chunked_transport(&server_info, &config)?;
+            let chunked = negotiate_chunked_transport(&server_info, config)?;
             server_info.use_chunked_send = chunked.send_chunked;
             server_info.use_chunked_recv = chunked.recv_chunked;
             let mut buf = Vec::new();
@@ -196,16 +427,7 @@ impl SyncClient {
             transport.write_all(&buf)?;
             transport.flush()?;
         }
-
-        let query_template = build_query_packet_template(&config, server_info.negotiated_revision);
-
-        Ok(SyncClient {
-            stream: transport,
-            server_info,
-            config,
-            query_template,
-            schema_cache: HashMap::new(),
-        })
+        Ok(server_info)
     }
 
     // ── Builder methods ──
@@ -369,8 +591,40 @@ impl SyncClient {
     pub fn execute_with_params_and_ignored_part_uuids(
         &mut self, query: &str, params: &[QueryParameter], uuids: &[[u8; 16]],
     ) -> Result<()> {
+        self.execute_with_params_settings_and_ignored_part_uuids(
+            query,
+            params,
+            &HashMap::new(),
+            uuids,
+        )
+    }
+
+    /// Execute a DDL/DML with a per-query settings overlay.
+    ///
+    /// The overlay is merged into this query's packet only; the connection's
+    /// session settings (and every later query) are untouched. An empty
+    /// overlay is identical to [`execute`](Self::execute).
+    pub fn execute_with_settings(
+        &mut self, query: &str, settings: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.execute_with_params_and_settings(query, &[], settings)
+    }
+
+    /// Execute a DDL/DML with parameters and a per-query settings overlay.
+    pub fn execute_with_params_and_settings(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.execute_with_params_settings_and_ignored_part_uuids(query, params, settings, &[])
+    }
+
+    /// Execute a DDL/DML with parameters, a per-query settings overlay, and
+    /// ignored-part UUIDs.
+    pub fn execute_with_params_settings_and_ignored_part_uuids(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+        uuids: &[[u8; 16]],
+    ) -> Result<()> {
         self.send_ignored_part_uuids(uuids)?;
-        let pkt = self.build_query_packet_with_params(query, params);
+        let pkt = self.build_query_packet_with_params_and_settings(query, params, settings);
         self.write_packet(&pkt)?;
         self.stream.flush()?;
         self.drain_response()?;
@@ -384,14 +638,30 @@ impl SyncClient {
     ///
     /// Uses streaming reads from a `BufReader`-wrapped socket to minimise
     /// syscall overhead.  Reads packet by packet until EndOfStream (type 5).
+    ///
+    /// The accumulated blocks are budgeted by
+    /// [`ClientConfig::max_response_size`]: the summed decoded payload bytes
+    /// of the retained blocks (see [`Block::payload_bytes`]) must stay within
+    /// the limit, else the query fails with
+    /// [`Error::ResponseTooLarge`]. Streaming alternatives
+    /// ([`start_stream`](Self::start_stream),
+    /// [`query_with_block_view`](Self::query_with_block_view)) are not
+    /// budgeted.
+    ///
+    /// [`Block::payload_bytes`]: crate::sync::protocol::block::Block::payload_bytes
     pub fn query(&mut self, query: &str) -> Result<Vec<Block>> {
         self.query_with_params(query, &[])
     }
 
     /// Execute a SELECT and decode all rows into owned values.
+    ///
+    /// The blocks are subject to the `max_response_size` budget (see
+    /// [`SyncClient::query`]); the total row count is summed with checked
+    /// arithmetic — an overflow errors instead of panicking under
+    /// overflow-checks.
     pub fn query_all<T: crate::sync::row::Row>(&mut self, query: &str) -> Result<Vec<T>> {
         let blocks = self.query(query)?;
-        let total_rows = blocks.iter().map(Block::row_count).sum();
+        let total_rows = total_row_count(&blocks)?;
         let mut rows = Vec::with_capacity(total_rows);
         for block in &blocks {
             rows.extend(crate::sync::row::read_all::<T>(block)?);
@@ -452,6 +722,7 @@ impl SyncClient {
         self.stream.flush()?;
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
@@ -461,6 +732,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         } else {
             let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
@@ -470,6 +742,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         }
     }
@@ -490,6 +763,7 @@ impl SyncClient {
         self.stream.flush()?;
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
@@ -498,6 +772,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         } else {
             let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
@@ -506,6 +781,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
         }
     }
@@ -528,64 +804,160 @@ impl SyncClient {
     pub fn query_with_params_and_ignored_part_uuids(
         &mut self, query: &str, params: &[QueryParameter], uuids: &[[u8; 16]],
     ) -> Result<Vec<Block>> {
+        self.query_with_params_settings_and_ignored_part_uuids(
+            query,
+            params,
+            &HashMap::new(),
+            uuids,
+        )
+    }
+
+    /// Execute a SELECT with a per-query settings overlay.
+    ///
+    /// The overlay is merged into this query's packet only; the connection's
+    /// session settings (and every later query) are untouched. An empty
+    /// overlay is identical to [`query`](Self::query).
+    pub fn query_with_settings(
+        &mut self, query: &str, settings: &HashMap<String, String>,
+    ) -> Result<Vec<Block>> {
+        self.query_with_params_and_settings(query, &[], settings)
+    }
+
+    /// Execute a SELECT with parameters and a per-query settings overlay.
+    pub fn query_with_params_and_settings(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+    ) -> Result<Vec<Block>> {
+        self.query_with_params_settings_and_ignored_part_uuids(query, params, settings, &[])
+    }
+
+    /// Execute a SELECT with parameters, a per-query settings overlay, and
+    /// ignored-part UUIDs.
+    pub fn query_with_params_settings_and_ignored_part_uuids(
+        &mut self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+        uuids: &[[u8; 16]],
+    ) -> Result<Vec<Block>> {
         self.send_ignored_part_uuids(uuids)?;
-        let pkt = self.build_query_packet_with_params(query, params);
+        let pkt = self.build_query_packet_with_params_and_settings(query, params, settings);
         self.write_packet(&pkt)?;
         self.stream.flush()?;
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         let mut blocks = Vec::with_capacity(8);
-        if self.server_info.use_chunked_recv {
-            let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
-            let mut reader = ChunkedReader::new(raw);
+        let mut budget = crate::limits::ResponseBudget::new(self.config.max_response_size);
+        // One reader across the read AND any recovery drain: dropping a
+        // buffered reader mid-response loses up to 64 KiB of read-ahead, so a
+        // freshly-built recovery reader would drain a misaligned stream and
+        // fail non-deterministically. The recovery below therefore runs
+        // through THIS instance (Cancel is written through the reader's own
+        // Write impl, which delegates to the transport) so the buffered
+        // continuation of the half-read response is never lost.
+        let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
+        let read = if self.server_info.use_chunked_recv {
+            let mut chunked = ChunkedReader::new(&mut reader);
             read_response_blocks(
-                &mut reader,
+                &mut chunked,
                 &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
-            )?;
+                compressed,
+                &mut budget,
+            )
         } else {
-            let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             read_response_blocks(
                 &mut reader,
                 &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
-            )?;
+                compressed,
+                &mut budget,
+            )
+        };
+        match read {
+            Ok(()) => Ok(blocks),
+            Err(e) => {
+                if !matches!(e, Error::ResponseTooLarge { .. }) {
+                    return Err(e);
+                }
+                // Budget breach: the response is half-read. Recover through
+                // the SAME reader — Cancel then a bounded discard to
+                // EndOfStream — so this client stays usable instead of
+                // poisoning the next query. On a failed recovery the socket
+                // is shut down so a misaligned stream can never be reused.
+                let drained = (|| -> Result<()> {
+                    crate::sync::chunked::write_cancel_packet(
+                        &mut reader,
+                        self.server_info.use_chunked_send,
+                    )?;
+                    let drain_deadline = std::time::Instant::now()
+                        + self.config.query_timeout.min(Duration::from_secs(5));
+                    if self.server_info.use_chunked_recv {
+                        let mut chunked = ChunkedReader::new(&mut reader);
+                        read_response_row_count(
+                            &mut chunked,
+                            drain_deadline,
+                            rev,
+                            self.server_info.use_chunked_send,
+                            compressed,
+                        )
+                        .map(|_| ())
+                    } else {
+                        read_response_row_count(
+                            &mut reader,
+                            drain_deadline,
+                            rev,
+                            self.server_info.use_chunked_send,
+                            compressed,
+                        )
+                        .map(|_| ())
+                    }
+                })();
+                drop(reader);
+                if drained.is_err() {
+                    let _ = self.stream.raw_tcp().shutdown(std::net::Shutdown::Both);
+                }
+                Err(e)
+            },
         }
-        Ok(blocks)
     }
 
+    /// Consume the response to EndOfStream, surfacing every failure.
+    ///
+    /// Server exceptions and protocol/parse errors are returned as `Err`; a
+    /// failed DDL/DML must never report success. After a server exception the
+    /// connection framing is intact and the client stays usable; after a
+    /// protocol error the stream position is unknown and the connection must
+    /// be dropped.
+    ///
+    /// Blocks are discarded as they arrive, not materialized: a DDL/DML
+    /// response is never buffered, so no response-size budget applies.
     pub fn drain_response(&mut self) -> Result<()> {
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
-        let mut blocks = Vec::new();
-        let res = if self.server_info.use_chunked_recv {
+        let compressed = self.config.compression.is_some();
+        if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
-            read_response_blocks(
+            read_response_row_count(
                 &mut reader,
-                &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
+            .map(|_| ())
         } else {
             let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
-            read_response_blocks(
+            read_response_row_count(
                 &mut reader,
-                &mut blocks,
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             )
-        };
-        match res {
-            Ok(_) => Ok(()),
-            Err(Error::Protocol(_)) => Ok(()), // swallow protocol errors in drain
-            Err(e) => Err(e),
+            .map(|_| ())
         }
     }
 
@@ -607,10 +979,62 @@ impl SyncClient {
     }
 
     /// Cancel the running query.
+    ///
+    /// **This method never cancels anything and always returns
+    /// [`Error::Config`].** A blocking
+    /// client holds its `&mut self` borrow for the whole query call, so by
+    /// the time `cancel()` is callable no blocking query of yours is running
+    /// — the only live-response case is a [`QueryStream`] from
+    /// [`SyncClient::start_stream`] left half-read, where this method's bare
+    /// `Cancel` write used to report success while the response stayed
+    /// undrained: the connection was left mid-response and the next query
+    /// desynchronized. Called with no response in flight, the stray packet
+    /// was injected into the server's input ahead of the next query. Either
+    /// way a `Cancel` write alone never produced a cancelled-and-clean
+    /// connection, so it now fails closed and touches no connection at all.
+    ///
+    /// To stop a query, use one of these instead:
+    /// - a response deadline —
+    ///   [`ClientConfig::with_query_timeout`](crate::sync::config::ClientConfig::with_query_timeout)
+    ///   (default 30 s) — every response read is deadline-checked and fails
+    ///   with [`Error::Timeout`] on expiry;
+    /// - keep reading a [`QueryStream`] to `EndOfStream` for a clean stop —
+    ///   dropping it alone only closes its duplicated socket (no `Cancel` is
+    ///   sent and the connection stays mid-response), so for an early
+    ///   abandon call [`QueryStream::shutdown_handle`] and
+    ///   [`TcpStream::shutdown`] the shared socket: the
+    ///   server aborts the query, a reader stuck in a blocking read is
+    ///   unblocked, and the client is closed — reconnect afterwards;
+    /// - [`SyncClient::socket_shutdown_handle`] is the same teardown from
+    ///   the client side.
+    #[deprecated(
+        since = "0.3.0",
+        note = "SyncClient::cancel cannot produce a cancelled-and-clean connection and always returns Error::Config; use ClientConfig::with_query_timeout, drain the QueryStream to EndOfStream, or shut the socket down via QueryStream::shutdown_handle / SyncClient::socket_shutdown_handle"
+    )]
     pub fn cancel(&mut self) -> Result<()> {
-        self.write_packet(&[3])?;
-        self.stream.flush()?;
-        Ok(())
+        Err(crate::sync::error::Error::Config(
+            concat!(
+                "SyncClient::cancel cannot cancel a query: a blocking client holds its ",
+                "borrow for the whole query, and a bare Cancel write leaves the ",
+                "response undrained, so no connection is touched. Use a response ",
+                "deadline (ClientConfig::with_query_timeout), drain the QueryStream ",
+                "to EndOfStream, or for an early abandon shut the socket down via ",
+                "QueryStream::shutdown_handle / SyncClient::socket_shutdown_handle ",
+                "(the server aborts the query; reconnect afterwards)"
+            )
+            .into(),
+        ))
+    }
+
+    /// Duplicate the underlying TCP socket for out-of-band teardown.
+    ///
+    /// The duplicate shares the same socket: [`TcpStream::shutdown`] on it
+    /// from any thread aborts in-flight blocking I/O on this client
+    /// deterministically (the peer sees the disconnect and stops the query).
+    /// The duplicate is read-only in spirit — callers must only use it to
+    /// shut the socket down, never for protocol traffic.
+    pub fn socket_shutdown_handle(&self) -> std::io::Result<TcpStream> {
+        self.stream.raw_tcp().try_clone()
     }
 
     // ── Raw stream access for INSERT ──
@@ -626,8 +1050,17 @@ impl SyncClient {
 
     // ── Packet building ──
 
+    /// Build the wire packet for a query.
+    ///
+    /// `settings` is a borrowed per-query overlay on top of the connection's
+    /// session settings. An empty overlay keeps the fast path: the cached
+    /// template bytes (which already contain the serialized session settings)
+    /// are extended verbatim. A non-empty overlay serializes the merged
+    /// settings block inline — neither `config.settings` nor the cached
+    /// template is mutated.
     fn build_query_packet_inner(
-        &self, query: &str, include_empty_block: bool, params: &[QueryParameter], buf: &mut Vec<u8>,
+        &self, query: &str, include_empty_block: bool, params: &[QueryParameter],
+        settings: &HashMap<String, String>, buf: &mut Vec<u8>,
     ) {
         let mut query_id_buf = [0u8; 22];
         let query_id_len = next_query_id(&mut query_id_buf);
@@ -639,7 +1072,19 @@ impl SyncClient {
         if let Some(client_info) = &self.query_template.client_info {
             crate::sync::client_info::write_client_info_from_template(buf, client_info, query_id);
         }
-        buf.extend_from_slice(&self.query_template.before_query);
+        if settings.is_empty() {
+            buf.extend_from_slice(&self.query_template.before_query);
+        } else {
+            crate::sync::query_packet::write_serialized_settings_overlay(
+                &self.config.settings,
+                settings,
+                self.server_info.negotiated_revision,
+                buf,
+            );
+            buf.extend_from_slice(
+                &self.query_template.before_query[self.query_template.settings_len..],
+            );
+        }
         wire::write_string_to_vec(buf, query);
         if params.is_empty() && include_empty_block {
             buf.extend_from_slice(&self.query_template.select_suffix);
@@ -663,7 +1108,7 @@ impl SyncClient {
     /// Includes a trailing empty Data block marker (required by CH 26.4+).
     pub fn build_query_packet(&self, query: &str) -> Vec<u8> {
         let mut buf = take_buf(self.query_template.select_capacity + query.len() + 80);
-        self.build_query_packet_inner(query, true, &[], &mut buf);
+        self.build_query_packet_inner(query, true, &[], &HashMap::new(), &mut buf);
         buf
     }
 
@@ -676,18 +1121,43 @@ impl SyncClient {
                 + query_parameters_capacity(params)
                 + 80,
         );
-        self.build_query_packet_inner(query, true, params, &mut buf);
+        self.build_query_packet_inner(query, true, params, &HashMap::new(), &mut buf);
+        buf
+    }
+
+    /// Build a SELECT query packet with a per-query settings overlay.
+    pub fn build_query_packet_with_settings(
+        &self, query: &str, settings: &HashMap<String, String>,
+    ) -> Vec<u8> {
+        self.build_query_packet_with_params_and_settings(query, &[], settings)
+    }
+
+    /// Build a SELECT query packet with parameters and a settings overlay.
+    pub fn build_query_packet_with_params_and_settings(
+        &self, query: &str, params: &[QueryParameter], settings: &HashMap<String, String>,
+    ) -> Vec<u8> {
+        let mut buf = take_buf(
+            self.query_template.select_capacity
+                + query.len()
+                + query_parameters_capacity(params)
+                + serialized_settings_capacity(&self.config.settings, settings)
+                + 80,
+        );
+        self.build_query_packet_inner(query, true, params, settings, &mut buf);
         buf
     }
 
     pub fn build_insert_query_packet(&self, query: &str) -> Vec<u8> {
         let mut buf = take_buf(self.query_template.insert_capacity + query.len() + 80);
-        self.build_query_packet_inner(query, false, &[], &mut buf);
+        self.build_query_packet_inner(query, false, &[], &HashMap::new(), &mut buf);
         buf
     }
 
     fn write_empty_data_block(&self, buf: &mut Vec<u8>) {
-        write_empty_data_block_to(buf);
+        // The trailing empty Data block must match the query packet's
+        // compression flag: a plain block after a compressed query wedges the
+        // server (it parses the block header as a compression frame).
+        let _ = write_empty_data_block_for(buf, self.config.compression);
     }
 
     // ── INSERT protocol ──
@@ -825,7 +1295,8 @@ impl SyncClient {
             pos: 0,
             stream: cloned,
             read_buffer_size: self.config.read_buffer_size,
-            compression: self.config.compression,
+            scratch: Vec::new(),
+            compressed: self.config.compression.is_some(),
             negotiated_revision: self.server_info.negotiated_revision,
             chunked_recv: self.server_info.use_chunked_recv,
             chunked_send: self.server_info.use_chunked_send,
@@ -838,6 +1309,7 @@ impl SyncClient {
     fn wait_for_insert_table_structure(&mut self) -> Result<()> {
         let deadline = std::time::Instant::now() + self.config.query_timeout;
         let rev = self.server_info.negotiated_revision;
+        let compressed = self.config.compression.is_some();
         if self.server_info.use_chunked_recv {
             let raw = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
             let mut reader = ChunkedReader::new(raw);
@@ -846,6 +1318,7 @@ impl SyncClient {
                 deadline,
                 rev,
                 self.server_info.use_chunked_send,
+                compressed,
             );
         }
         let mut reader = TransportReader::new(&mut self.stream, self.config.read_buffer_size);
@@ -854,6 +1327,7 @@ impl SyncClient {
             deadline,
             rev,
             self.server_info.use_chunked_send,
+            compressed,
         )
     }
 
@@ -872,7 +1346,7 @@ impl SyncClient {
 }
 
 fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
-    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool,
+    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool, compressed: bool,
 ) -> Result<()> {
     loop {
         if std::time::Instant::now() > deadline {
@@ -882,7 +1356,7 @@ fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
         }
         match wire::read_varint(reader)? {
             1 => {
-                let _ = crate::sync::protocol::response::read_block(reader)?;
+                let _ = read_block_from(reader, compressed)?;
                 return Ok(());
             },
             2 => {
@@ -897,17 +1371,18 @@ fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
             },
             6 => skip_profile_info_packet(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::read_block(reader)?;
+                let _ = read_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::read_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                read_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -925,11 +1400,124 @@ fn wait_for_insert_table_structure_from_reader<R: Read + Write>(
 // Response-parsing free functions (generic over R: Read for BufReader support)
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Sum row counts across blocks with checked arithmetic. An honest server
+/// streaming enough blocks can pass `usize` capacity; `query_all` must error,
+/// not panic under overflow-checks.
+fn total_row_count(blocks: &[Block]) -> Result<usize> {
+    let mut total = 0usize;
+    for block in blocks {
+        total = total.checked_add(block.row_count()).ok_or_else(|| {
+            Error::Protocol("total row count overflow while materializing rows".into())
+        })?;
+    }
+    Ok(total)
+}
+
+// ── Compressed response reads ─────────────────────────────────────────────
+//
+// When the query packet's compression flag is set the server compresses
+// every Data/Totals/Extremes/ProfileEvents packet body (TableColumns too),
+// as a SEQUENCE of frames per packet (~1 MiB CompressedWriteBuffer flushes
+// mid-packet). Each helper below wraps `reader` in a fresh
+// DecompressingReader for exactly one packet body; the block parsers consume
+// exactly the block's bytes, so the wrapper never over-reads into the next
+// packet. Log packets (type 10) are protocol-defined UNCOMPRESSED and stay
+// on the raw reader.
+
+/// Construct the per-packet decompressing reader over `reader`.
+fn decompressing<R: std::io::Read>(reader: &mut R) -> Result<DecompressingReader<&mut R>> {
+    DecompressingReader::new(reader).map_err(|err| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            err.to_string(),
+        ))
+    })
+}
+
+/// Read one Data-family packet: the packet-type varint is already consumed.
+/// The table/tag string is NOT compressed — the server compresses only the
+/// block body that follows it (mirrors the async reader, which reads the
+/// table name from the raw stream before wrapping).
+fn read_block_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<Block> {
+    let _table = wire::read_string(reader)?;
+    if compressed {
+        crate::sync::protocol::response::read_block_body(&mut decompressing(reader)?)
+    } else {
+        crate::sync::protocol::response::read_block_body(reader)
+    }
+}
+fn discard_block_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<usize> {
+    let _table = wire::read_string(reader)?;
+    if compressed {
+        crate::sync::protocol::response::discard_block_body(&mut decompressing(reader)?)
+    } else {
+        crate::sync::protocol::response::discard_block_body(reader)
+    }
+}
+
+fn discard_block_body_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<usize> {
+    if compressed {
+        crate::sync::protocol::response::discard_block_body(&mut decompressing(reader)?)
+    } else {
+        crate::sync::protocol::response::discard_block_body(reader)
+    }
+}
+
+/// Read one tagged (ProfileEvents-style) packet: plain tag string, then the
+/// compressed block body.
+fn read_tagged_block_body_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<()> {
+    let _tag = wire::read_string(reader)?;
+    if compressed {
+        let _ = crate::sync::protocol::response::read_block_body(&mut decompressing(reader)?)?;
+    } else {
+        let _ = crate::sync::protocol::response::read_block_body(reader)?;
+    }
+    Ok(())
+}
+
+/// Read a compressed TableColumns packet: unlike Data packets, the whole
+/// payload after the packet-type varint is compressed (mirrors the async
+/// `read_table_columns_packet`).
+fn read_table_columns_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<()> {
+    if compressed {
+        let mut reader = decompressing(reader)?;
+        let _table = wire::read_string(&mut reader)?;
+        let _columns = wire::read_string(&mut reader)?;
+    } else {
+        let _table = wire::read_string(reader)?;
+        let _columns = wire::read_string(reader)?;
+    }
+    Ok(())
+}
+
+fn discard_tagged_block_body_from<R: std::io::Read + std::io::Write>(
+    reader: &mut R, compressed: bool,
+) -> Result<()> {
+    let _tag = wire::read_string(reader)?;
+    discard_block_body_from(reader, compressed).map(|_| ())
+}
+
 /// Read response packets until EndOfStream (type 5).
 /// Pushes Data blocks into `blocks`.
+///
+/// Every accumulated block's decoded payload bytes are charged against
+/// `budget` (sized from `ClientConfig::max_response_size`); a breach aborts
+/// at a block boundary with [`Error::ResponseTooLarge`]. The caller must then
+/// recover the connection (Cancel plus a bounded discard through the same
+/// buffered reader inside the query method).
 fn read_response_blocks<R: std::io::Read + std::io::Write>(
     reader: &mut R, blocks: &mut Vec<Block>, deadline: std::time::Instant, rev: u64,
-    chunked_send: bool,
+    chunked_send: bool, compressed: bool, budget: &mut crate::limits::ResponseBudget,
 ) -> Result<()> {
     loop {
         if std::time::Instant::now() > deadline {
@@ -942,10 +1530,12 @@ fn read_response_blocks<R: std::io::Read + std::io::Write>(
             },
             Err(e) => return Err(e),
         };
-
         match packet_type {
             1 => {
-                let block = crate::sync::protocol::response::read_block(reader)?;
+                let block = read_block_from(reader, compressed)?;
+                budget
+                    .charge(block.payload_bytes())
+                    .map_err(|_| Error::response_budget_exceeded(budget))?;
                 blocks.push(block);
             },
             2 => return Err(read_exception_packet(reader)),
@@ -954,17 +1544,18 @@ fn read_response_blocks<R: std::io::Read + std::io::Write>(
             5 => return Ok(()),
             6 => skip_profile_info_packet_for_revision(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::read_block(reader)?;
+                let _ = read_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::read_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                read_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -978,6 +1569,7 @@ fn read_response_blocks<R: std::io::Read + std::io::Write>(
 
 fn read_response_block_views<R, F>(
     reader: &mut R, visitor: &mut F, deadline: std::time::Instant, rev: u64, chunked_send: bool,
+    compressed: bool,
 ) -> Result<()>
 where
     R: std::io::Read + std::io::Write,
@@ -996,24 +1588,35 @@ where
         };
 
         match packet_type {
-            1 => crate::sync::protocol::response::read_block_view(reader, visitor)?,
+            1 => {
+                if compressed {
+                    let _table = wire::read_string(reader)?;
+                    crate::sync::protocol::response::read_block_body_view(
+                        &mut decompressing(reader)?,
+                        visitor,
+                    )?;
+                } else {
+                    crate::sync::protocol::response::read_block_view(reader, visitor)?;
+                }
+            },
             2 => return Err(read_exception_packet(reader)),
             3 => skip_progress_packet_for_revision(reader, rev)?,
             4 => {},
             5 => return Ok(()),
             6 => skip_profile_info_packet_for_revision(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::discard_block(reader)?;
+                let _ = discard_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::discard_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                discard_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -1026,7 +1629,7 @@ where
 }
 
 fn read_response_row_count<R: std::io::Read + std::io::Write>(
-    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool,
+    reader: &mut R, deadline: std::time::Instant, rev: u64, chunked_send: bool, compressed: bool,
 ) -> Result<usize> {
     let mut rows = 0usize;
     loop {
@@ -1044,7 +1647,7 @@ fn read_response_row_count<R: std::io::Read + std::io::Write>(
         match packet_type {
             1 => {
                 rows = rows
-                    .checked_add(crate::sync::protocol::response::discard_block(reader)?)
+                    .checked_add(discard_block_from(reader, compressed)?)
                     .ok_or_else(|| Error::Protocol("row count overflow".into()))?;
             },
             2 => return Err(read_exception_packet(reader)),
@@ -1053,17 +1656,18 @@ fn read_response_row_count<R: std::io::Read + std::io::Write>(
             5 => return Ok(rows),
             6 => skip_profile_info_packet_for_revision(reader, rev)?,
             7 | 8 => {
-                let _ = crate::sync::protocol::response::discard_block(reader)?;
+                let _ = discard_block_from(reader, compressed)?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are protocol-defined uncompressed.
                 let _tag = wire::read_string(reader)?;
                 let _ = crate::sync::protocol::response::discard_block_body(reader)?;
             },
-            12 => skip_part_uuids_packet(reader)?,
-            11 => {
-                let _table = wire::read_string(reader)?;
-                let _columns = wire::read_string(reader)?;
+            14 => {
+                discard_tagged_block_body_from(reader, compressed)?;
             },
+            12 => skip_part_uuids_packet(reader)?,
+            11 => read_table_columns_from(reader, compressed)?,
             17 => {
                 let _timezone = wire::read_string(reader)?;
             },
@@ -1222,8 +1826,15 @@ fn checked_len(count: usize, elem_size: usize, what: &str) -> Result<usize> {
 }
 
 #[cold]
+/// Read an Exception packet (type 2) body into a structured error.
+///
+/// A fully parsed chain yields [`Error::ServerError`] with the root
+/// exception's code/name and the whole nested chain in `message`. Any read or
+/// parse failure inside the packet is returned as-is so malformed protocol
+/// stays distinguishable from a terminal server exception.
 fn read_exception_packet<R: std::io::Read>(reader: &mut R) -> Error {
-    let mut parts = Vec::new();
+    let mut messages = Vec::new();
+    let mut root: Option<(i32, String)> = None;
     loop {
         let code = match wire::read_bytes(reader, 4) {
             Ok(bytes) => {
@@ -1233,17 +1844,39 @@ fn read_exception_packet<R: std::io::Read>(reader: &mut R) -> Error {
             },
             Err(e) => return e,
         };
-        let name = wire::read_string(reader).unwrap_or_else(|_| "unknown".to_string());
-        let msg = wire::read_string(reader).unwrap_or_default();
-        let _stack = wire::read_string(reader);
-        parts.push(format!("{name} (code {code}): {msg}"));
+        // Lossy decode: a server exception must surface even if its message
+        // contains bytes that are not valid UTF-8.
+        let name = match read_string_lossy(reader) {
+            Ok(name) => name,
+            Err(e) => return e,
+        };
+        let msg = match read_string_lossy(reader) {
+            Ok(msg) => msg,
+            Err(e) => return e,
+        };
+        if let Err(e) = wire::read_string_bytes(reader) {
+            return e; // stack trace still frames the packet; it must parse
+        }
+        messages.push(format!("{name} (code {code}): {msg}"));
+        if root.is_none() {
+            root = Some((code, name));
+        }
         match wire::read_bytes(reader, 1) {
             Ok(flag) if flag.first().copied().unwrap_or(0) != 0 => {},
             Ok(_) => break,
             Err(e) => return e,
         }
     }
-    Error::Protocol(format!("server error: {}", parts.join(" | nested: ")))
+    let (code, name) = root.unwrap_or((0, "unknown".to_string()));
+    Error::ServerError {
+        code,
+        name,
+        message: messages.join(" | nested: "),
+    }
+}
+
+fn read_string_lossy<R: std::io::Read>(reader: &mut R) -> Result<String> {
+    wire::read_string_bytes(reader).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn skip_progress_packet<R: std::io::Read>(reader: &mut R, rev: u64) -> Result<()> {
@@ -1478,13 +2111,116 @@ fn write_all_vectored<W: Write>(writer: &mut W, slices: &mut [std::io::IoSlice<'
 // QueryStream — streaming query result parser
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Incremental byte source for one compressed packet body: serves the
+/// stream's already-buffered (de-chunked) bytes first, then refills from the
+/// transport — reading chunk framing when the negotiated transport is
+/// chunked, because chunk framing wraps the compressed bytes.
+///
+/// Lives only for the duration of one packet's parse; any bytes it reads
+/// beyond the caller's request stay in the stream's own buffer.
+struct StreamBytes<'a> {
+    buffer: &'a mut Vec<u8>,
+    pos: &'a mut usize,
+    scratch: &'a mut Vec<u8>,
+    stream: &'a mut crate::sync::transport::Transport,
+    read_buffer_size: usize,
+    chunked_recv: bool,
+}
+
+impl<'a> StreamBytes<'a> {
+    fn borrow(stream: &'a mut QueryStream) -> Self {
+        Self {
+            buffer: &mut stream.buffer,
+            pos: &mut stream.pos,
+            scratch: &mut stream.scratch,
+            stream: &mut stream.stream,
+            read_buffer_size: stream.read_buffer_size,
+            chunked_recv: stream.chunked_recv,
+        }
+    }
+
+    /// Pull the next chunked frame (length-prefixed) into the buffer.
+    fn refill_chunked(&mut self) -> std::io::Result<usize> {
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 {
+            // Zero-length chunk: keep pulling for the next real chunk.
+            return Ok(0);
+        }
+        if len > crate::limits::MAX_CHUNK_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "chunk length {len} exceeds maximum {}",
+                    crate::limits::MAX_CHUNK_LEN
+                ),
+            ));
+        }
+        let start = self.buffer.len();
+        self.buffer.resize(start + len, 0);
+        self.stream.read_exact(&mut self.buffer[start..])?;
+        Ok(len)
+    }
+
+    /// Pull more raw (or de-chunked) bytes into the buffer. Returns how many
+    /// new bytes became available.
+    fn refill(&mut self) -> std::io::Result<usize> {
+        if self.chunked_recv {
+            loop {
+                let n = self.refill_chunked()?;
+                if n > 0 {
+                    return Ok(n);
+                }
+            }
+        }
+        if self.scratch.len() != self.read_buffer_size {
+            self.scratch.resize(self.read_buffer_size, 0);
+        }
+        let mut buf = std::mem::take(&mut *self.scratch);
+        let result = self.stream.read(&mut buf);
+        let n = match result {
+            Ok(n) => n,
+            Err(err) => {
+                *self.scratch = buf;
+                return Err(err);
+            },
+        };
+        self.buffer.extend_from_slice(&buf[..n]);
+        *self.scratch = buf;
+        Ok(n)
+    }
+}
+
+impl Read for StreamBytes<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if *self.pos >= self.buffer.len() {
+            let n = self.refill()?;
+            if n == 0 {
+                return Ok(0);
+            }
+        }
+        let n = out.len().min(self.buffer.len() - *self.pos);
+        out[..n].copy_from_slice(&self.buffer[*self.pos..*self.pos + n]);
+        *self.pos += n;
+        Ok(n)
+    }
+}
+
 pub struct QueryStream {
     buffer: Vec<u8>,
     pos: usize,
     stream: crate::sync::transport::Transport,
     read_buffer_size: usize,
-    #[allow(dead_code)]
-    compression: Option<crate::sync::compression::CompressionMethod>,
+    /// Reusable fill scratch: avoids a fresh zeroed allocation per fill.
+    scratch: Vec<u8>,
+    /// True when the server compresses this response's Data-family packet
+    /// bodies (Data/Totals/Extremes/ProfileEvents/TableColumns) as
+    /// multi-frame sequences — see `DecompressingReader`.
+    compressed: bool,
     negotiated_revision: u64,
     chunked_recv: bool,
     chunked_send: bool,
@@ -1492,6 +2228,16 @@ pub struct QueryStream {
 }
 
 impl QueryStream {
+    /// Duplicate the underlying TCP socket for out-of-band teardown.
+    ///
+    /// The stream's transport is a duplicate of the owning client's socket,
+    /// so shutting this handle down kills the shared connection and unblocks
+    /// a reader stuck in a blocking read. See
+    /// [`SyncClient::socket_shutdown_handle`].
+    pub fn shutdown_handle(&self) -> std::io::Result<std::net::TcpStream> {
+        self.stream.raw_tcp().try_clone()
+    }
+
     pub fn read_next_block(&mut self) -> Result<Option<Block>> {
         if self.done {
             return Ok(None);
@@ -1509,43 +2255,55 @@ impl QueryStream {
                     Err(e) => return Err(e),
                 };
                 match packet_type {
-                    1 => match parse_block(&self.buffer, &mut self.pos) {
-                        Ok(block) => return Ok(Some(block)),
-                        Err(Error::Protocol(_)) => {
-                            self.pos = saved_pos;
-                            self.fill_buffer()?;
-                            continue;
-                        },
-                        Err(e) => return Err(e),
-                    },
-                    5 => {
-                        self.done = true;
-                        return Ok(None);
-                    },
-                    2 => {
-                        let code = match wire::parse_i32(&self.buffer, &mut self.pos) {
-                            Ok(v) => v,
+                    1 => {
+                        if self.compressed {
+                            let block = self.read_compressed_block()?;
+                            self.compact();
+                            return Ok(Some(block));
+                        }
+                        match parse_block(&self.buffer, &mut self.pos) {
+                            Ok(block) => {
+                                // Return the block with the consumed prefix
+                                // already dropped (long streams must not
+                                // retain every parsed byte until drop).
+                                self.compact();
+                                return Ok(Some(block));
+                            },
                             Err(Error::Protocol(_)) => {
                                 self.pos = saved_pos;
                                 self.fill_buffer()?;
                                 continue;
                             },
                             Err(e) => return Err(e),
-                        };
-                        let name = wire::parse_string(&self.buffer, &mut self.pos)
-                            .unwrap_or("unknown")
-                            .to_owned();
-                        let msg = wire::parse_string(&self.buffer, &mut self.pos)
-                            .unwrap_or("")
-                            .to_owned();
-                        let _ = wire::parse_string(&self.buffer, &mut self.pos);
-                        if self.pos < self.buffer.len() {
-                            self.pos += 1;
                         }
+                    },
+                    5 => {
                         self.done = true;
-                        return Err(Error::Protocol(format!(
-                            "server error (code={code}, name={name}): {msg}"
-                        )));
+                        self.compact();
+                        return Ok(None);
+                    },
+                    2 => match parse_exception_chain(&self.buffer, &mut self.pos) {
+                        Ok((code, name, message)) => {
+                            self.done = true;
+                            return Err(Error::ServerError {
+                                code,
+                                name,
+                                message,
+                            });
+                        },
+                        Err(Error::Protocol(_)) => {
+                            self.pos = saved_pos;
+                            let buffered = self.buffer.len();
+                            self.fill_buffer()?;
+                            if self.buffer.len() == buffered {
+                                self.done = true;
+                                return Err(Error::Protocol(
+                                    "truncated exception packet in query stream".into(),
+                                ));
+                            }
+                            continue;
+                        },
+                        Err(e) => return Err(e),
                     },
                     3 => {
                         let fields = 3
@@ -1626,16 +2384,43 @@ impl QueryStream {
                             }
                         }
                     },
-                    7 | 8 => match parse_block(&self.buffer, &mut self.pos) {
-                        Ok(_) => {},
-                        Err(Error::Protocol(_)) => {
+                    7 | 8 => {
+                        if self.compressed {
+                            self.read_compressed_block()?;
+                            continue;
+                        }
+                        match parse_block(&self.buffer, &mut self.pos) {
+                            Ok(_) => {},
+                            Err(Error::Protocol(_)) => {
+                                self.pos = saved_pos;
+                                self.fill_buffer()?;
+                                continue;
+                            },
+                            Err(e) => return Err(e),
+                        }
+                    },
+                    10 => {
+                        // Log blocks are protocol-defined uncompressed.
+                        if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
                             self.pos = saved_pos;
                             self.fill_buffer()?;
                             continue;
-                        },
-                        Err(e) => return Err(e),
+                        }
+                        match parse_block_body(&self.buffer, &mut self.pos) {
+                            Ok(_) => {},
+                            Err(Error::Protocol(_)) => {
+                                self.pos = saved_pos;
+                                self.fill_buffer()?;
+                                continue;
+                            },
+                            Err(e) => return Err(e),
+                        }
                     },
-                    10 | 14 => {
+                    14 => {
+                        if self.compressed {
+                            self.read_compressed_tagged_block()?;
+                            continue;
+                        }
                         if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
                             self.pos = saved_pos;
                             self.fill_buffer()?;
@@ -1652,6 +2437,10 @@ impl QueryStream {
                         }
                     },
                     11 => {
+                        if self.compressed {
+                            self.read_compressed_table_columns()?;
+                            continue;
+                        }
                         if wire::parse_string(&self.buffer, &mut self.pos).is_err()
                             || wire::parse_string(&self.buffer, &mut self.pos).is_err()
                         {
@@ -1705,10 +2494,74 @@ impl QueryStream {
                         )));
                     },
                 }
+                // A full packet was consumed from the front of the buffer
+                // (or a fill was queued by rewinding): drop the consumed
+                // prefix so long streams do not retain every byte they have
+                // already parsed.
+                self.compact();
             } else {
                 self.fill_buffer()?;
             }
         }
+    }
+
+    /// Read one Data-packet body through the decompressing wrapper.
+    ///
+    /// The packet type varint was already consumed from the buffer. The
+    /// wrapper pulls frames from a [`StreamBytes`] adapter (buffered bytes
+    /// first, then the transport — de-chunked when the negotiated transport
+    /// is chunked, since chunk framing wraps the compressed bytes), so the
+    /// block parser consumes exactly this packet's frame sequence and the
+    /// next packet's bytes stay in `self.buffer`/the transport.
+    fn read_compressed_block(&mut self) -> Result<Block> {
+        // The table name precedes the compressed body and stays plain.
+        if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
+            self.fill_buffer()?;
+            wire::parse_string(&self.buffer, &mut self.pos)?;
+        }
+        let mut bytes = StreamBytes::borrow(self);
+        let mut reader = decompressing(&mut bytes)?;
+        let block = crate::sync::protocol::response::read_block_body(&mut reader)?;
+        let pending = reader.into_pending();
+        if !pending.is_empty() {
+            // Non-conforming server packed extra bytes into this packet's
+            // frame sequence: keep them in front of the stream buffer.
+            let rest = self.buffer.split_off(self.pos);
+            self.pos = 0;
+            self.buffer = pending;
+            self.buffer.extend(rest);
+        }
+        Ok(block)
+    }
+
+    /// Read one tagged (ProfileEvents-style) packet body: compressed tag
+    /// string plus block body, both through the wrapper.
+    fn read_compressed_tagged_block(&mut self) -> Result<()> {
+        // The tag string precedes the compressed body and stays plain.
+        if wire::parse_string(&self.buffer, &mut self.pos).is_err() {
+            self.fill_buffer()?;
+            wire::parse_string(&self.buffer, &mut self.pos)?;
+        }
+        let mut bytes = StreamBytes::borrow(self);
+        let mut reader = decompressing(&mut bytes)?;
+        let _block = crate::sync::protocol::response::read_block_body(&mut reader)?;
+        let pending = reader.into_pending();
+        if !pending.is_empty() {
+            let rest = self.buffer.split_off(self.pos);
+            self.pos = 0;
+            self.buffer = pending;
+            self.buffer.extend(rest);
+        }
+        Ok(())
+    }
+
+    /// Read a compressed TableColumns packet (two strings).
+    fn read_compressed_table_columns(&mut self) -> Result<()> {
+        let mut bytes = StreamBytes::borrow(self);
+        let mut reader = decompressing(&mut bytes)?;
+        let _table = wire::read_string(&mut reader)?;
+        let _columns = wire::read_string(&mut reader)?;
+        Ok(())
     }
 
     fn fill_buffer(&mut self) -> Result<()> {
@@ -1720,6 +2573,14 @@ impl QueryStream {
                         let len = u32::from_le_bytes(len_buf) as usize;
                         if len == 0 {
                             continue;
+                        }
+                        // The chunk length is server-controlled: reject an
+                        // oversized claim before the eager zeroed resize.
+                        if len > crate::limits::MAX_CHUNK_LEN {
+                            return Err(Error::Protocol(format!(
+                                "chunk length {len} exceeds maximum {}",
+                                crate::limits::MAX_CHUNK_LEN
+                            )));
                         }
                         let start = self.buffer.len();
                         self.buffer.resize(start + len, 0);
@@ -1739,8 +2600,13 @@ impl QueryStream {
                 }
             }
         }
-        let mut buf = vec![0u8; self.read_buffer_size];
-        match self.stream.read(&mut buf) {
+        // Reuse one scratch buffer across fills instead of allocating (and
+        // zero-filling) a fresh read_buffer_size Vec every time.
+        if self.scratch.len() != self.read_buffer_size {
+            self.scratch.resize(self.read_buffer_size, 0);
+        }
+        let mut buf = std::mem::take(&mut self.scratch);
+        let result = match self.stream.read(&mut buf) {
             Ok(0) => {
                 self.done = true;
                 Ok(())
@@ -1755,6 +2621,24 @@ impl QueryStream {
             },
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e.into()),
+        };
+        self.scratch = buf;
+        result
+    }
+
+    /// Drop the consumed prefix of the receive buffer so long streams do not
+    /// retain the whole response: `buffer` is append-only otherwise, so a
+    /// 10 GiB export would hold 10 GiB of already-parsed bytes until the
+    /// stream is dropped.
+    fn compact(&mut self) {
+        if self.pos > 0 && self.pos == self.buffer.len() {
+            self.buffer.clear();
+            self.pos = 0;
+        } else if self.pos > 0 {
+            self.buffer.copy_within(self.pos.., 0);
+            let new_len = self.buffer.len() - self.pos;
+            self.buffer.truncate(new_len);
+            self.pos = 0;
         }
     }
 }
@@ -1762,6 +2646,453 @@ impl QueryStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        wire::write_varint(buf, s.len() as u64).expect("test operation failed");
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// Body of an Exception packet (after the type varint) for one exception.
+    fn exception_body(code: i32, name: &str, msg: &str, nested: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&code.to_le_bytes());
+        put_string(&mut buf, name);
+        put_string(&mut buf, msg);
+        put_string(&mut buf, ""); // stack trace
+        buf.push(u8::from(nested)); // has_nested
+        buf
+    }
+
+    #[test]
+    fn read_exception_packet_parses_chain_into_server_error() {
+        let mut body = exception_body(60, "DB::Exception", "unknown function xyz", true);
+        body.extend(exception_body(48, "DB::Exception", "inner cause", false));
+        let err = read_exception_packet(&mut std::io::Cursor::new(body));
+        match &err {
+            Error::ServerError {
+                code,
+                name,
+                message,
+            } => {
+                assert_eq!(*code, 60, "root code must be reported");
+                assert_eq!(name, "DB::Exception");
+                assert!(
+                    message.contains("unknown function xyz") && message.contains("inner cause"),
+                    "message must carry the whole chain: {message}"
+                );
+            },
+            _other => unreachable!("expected ServerError, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn read_exception_packet_distinguishes_malformed_body() {
+        let mut body = exception_body(60, "DB::Exception", "unknown function xyz", false);
+        body.truncate(body.len() - 2); // cut the has_nested flag
+        let err = read_exception_packet(&mut std::io::Cursor::new(body));
+        assert!(
+            matches!(err, Error::Protocol(_) | Error::Io(_)),
+            "truncated exception body must not become ServerError, got {err:?}"
+        );
+    }
+
+    fn query_stream_chunked() -> (QueryStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test socket");
+        let (server, _) = listener.accept().expect("accept test socket");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .expect("set test timeout");
+        (
+            QueryStream {
+                buffer: Vec::new(),
+                pos: 0,
+                stream: crate::sync::transport::Transport::new_plain(client),
+                read_buffer_size: 8192,
+                scratch: Vec::new(),
+                compressed: false,
+                negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
+                chunked_recv: true,
+                chunked_send: false,
+                done: false,
+            },
+            server,
+        )
+    }
+
+    /// A hostile chunked-transport chunk header must be rejected before the
+    /// eager zeroed buffer resize (previously up to 4 GiB).
+    #[test]
+    fn query_stream_chunked_refill_rejects_oversized_chunk() {
+        let (mut stream, mut server) = query_stream_chunked();
+        server
+            .write_all(&u32::MAX.to_le_bytes())
+            .expect("send hostile chunk header");
+
+        let err = stream
+            .read_next_block()
+            .err()
+            .expect("oversized chunk must be rejected (Block lacks Debug; expect_err needs it)");
+        assert!(
+            matches!(&err, Error::Protocol(msg) if msg.contains("chunk length")),
+            "expected chunk length Protocol error, got: {err:?}"
+        );
+    }
+
+    fn query_stream_with_buffer(buffer: Vec<u8>) -> (QueryStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test socket");
+        let (server, _) = listener.accept().expect("accept test socket");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .expect("set test timeout");
+        (
+            QueryStream {
+                buffer,
+                pos: 0,
+                stream: crate::sync::transport::Transport::new_plain(client),
+                read_buffer_size: 8192,
+                scratch: Vec::new(),
+                compressed: false,
+                negotiated_revision: revision::DEFAULT_PROTOCOL_REVISION,
+                chunked_recv: false,
+                chunked_send: false,
+                done: false,
+            },
+            server,
+        )
+    }
+
+    /// Consumed packets must not stay resident: after reading a block, the
+    /// buffer must not retain the already-parsed prefix (the audit's
+    /// "10 GiB export holds 10 GiB" bug class).
+    #[test]
+    fn query_stream_compacts_consumed_prefix() {
+        // One empty Data packet (table name only, 0 cols/rows) plus a
+        // trailing EndOfStream, split so the second packet needs a fill.
+        let mut packet = vec![1u8];
+        put_string(&mut packet, "");
+        wire::write_varint(&mut packet, 0).expect("test write"); // block info end
+        wire::write_varint(&mut packet, 0).expect("test write"); // cols
+        wire::write_varint(&mut packet, 0).expect("test write"); // rows
+        packet.push(5); // EndOfStream
+        let split = packet.len() - 1;
+
+        let (mut stream, mut server) = query_stream_with_buffer(packet[..split].to_vec());
+        let rest = packet[split..].to_vec();
+        let srv = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            server.write_all(&rest).expect("write eos");
+        });
+
+        let block = stream
+            .read_next_block()
+            .expect("read block")
+            .expect("non-empty");
+        assert_eq!(block.row_count(), 0);
+        // After returning the parsed packet, the consumed prefix is gone:
+        // only unconsumed bytes remain buffered.
+        assert!(
+            stream.pos == 0,
+            "compaction must reset pos (pos={})",
+            stream.pos
+        );
+        let buffered_after_block = stream.buffer.len();
+        assert!(
+            buffered_after_block <= 1,
+            "only the partial EoS byte may remain"
+        );
+
+        assert!(stream.read_next_block().expect("read eos").is_none());
+        assert!(stream.buffer.is_empty(), "EoS must leave an empty buffer");
+        srv.join().expect("server thread");
+    }
+
+    #[test]
+    fn query_stream_refills_and_parses_nested_exception_chain() {
+        let mut packet = vec![2];
+        packet.extend(exception_body(1000, "DB::Exception", "outer", true));
+        packet.extend(exception_body(48, "DB::Exception", "inner", false));
+        let split = 9;
+        let (mut stream, mut server) = query_stream_with_buffer(packet[..split].to_vec());
+        server
+            .write_all(&packet[split..])
+            .expect("write remainder of split exception");
+
+        let err = stream
+            .read_next_block()
+            .err()
+            .expect("exception stream must return an error");
+        let Error::ServerError {
+            code,
+            name,
+            message,
+        } = err
+        else {
+            unreachable!("expected ServerError");
+        };
+        assert_eq!(code, 1000);
+        assert_eq!(name, "DB::Exception");
+        assert!(message.contains("outer") && message.contains("inner"));
+    }
+
+    #[test]
+    fn query_stream_truncated_exception_terminates_as_protocol_error() {
+        let mut packet = vec![2];
+        packet.extend_from_slice(&46i32.to_le_bytes());
+        let (mut stream, server) = query_stream_with_buffer(packet);
+        server
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close server write side");
+
+        let err = stream
+            .read_next_block()
+            .err()
+            .expect("truncated exception must return an error");
+        assert!(
+            matches!(err, Error::Protocol(ref message) if message.contains("truncated exception")),
+            "expected truncated Protocol error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_response_blocks_surfaces_server_exception() {
+        let mut wire_bytes = Vec::new();
+        wire::write_varint(&mut wire_bytes, 2).expect("test operation failed");
+        wire_bytes.extend(exception_body(
+            60,
+            "DB::Exception",
+            "unknown function xyz",
+            false,
+        ));
+
+        let mut reader = std::io::Cursor::new(wire_bytes);
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            false,
+            &mut crate::limits::ResponseBudget::new(usize::MAX),
+        )
+        .expect_err("server exception must surface");
+        assert!(err.is_server_error(), "expected ServerError, got {err:?}");
+    }
+
+    #[test]
+    fn read_response_blocks_end_of_stream_is_ok_and_unknown_packet_is_err() {
+        let mut reader = std::io::Cursor::new(vec![5u8]);
+        let mut blocks = Vec::new();
+        read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            false,
+            &mut crate::limits::ResponseBudget::new(usize::MAX),
+        )
+        .expect("EndOfStream drains to Ok");
+
+        let mut reader = std::io::Cursor::new(vec![99u8, 5]);
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            false,
+            &mut crate::limits::ResponseBudget::new(usize::MAX),
+        )
+        .expect_err("unknown packet type must surface");
+        assert!(
+            matches!(err, Error::Protocol(ref msg) if msg.contains("unknown packet type")),
+            "expected protocol error, got {err:?}"
+        );
+    }
+
+    /// Wire body of one Data packet carrying a single UInt64 column with
+    /// `vals.len() * 8` payload bytes (the budget metric).
+    fn u64_data_packet(vals: &[u64]) -> Vec<u8> {
+        let mut p = Vec::new();
+        wire::write_varint(&mut p, 1).expect("test operation failed"); // Data
+        put_string(&mut p, ""); // table name
+        // BlockInfo: field 1 (is_overflows), field 2 (bucket_num), terminator.
+        wire::write_varint(&mut p, 1).expect("test operation failed");
+        p.push(0);
+        wire::write_varint(&mut p, 2).expect("test operation failed");
+        p.extend_from_slice(&(-1i32).to_le_bytes());
+        wire::write_varint(&mut p, 0).expect("test operation failed");
+        wire::write_varint(&mut p, 1).expect("test operation failed"); // columns
+        wire::write_varint(&mut p, vals.len() as u64).expect("test operation failed"); // rows
+        put_string(&mut p, "v");
+        put_string(&mut p, "UInt64");
+        p.push(0); // custom serialization = none
+        for val in vals {
+            p.extend_from_slice(&val.to_le_bytes());
+        }
+        p
+    }
+
+    fn two_block_wire() -> Vec<u8> {
+        let mut wire = u64_data_packet(&[1, 2]); // 16 payload bytes
+        wire.extend_from_slice(&u64_data_packet(&[3, 4])); // 16 more
+        wire.push(5); // EndOfStream
+        wire
+    }
+
+    #[test]
+    fn read_response_blocks_tiny_cap_breaches_naming_the_limit() {
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            false,
+            &mut crate::limits::ResponseBudget::new(16),
+        )
+        .expect_err("second 16-byte block must breach a 16-byte budget");
+        match err {
+            Error::ResponseTooLarge { limit, received } => {
+                assert_eq!(limit, 16);
+                assert_eq!(received, 32, "breach reports the decoded total");
+            },
+            other => unreachable!("expected ResponseTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            blocks.len(),
+            1,
+            "blocks accumulated up to the breach are kept"
+        );
+    }
+
+    #[test]
+    fn read_response_blocks_exactly_at_cap_passes() {
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            false,
+            &mut crate::limits::ResponseBudget::new(32),
+        )
+        .expect("cumulative payload exactly at the cap must pass");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].payload_bytes(), 16);
+        assert_eq!(blocks[1].payload_bytes(), 16);
+    }
+
+    #[test]
+    fn client_config_budget_reaches_enforcement() {
+        // The plumbing contract: the configured limit sizes the budget that
+        // read_response_blocks enforces. A tiny configured cap changes the
+        // outcome of the same wire response.
+        let config = crate::sync::config::ClientConfig::default().with_max_response_size(16);
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        let err = read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            false,
+            &mut crate::limits::ResponseBudget::new(config.max_response_size),
+        )
+        .expect_err("tiny configured cap must breach on the second block");
+        assert!(
+            matches!(
+                err,
+                Error::ResponseTooLarge {
+                    limit: 16,
+                    received: 32
+                }
+            ),
+            "expected ResponseTooLarge(16, 32), got {err:?}"
+        );
+
+        let config = crate::sync::config::ClientConfig::default().with_max_response_size(32);
+        let mut reader = std::io::Cursor::new(two_block_wire());
+        let mut blocks = Vec::new();
+        read_response_blocks(
+            &mut reader,
+            &mut blocks,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            revision::DEFAULT_PROTOCOL_REVISION,
+            false,
+            false,
+            &mut crate::limits::ResponseBudget::new(config.max_response_size),
+        )
+        .expect("cap raised to the exact payload passes");
+    }
+
+    #[test]
+    fn read_response_block_views_are_not_budgeted() {
+        // The streaming block-view path takes no budget by design: the same
+        // payload that breaches a tiny cap when accumulated streams through.
+        let mut visitor_calls = 0usize;
+        let mut rows_seen = 0usize;
+        let result = {
+            let mut reader = std::io::Cursor::new(two_block_wire());
+            read_response_block_views(
+                &mut reader,
+                &mut |view: crate::sync::protocol::block::BlockView<'_>| {
+                    visitor_calls += 1;
+                    rows_seen += view.row_count();
+                    Ok(())
+                },
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                revision::DEFAULT_PROTOCOL_REVISION,
+                false,
+                false,
+            )
+        };
+        result.expect("block-view streaming must not be budgeted");
+        assert_eq!(visitor_calls, 2);
+        assert_eq!(rows_seen, 4);
+    }
+
+    #[test]
+    fn total_row_count_errors_instead_of_overflowing() {
+        // query_all previously summed row counts with `sum()` — an overflow
+        // panic under overflow-checks. Now it errors.
+        let blocks = vec![
+            Block {
+                columns: Vec::new(),
+                rows: usize::MAX / 2 + 1,
+            },
+            Block {
+                columns: Vec::new(),
+                rows: usize::MAX / 2 + 1,
+            },
+        ];
+        let err =
+            total_row_count(&blocks).expect_err("row-count sum overflow must error, not panic");
+        assert!(
+            matches!(err, Error::Protocol(ref msg) if msg.contains("row count overflow")),
+            "expected overflow Protocol error, got {err:?}"
+        );
+
+        let ok_blocks = vec![
+            Block::empty(),
+            Block {
+                columns: Vec::new(),
+                rows: 7,
+            },
+        ];
+        assert_eq!(total_row_count(&ok_blocks).expect("small sums pass"), 7);
+    }
 
     #[test]
     fn chunked_reader_removes_native_chunk_markers() {
@@ -1797,5 +3128,235 @@ mod tests {
                 .expect("test operation failed")
         );
         assert!(choose_chunked_mode("chunked", "notchunked", "recv").is_err());
+    }
+    // ── Per-query settings overlay: server-free packet tests ──────────────
+
+    /// Build a `SyncClient` that never touches the network: packets are
+    /// built from the cached template exactly as after a real handshake.
+    fn offline_client(settings: &[(&str, &str)], rev: u64) -> SyncClient {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let sock = std::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test socket");
+        drop(listener.accept().expect("accept test socket").0);
+        let mut config = ClientConfig::default();
+        config.client_revision = rev;
+        for (name, value) in settings {
+            config
+                .settings
+                .insert((*name).to_string(), (*value).to_string());
+        }
+        let server_info = ServerInfo {
+            name: "test-server".to_string(),
+            major: 26,
+            minor: 4,
+            patch: 1,
+            revision: rev,
+            negotiated_revision: rev,
+            timezone: None,
+            display_name: None,
+            server_parallel_replicas_protocol_version: 0,
+            proto_send_chunked_srv: String::new(),
+            proto_recv_chunked_srv: String::new(),
+            use_chunked_send: false,
+            use_chunked_recv: false,
+            password_complexity_rules: Vec::new(),
+            interserver_secret_nonce: None,
+            server_query_plan_serialization_version: None,
+            worker_cluster_function_protocol_version: 0,
+        };
+        SyncClient {
+            stream: crate::sync::transport::Transport::new_plain(sock),
+            server_info,
+            query_template: build_query_packet_template(&config, rev),
+            config,
+            schema_cache: HashMap::new(),
+        }
+    }
+
+    fn read_varint_at(packet: &[u8], pos: usize) -> (usize, usize) {
+        let mut reader = std::io::Cursor::new(&packet[pos..]);
+        let value = wire::read_varint(&mut reader).expect("test varint");
+        (value as usize, reader.position() as usize)
+    }
+
+    /// Byte offset where a query packet's serialized settings block starts.
+    fn settings_offset(client: &SyncClient, packet: &[u8]) -> usize {
+        let mut pos = client.query_template.prefix.len();
+        let (qid_len, n) = read_varint_at(packet, pos);
+        pos += n + qid_len;
+        if let Some(ci) = &client.query_template.client_info {
+            pos += ci.before_initial_query_id.len();
+            let (qid_len, n) = read_varint_at(packet, pos);
+            pos += n + qid_len;
+            pos += ci.after_initial_query_id.len();
+        }
+        pos
+    }
+
+    /// Parse the settings block of a packet. Returns the entries and the
+    /// packet offset just past the empty-name terminator.
+    fn packet_settings(client: &SyncClient, packet: &[u8]) -> (Vec<(String, String)>, usize) {
+        let start = settings_offset(client, packet);
+        let mut reader = std::io::Cursor::new(&packet[start..]);
+        let mut out = Vec::new();
+        loop {
+            let name = wire::read_string(&mut reader).expect("setting name");
+            if name.is_empty() {
+                return (out, start + reader.position() as usize);
+            }
+            let _flags = wire::read_varint(&mut reader).expect("setting flags");
+            let value = wire::read_string(&mut reader).expect("setting value");
+            out.push((name, value));
+        }
+    }
+
+    /// Packet bytes minus the two per-query generated query-id strings, so
+    /// consecutive packets are byte-comparable.
+    fn strip_query_ids(client: &SyncClient, packet: &[u8]) -> Vec<u8> {
+        let mut pos = client.query_template.prefix.len();
+        let (qid_len, n) = read_varint_at(packet, pos);
+        let mut out = packet[..pos].to_vec();
+        pos += n + qid_len;
+        if let Some(ci) = &client.query_template.client_info {
+            out.extend_from_slice(&ci.before_initial_query_id);
+            pos += ci.before_initial_query_id.len();
+            let (qid_len, n) = read_varint_at(packet, pos);
+            pos += n + qid_len;
+            out.extend_from_slice(&ci.after_initial_query_id);
+            pos += ci.after_initial_query_id.len();
+        }
+        out.extend_from_slice(&packet[pos..]);
+        out
+    }
+
+    #[test]
+    fn query_packet_settings_overlay_merges_with_precedence() {
+        let client = offline_client(
+            &[("max_threads", "4"), ("max_block_size", "1000")],
+            revision::DEFAULT_PROTOCOL_REVISION,
+        );
+        let mut overlay = HashMap::new();
+        overlay.insert("max_threads".to_string(), "9".to_string());
+        overlay.insert("max_insert_block_size".to_string(), "500".to_string());
+        let pkt = client.build_query_packet_with_settings("SELECT 1", &overlay);
+
+        assert_eq!(pkt[0], 1, "ClientCode::Query");
+        let (entries, _) = packet_settings(&client, &pkt);
+        let by_name: HashMap<_, _> = entries.iter().cloned().collect();
+        assert_eq!(
+            by_name.get("max_threads").map(String::as_str),
+            Some("9"),
+            "overlay must win on duplicate keys"
+        );
+        assert_eq!(
+            by_name.get("max_block_size").map(String::as_str),
+            Some("1000"),
+            "unshadowed baseline must survive"
+        );
+        assert_eq!(
+            by_name.get("max_insert_block_size").map(String::as_str),
+            Some("500"),
+            "overlay-only keys must be added"
+        );
+        assert_eq!(
+            entries.iter().filter(|(n, _)| n == "max_threads").count(),
+            1,
+            "duplicate keys must be emitted exactly once"
+        );
+        // Automatic defaults are still serialized.
+        assert!(by_name.contains_key(
+            crate::sync::protocol::settings::OUTPUT_FORMAT_NATIVE_WRITE_JSON_AS_STRING
+        ));
+        assert!(by_name.contains_key(
+            crate::sync::protocol::settings::RATIO_OF_DEFAULTS_FOR_SPARSE_SERIALIZATION
+        ));
+    }
+
+    #[test]
+    fn query_packet_settings_overlay_does_not_mutate_state() {
+        let client = offline_client(&[("max_threads", "4")], revision::DEFAULT_PROTOCOL_REVISION);
+        let template_before = client.query_template.before_query.clone();
+        let mut overlay = HashMap::new();
+        overlay.insert("max_threads".to_string(), "9".to_string());
+        let _ = client.build_query_packet_with_settings("SELECT 1", &overlay);
+
+        assert_eq!(
+            client
+                .config
+                .settings
+                .get("max_threads")
+                .map(String::as_str),
+            Some("4"),
+            "config settings must not be mutated"
+        );
+        assert_eq!(
+            client.query_template.before_query, template_before,
+            "cached template must not be mutated"
+        );
+        let (entries, _) = packet_settings(&client, &client.build_query_packet("SELECT 1"));
+        assert!(
+            entries.iter().any(|(n, v)| n == "max_threads" && v == "4"),
+            "next packet must carry the baseline: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(n, v)| n == "max_threads" && v == "9"),
+            "overlay must not leak into later packets: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn query_packet_empty_overlay_equals_fast_path() {
+        for rev in [
+            revision::MIN_SUPPORTED_PROTOCOL_REVISION,
+            revision::DEFAULT_PROTOCOL_REVISION,
+        ] {
+            let client = offline_client(&[("max_threads", "4"), ("x", "y")], rev);
+            let fast = client.build_query_packet("SELECT 42");
+            let overlay = client.build_query_packet_with_settings("SELECT 42", &HashMap::new());
+            assert_eq!(
+                strip_query_ids(&client, &fast),
+                strip_query_ids(&client, &overlay),
+                "empty overlay must keep the cached-template fast path at rev {rev}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_packet_overlay_preserves_params_and_framing() {
+        let client = offline_client(&[("max_threads", "4")], revision::DEFAULT_PROTOCOL_REVISION);
+        let params = vec![
+            QueryParameter::new("id", "42"),
+            QueryParameter::new("name", "o'brien"),
+        ];
+        let query = "SELECT {id:UInt64} AS i, {name:String} AS n";
+        let mut overlay = HashMap::new();
+        overlay.insert("max_threads".to_string(), "9".to_string());
+        let pkt = client.build_query_packet_with_params_and_settings(query, &params, &overlay);
+
+        // Deterministic tail: template post-settings bytes + query text +
+        // parameters (CUSTOM flag framing) + trailing empty Data block.
+        let mut empty_data_block = Vec::new();
+        let _ = write_empty_data_block_for(&mut empty_data_block, None);
+        let mut expected_tail = Vec::new();
+        expected_tail.extend_from_slice(
+            &client.query_template.before_query[client.query_template.settings_len..],
+        );
+        wire::write_string_to_vec(&mut expected_tail, query);
+        write_query_parameters_to_vec(&mut expected_tail, &params);
+        expected_tail.extend_from_slice(&empty_data_block);
+        assert!(
+            pkt.ends_with(&expected_tail),
+            "overlay packet must preserve query/parameter/suffix framing"
+        );
+
+        // The settings block must end exactly where the deterministic tail
+        // begins — well-formed and exactly sized.
+        let (entries, settings_end) = packet_settings(&client, &pkt);
+        assert_eq!(
+            settings_end,
+            pkt.len() - expected_tail.len(),
+            "settings block must end exactly at the framing tail boundary"
+        );
+        assert!(entries.iter().any(|(n, v)| n == "max_threads" && v == "9"));
     }
 }

@@ -42,22 +42,26 @@ async fn test_progress_callback() {
         on_part_uuids: None,
     };
 
-    let block = client
+    let blocks = client
         .query("SELECT number FROM system.numbers LIMIT 100000")
         .with_callbacks(callbacks)
-        .block()
+        .blocks()
         .await
         .expect("test operation failed");
+    let returned_rows = blocks
+        .iter()
+        .map(st_clickhouse::Block::row_count)
+        .sum::<usize>();
 
     assert!(
         fired.load(Ordering::SeqCst),
         "progress callback should fire"
     );
-    assert!(block.row_count() > 0, "should return rows");
+    assert!(returned_rows > 0, "should return rows");
     eprintln!(
-        "Progress: reported {} rows, block has {} rows",
+        "Progress: reported {} rows, result has {} rows",
         row_count.load(Ordering::SeqCst),
-        block.row_count()
+        returned_rows
     );
 }
 
@@ -360,23 +364,32 @@ async fn test_cancel_during_progress() {
         on_part_uuids: None,
     };
 
-    // Spawn a long-running query in the background
+    // Client::cancel is fail-closed: it cannot reach the connection running
+    // the query, so it must return Error::Config without opening or touching
+    // any pooled connection. The heavy query below runs on a different client
+    // and finishes (or errors) on its own.
     let client_for_cancel = connect().await;
     let cancel_handle = tokio::spawn(async move {
         // Give the query a moment to start sending progress
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = client_for_cancel.cancel().await;
+        #[allow(deprecated)]
+        let result = client_for_cancel.cancel().await;
+        matches!(result, Err(st_clickhouse::error::Error::Config(_)))
     });
 
-    // Run a heavy query — will be cancelled
+    // Run a heavy query — unaffected by the (fail-closed) cancel
     let result = client
         .query("SELECT number FROM system.numbers LIMIT 500000000")
         .with_callbacks(callbacks)
         .block()
         .await;
 
-    // Wait for cancel to complete
-    let _ = cancel_handle.await;
+    // Wait for cancel to complete and prove it failed closed.
+    let cancelled_config_error = cancel_handle.await.expect("cancel task must not panic");
+    assert!(
+        cancelled_config_error,
+        "Client::cancel must fail closed with Error::Config"
+    );
 
     match result {
         Ok(block) => {

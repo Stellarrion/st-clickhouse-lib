@@ -10,6 +10,8 @@ pub mod part_uuid;
 pub mod revision;
 pub mod settings;
 #[cfg(feature = "tokio")]
+pub(crate) mod skip_column;
+#[cfg(feature = "tokio")]
 pub mod table_status;
 pub mod type_parser;
 pub mod wire;

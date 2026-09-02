@@ -140,7 +140,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Run Rust tests
-        run: cargo nextest run --workspace --exclude st-clickhouse-py --all-features --profile ci
+        run: cargo nextest run --workspace --exclude st-clickhouse-py --all-features --cargo-profile ci
         env:
           CLICKHOUSE_HOST: "127.0.0.1:9000"
           CLICKHOUSE_USER: "default"
@@ -242,11 +242,118 @@ jobs:
       - run: cargo deny check advisories sources licenses
       - run: cargo audit
 
+  # ── MSRV ─────────────────────────────────────────────────────
+  # Checks the rust-version declared in Cargo.toml, so the job cannot drift
+  # from the declaration. Note: the workspace needs >= 1.89 for
+  # --all-features (src/pool.rs uses let-chains, stable since 1.88; the
+  # bench-clickhouse-rs feature pulls clickhouse 0.15, which requires 1.89).
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read declared MSRV from Cargo.toml
+        id: msrv
+        run: |
+          MSRV="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$MSRV" ]; then
+            echo "Failed to parse rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "Declared MSRV: $MSRV"
+          echo "version=$MSRV" >> "$GITHUB_OUTPUT"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --workspace --all-features
+
+  # ── Version consistency ─────────────────────────────────────
+  version-check:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert all crate versions are equal
+        run: |
+          LIB_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          DERIVE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' derive/Cargo.toml | head -n 1)"
+          PY_CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' st-clickhouse-py/Cargo.toml | head -n 1)"
+          PY_PROJECT_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' st-clickhouse-py/pyproject.toml | head -n 1)"
+          if [ -z "$LIB_VERSION" ] || [ -z "$DERIVE_VERSION" ] || [ -z "$PY_CARGO_VERSION" ] || [ -z "$PY_PROJECT_VERSION" ]; then
+            echo "Failed to parse at least one crate version:"
+            echo "  st-clickhouse-lib (Cargo.toml): $LIB_VERSION"
+            echo "  st-clickhouse-derive (derive/Cargo.toml): $DERIVE_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/Cargo.toml): $PY_CARGO_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/pyproject.toml): $PY_PROJECT_VERSION"
+            exit 1
+          fi
+          if [ "$LIB_VERSION" != "$DERIVE_VERSION" ] || [ "$LIB_VERSION" != "$PY_CARGO_VERSION" ] || [ "$LIB_VERSION" != "$PY_PROJECT_VERSION" ]; then
+            echo "Crate versions are inconsistent; refusing to publish:"
+            echo "  st-clickhouse-lib (Cargo.toml): $LIB_VERSION"
+            echo "  st-clickhouse-derive (derive/Cargo.toml): $DERIVE_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/Cargo.toml): $PY_CARGO_VERSION"
+            echo "  st-clickhouse-py (st-clickhouse-py/pyproject.toml): $PY_PROJECT_VERSION"
+            echo "Bump all crates to the same version before tagging a release."
+            exit 1
+          fi
+          echo "All crate versions agree: $LIB_VERSION"
+
+  # ── Version bump gate (PRs) ──────────────────────────────────
+  # Enforces CONTRIBUTING.md (Versioning): the PR's own manifests (the merge-ref
+  # checkout) must carry a version strictly greater than the one currently
+  # published on crates.io, and CHANGELOG.md must already contain the
+  # section header for that version. Mark this check required in branch
+  # protection so unbumped PRs cannot merge.
+  version-bump-check:
+    name: Version bump required
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare PR version against crates.io
+        run: |
+          PR_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$PR_VERSION" ]; then
+            echo "Failed to parse version from Cargo.toml"
+            exit 1
+          fi
+          echo "PR version: $PR_VERSION"
+          REGISTRY_VERSION="$(curl -sf -A "st-clickhouse-ci" \
+            https://crates.io/api/v1/crates/st-clickhouse-lib \
+            | jq -r '.crate.max_version // empty')"
+          if [ -z "$REGISTRY_VERSION" ]; then
+            echo "No published st-clickhouse-lib found on crates.io; any version is acceptable."
+            exit 0
+          fi
+          echo "Published on crates.io: $REGISTRY_VERSION"
+          HIGHER="$(printf '%s\n%s\n' "$REGISTRY_VERSION" "$PR_VERSION" \
+            | sort -V | tail -n 1)"
+          if [ "$PR_VERSION" = "$REGISTRY_VERSION" ] || [ "$HIGHER" = "$REGISTRY_VERSION" ]; then
+            echo "::error::This PR does not bump the version (PR: $PR_VERSION, published: $REGISTRY_VERSION)."
+            echo "::error::Merging to main IS the release (see CONTRIBUTING.md): bump the version in"
+            echo "::error::Cargo.toml, derive/Cargo.toml, st-clickhouse-py/Cargo.toml and pyproject.toml,"
+            echo "::error::and add a '## [$PR_VERSION] — YYYY-MM-DD' section to CHANGELOG.md."
+            exit 1
+          fi
+      - name: Require a CHANGELOG section for the version
+        run: |
+          PR_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if ! grep -q "^## \[$PR_VERSION\] — " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$PR_VERSION] — YYYY-MM-DD' section."
+            echo "::error::Every released version must be documented (see CONTRIBUTING.md)."
+            exit 1
+          fi
+          echo "CHANGELOG section for $PR_VERSION present."
+
   # ── Release (crates.io) ──────────────────────────────────────
   publish-crates:
     name: Release (crates.io)
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, clippy, build, test, python, audit]
+    # Release on merge to main (idempotent: skips versions already on
+    # crates.io) and on v* tags for manual/back-compat releases.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, clippy, build, test, python, audit, msrv, version-check]
     runs-on: ubuntu-latest
     environment:
       name: crates-io
@@ -278,35 +385,89 @@ jobs:
           } >> "$GITHUB_ENV"
         env:
           FALLBACK_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Check if derive version is already published
+        id: derive_exists
+        run: |
+          DERIVE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' derive/Cargo.toml | head -n 1)"
+          if [ -z "$DERIVE_VERSION" ]; then
+            echo "Failed to parse st-clickhouse-derive version from derive/Cargo.toml"
+            exit 1
+          fi
+          if cargo search st-clickhouse-derive --limit 1 | grep -q "^st-clickhouse-derive = \"$DERIVE_VERSION\""; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "st-clickhouse-derive $DERIVE_VERSION already on crates.io; publish step will be skipped"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish derive helper
+        if: steps.derive_exists.outputs.exists != 'true'
         run: cargo publish -p st-clickhouse-derive
       - name: Wait for derive helper in crates.io index
         run: |
+          DERIVE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' derive/Cargo.toml | head -n 1)"
+          if [ -z "$DERIVE_VERSION" ]; then
+            echo "Failed to parse st-clickhouse-derive version from derive/Cargo.toml"
+            exit 1
+          fi
+          echo "Waiting for st-clickhouse-derive $DERIVE_VERSION in the crates.io index"
           for i in $(seq 1 30); do
-            if cargo search st-clickhouse-derive --limit 1 | grep -q '^st-clickhouse-derive = "0.1.0"'; then
+            if cargo search st-clickhouse-derive --limit 1 | grep -q "^st-clickhouse-derive = \"$DERIVE_VERSION\""; then
+              echo "st-clickhouse-derive $DERIVE_VERSION is available in the crates.io index"
               exit 0
             fi
             sleep 10
           done
-          echo "st-clickhouse-derive 0.1.0 did not appear in crates.io index in time"
+          echo "st-clickhouse-derive $DERIVE_VERSION did not appear in the crates.io index in time"
           exit 1
+      - name: Check if lib version is already published
+        id: lib_exists
+        run: |
+          LIB_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$LIB_VERSION" ]; then
+            echo "Failed to parse st-clickhouse-lib version from Cargo.toml"
+            exit 1
+          fi
+          if cargo search st-clickhouse-lib --limit 1 | grep -q "^st-clickhouse-lib = \"$LIB_VERSION\""; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "st-clickhouse-lib $LIB_VERSION already on crates.io; publish step will be skipped"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish user-facing crate
+        if: steps.lib_exists.outputs.exists != 'true'
         run: cargo publish -p st-clickhouse-lib
 
   # ── Release (PyPI) ──────────────────────────────────────────
   build-wheels:
-    name: Build wheels (${{ matrix.os }})
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [fmt, clippy, build, test, python, audit]
+    name: Build wheels (${{ matrix.os }}${{ matrix.freethreaded && ', free-threaded' || '' }})
+    # Same release trigger as publish-crates: merge to main or v* tag.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, clippy, build, test, python, audit, msrv, version-check]
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # `false` builds the single abi3 (stable ABI, GIL) wheel per OS;
+        # `true` builds a version-specific free-threaded wheel (cp314-cp314t) with
+        # the 3.14t interpreter selected below — pyo3 detects
+        # Py_GIL_DISABLED and falls back from abi3 to a cp314-cp314t build, so the
+        # maturin invocation is identical. Python 3.13t is deliberately not
+        # built: pyo3 0.29 dropped support for it (free-threading is only
+        # officially supported from 3.14t up).
+        freethreaded: [false, true]
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 for the abi3 legs (wheel tag is cp312-abi3 regardless);
+          # "3.14t" selects the free-threaded interpreter for the ft legs.
+          python-version: ${{ matrix.freethreaded && '3.14t' || '3.12' }}
       - name: Install maturin
         run: pip install maturin
       - name: Build wheel
@@ -314,12 +475,15 @@ jobs:
         working-directory: st-clickhouse-py
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: ${{ matrix.freethreaded && format('wheels-ft-{0}', matrix.os) || format('wheels-{0}', matrix.os) }}
           path: st-clickhouse-py/dist/*.whl
 
   publish-pypi:
     name: Release (PyPI)
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Same release trigger as publish-crates: merge to main or v* tag.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
     needs: [build-wheels]
     runs-on: ubuntu-latest
     environment:
@@ -337,3 +501,35 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
+
+  # ── Release bookmark ─────────────────────────────────────────
+  # After a merge-triggered release publishes, tag the commit that produced
+  # it. The tag is a provenance bookmark (git ref for the exact published
+  # tree); it is NOT the publish trigger — pushes made with GITHUB_TOKEN
+  # cannot start new workflow runs, and publishing already happened on the
+  # merge itself.
+  tag-release:
+    name: Tag released version
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [publish-crates, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release tag if it does not exist
+        run: |
+          VERSION="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "v" ]; then
+            echo "Failed to parse version from Cargo.toml"
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/$VERSION" | grep -q .; then
+            echo "Tag $VERSION already exists; nothing to do"
+            exit 0
+          fi
+          git config user.name "release-bot"
+          git config user.email "noreply@github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+          echo "Tagged $VERSION at $GITHUB_SHA"

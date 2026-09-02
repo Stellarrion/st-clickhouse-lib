@@ -74,8 +74,42 @@ async fn tables_status_roundtrip() {
     );
 }
 
+/// Whether the server still accepts `Client::IgnoredPartUUIDs`.
+///
+/// ClickHouse removed query deduplication server-side (UNSUPPORTED_METHOD
+/// "Received IgnoredPartUUIDs packet, but query deduplication ... is no
+/// longer supported" — TCPHandler::processObsoleteIgnoredPartUUIDs, observed
+/// live on 26.7.3). On such servers the packet closes the connection, so the
+/// ignored-part-UUID tests below can only run where the feature exists.
+async fn server_supports_ignored_part_uuids() -> bool {
+    let client = connect().await;
+    let block = client.query("SELECT version()").block().await;
+    match block {
+        Ok(block) => {
+            let version = block
+                .column::<String>("version()")
+                .expect("test operation failed")
+                .get(0)
+                .expect("test operation failed");
+            // Removal landed in 25.x (26.7 rejects it outright). Exact cutoff
+            // unverified; 24.x is the last line known to accept it.
+            let major: u32 = version
+                .split('.')
+                .next()
+                .and_then(|m| m.parse().ok())
+                .unwrap_or(0);
+            major <= 24
+        },
+        Err(_) => false,
+    }
+}
+
 #[tokio::test]
 async fn ignored_part_uuids_packet_is_accepted_before_query() {
+    if !server_supports_ignored_part_uuids().await {
+        eprintln!("server dropped IgnoredPartUUIDs support; skipping");
+        return;
+    }
     let client = connect().await;
     let block = client
         .query("SELECT 1 AS x")
@@ -97,6 +131,10 @@ async fn ignored_part_uuids_packet_is_accepted_before_query() {
 
 #[tokio::test]
 async fn ignored_part_uuids_packet_is_accepted_before_begin_select() {
+    if !server_supports_ignored_part_uuids().await {
+        eprintln!("server dropped IgnoredPartUUIDs support; skipping");
+        return;
+    }
     let client = connect().await.with_setting("replace_running_query", "1");
     let mut stream = client
         .begin_select_with_ignored_part_uuids("SELECT 1 AS x", &[[8u8; 16]])
@@ -121,6 +159,10 @@ async fn ignored_part_uuids_packet_is_accepted_before_begin_select() {
 
 #[tokio::test]
 async fn ignored_part_uuids_packet_is_accepted_before_batch_queries() {
+    if !server_supports_ignored_part_uuids().await {
+        eprintln!("server dropped IgnoredPartUUIDs support; skipping");
+        return;
+    }
     let client = connect().await;
     let blocks = client
         .batch()

@@ -21,6 +21,7 @@ pub struct Int256(pub [u8; 32]);
 /// Use `.as_days()` to get the raw days count.
 /// Convert to `chrono::NaiveDate` with:
 /// ```ignore
+/// // ignore: requires the `chrono` crate, a user-side dependency
 /// let naive_date = chrono::NaiveDate::from_num_days_from_ce(date.as_days() as i32 + 719163);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -58,8 +59,15 @@ impl From<Date> for u16 {
 /// DateTime stored as Unix timestamp (seconds since epoch, UInt32 wire format).
 ///
 /// Convert to `std::time::SystemTime`:
-/// ```ignore
+/// ```rust
+/// let dt = st_clickhouse::DateTime::from_secs(1_700_000_000);
 /// let st = std::time::UNIX_EPOCH + std::time::Duration::from_secs(dt.as_secs() as u64);
+/// assert_eq!(
+///     st.duration_since(std::time::UNIX_EPOCH)
+///         .expect("after the epoch")
+///         .as_secs(),
+///     1_700_000_000,
+/// );
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -98,6 +106,7 @@ impl From<DateTime> for u32 {
 /// Use `.as_bytes()` for byte-level access.
 /// Convert to `uuid::Uuid`:
 /// ```ignore
+/// // ignore: requires the `uuid` crate, a user-side dependency
 /// let u = uuid::Uuid::from_u128(uuid.as_u128());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -171,8 +180,11 @@ impl From<Uuid> for u128 {
 /// IPv4 address stored as a 32-bit integer (UInt32 wire format, LE).
 ///
 /// Convert to `std::net::Ipv4Addr`:
-/// ```ignore
+/// ```rust
+/// let ipv4 = st_clickhouse::Ipv4::from_std("192.0.2.1".parse().expect("valid Ipv4Addr"));
 /// let addr: std::net::Ipv4Addr = ipv4.into();
+/// assert_eq!(addr.to_string(), "192.0.2.1");
+/// assert_eq!(st_clickhouse::Ipv4::from(addr), ipv4);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -225,8 +237,11 @@ impl From<Ipv4> for u32 {
 /// IPv6 address stored as a 128-bit integer (UInt128 wire format, LE).
 ///
 /// Convert to `std::net::Ipv6Addr`:
-/// ```ignore
+/// ```rust
+/// let ipv6 = st_clickhouse::Ipv6::from_std("2001:db8::1".parse().expect("valid Ipv6Addr"));
 /// let addr: std::net::Ipv6Addr = ipv6.into();
+/// assert_eq!(addr.to_string(), "2001:db8::1");
+/// assert_eq!(st_clickhouse::Ipv6::from(addr), ipv6);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -340,7 +355,7 @@ impl<'a> ClickHouseColumnData<'a, JsonValue> for JsonColumnData {
 }
 
 /// Variant value — stored as raw discriminators + sub-columns.
-/// The raw data format: [discriminators: u8 * N] [subcol_0] [subcol_1] ...
+/// The raw data format: `[discriminators: u8 * N] [subcol_0] [subcol_1] ...`
 #[derive(Debug, Clone)]
 pub struct VariantValue(pub Vec<u8>);
 
@@ -386,6 +401,7 @@ include!(concat!(
 /// Scale indicates the number of decimal places (0=seconds, 3=ms, 6=us, 9=ns).
 /// Use `DateTime64Value::to_timestamp(scale)` to get seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct DateTime64Value(pub i64);
 
 impl DateTime64Value {
@@ -408,14 +424,17 @@ impl DateTime64Value {
 
 /// Decimal32 value (4 bytes, precision <= 9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Decimal32(pub i32);
 
 /// Decimal64 value (8 bytes, precision 10-18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Decimal64(pub i64);
 
 /// Decimal128 value (16 bytes, precision 19-38).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Decimal128(pub i128);
 
 /// Decimal256 value (32 bytes, precision 39-76).
@@ -516,12 +535,26 @@ impl<'a, T: PlainColumn + Copy> PlainColumnData<'a, T> {
     }
 
     /// Read from a byte slice with a given number of elements.
-    pub fn read_from_bytes(bytes: &'a [u8], count: usize) -> Self {
-        PlainColumnData {
+    ///
+    /// Fails when `count` elements of `size_of::<T>()` bytes do not fit in
+    /// `bytes`: a safe constructor must never hand out a column whose
+    /// logical length exceeds its backing bytes, because `get()`/`as_slice()`
+    /// would then read out of bounds.
+    pub fn read_from_bytes(bytes: &'a [u8], count: usize) -> Result<Self> {
+        let nbytes = count.checked_mul(size_of::<T>()).ok_or_else(|| {
+            Error::Protocol("PlainColumnData: element count overflows byte length".into())
+        })?;
+        if nbytes > bytes.len() {
+            return Err(Error::Protocol(format!(
+                "PlainColumnData: {count} elements need {nbytes} bytes, backing slice has {}",
+                bytes.len()
+            )));
+        }
+        Ok(PlainColumnData {
             buf: bytes,
             count,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Number of elements.
@@ -541,13 +574,28 @@ impl<'a, T: PlainColumn + Copy> PlainColumnData<'a, T> {
                 self.count
             )));
         }
-        let offset = index * size_of::<T>();
-        let ptr = self.buf[offset..].as_ptr() as *const T;
+        // Even though the constructors preserve count * size <= buf.len(),
+        // re-check the byte window here so a malformed internal state can
+        // only produce an error, never an out-of-bounds read.
+        let offset = index.checked_mul(size_of::<T>()).ok_or_else(|| {
+            super::super::error::Error::Protocol(
+                "PlainColumnData: index byte offset overflow".into(),
+            )
+        })?;
+        let src = self
+            .buf
+            .get(offset..)
+            .and_then(|rest| rest.get(..size_of::<T>()))
+            .ok_or_else(|| {
+                super::super::error::Error::Protocol(
+                    "PlainColumnData: buffer shorter than logical length".into(),
+                )
+            })?;
         // SAFETY:
         // - T: PlainColumn guarantees any bit pattern is valid (no Undef)
         // - read_unaligned handles any alignment (safe on x86/ARM)
-        // - bounds check above ensures offset + size_of<T>() <= buf.len()
-        Ok(unsafe { ptr.read_unaligned() })
+        // - the byte-window check above proves a full element is in bounds
+        Ok(unsafe { src.as_ptr().cast::<T>().read_unaligned() })
     }
 
     /// Get all values as a slice — only when the buffer is properly aligned.
@@ -556,11 +604,18 @@ impl<'a, T: PlainColumn + Copy> PlainColumnData<'a, T> {
         if self.count == 0 {
             return Some(&[]);
         }
+        // count * size_of::<T>() must stay within the backing bytes; the
+        // constructors enforce it, this check keeps the unsafe projection
+        // sound even if the invariant were ever broken.
+        let nbytes = self.count.checked_mul(size_of::<T>())?;
+        if nbytes > self.buf.len() {
+            return None;
+        }
         let ptr = self.buf.as_ptr() as *const T;
-        if (ptr as usize) % align_of::<T>() == 0 {
+        if (ptr as usize).is_multiple_of(align_of::<T>()) {
             // SAFETY: T: PlainColumn guarantees valid bit pattern + no padding.
-            // Alignment is verified above. Size is count * size_of::<T>() which
-            // matches buf.len() (validated in read_column).
+            // Alignment is verified above. Size is count * size_of::<T>(),
+            // proven within buf.len() by the check above.
             Some(unsafe { std::slice::from_raw_parts(ptr, self.count) })
         } else {
             None
@@ -842,11 +897,11 @@ impl ClickHouseColumn for JsonValue {
         let mut offsets = Vec::with_capacity(ctx.rows);
         let mut data = Vec::new();
         for _ in 0..ctx.rows {
-            let (l, consumed) = read_varint_from_slice(&ctx.buf[ctx.pos..]);
-            ctx.pos += consumed;
-            let _start = data.len();
-            data.extend_from_slice(&ctx.buf[ctx.pos..ctx.pos + l]);
-            ctx.pos += l;
+            let (len, consumed) = read_varint_from_slice(&ctx.buf[ctx.pos..])?;
+            ctx.pos = ctx.pos.checked_add(consumed).ok_or_else(|| {
+                super::super::error::Error::Protocol("JSON column position overflow".into())
+            })?;
+            data.extend_from_slice(ctx.read_exact(len)?);
             offsets.push(data.len() as u64);
         }
         Ok(JsonColumnData::new(offsets, data))
@@ -860,22 +915,32 @@ impl ClickHouseColumn for JsonValue {
 }
 
 /// Read a LEB128 varint from a byte slice, returning (value, bytes_consumed).
-fn read_varint_from_slice(data: &[u8]) -> (usize, usize) {
+fn read_varint_from_slice(data: &[u8]) -> Result<(usize, usize)> {
     let mut result = 0u64;
     let mut shift = 0;
-    let mut consumed = 0;
-    for &b in data {
-        consumed += 1;
-        result |= ((b & 0x7F) as u64) << shift;
-        if b & 0x80 == 0 {
-            return (result as usize, consumed);
+    for (index, &byte) in data.iter().enumerate() {
+        if shift == 63 && (byte & 0x7F) > 1 {
+            return Err(super::super::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
+        }
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            let value = usize::try_from(result).map_err(|_| {
+                super::super::error::Error::Protocol("length does not fit usize".into())
+            })?;
+            return Ok((value, index + 1));
         }
         shift += 7;
         if shift >= 64 {
-            break;
+            return Err(super::super::error::Error::Protocol(
+                "varint overflow".into(),
+            ));
         }
     }
-    (result as usize, consumed)
+    Err(super::super::error::Error::Protocol(
+        "unexpected end of data in varint".into(),
+    ))
 }
 
 /// Write a string with varint prefix (matching `wire::write_string`).
@@ -1286,6 +1351,27 @@ mod tests {
     }
 
     #[test]
+    fn test_json_column_rejects_malformed_lengths_without_panicking() {
+        let overflow = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02,
+        ];
+        let mut ctx = ReadColumnContext {
+            rows: 1,
+            pos: 0,
+            buf: &overflow,
+        };
+        assert!(JsonValue::read_column(&mut ctx).is_err());
+
+        let truncated = [10u8, b'a'];
+        let mut ctx = ReadColumnContext {
+            rows: 1,
+            pos: 0,
+            buf: &truncated,
+        };
+        assert!(JsonValue::read_column(&mut ctx).is_err());
+    }
+
+    #[test]
     fn test_plain_column_aligned() {
         // Aligned buffer — as_slice() should work
         let bytes = 1u64
@@ -1339,6 +1425,29 @@ mod tests {
         };
         assert!(data.get(0).is_ok());
         assert!(data.get(1).is_err());
+    }
+
+    #[test]
+    fn read_from_bytes_rejects_len_beyond_backing_bytes() {
+        let bytes = [0u8; 8]; // room for exactly one u64
+        // Two elements claimed, one fits: the safe constructor must refuse,
+        // otherwise get(1)/as_slice() would read out of bounds.
+        let res = PlainColumnData::<u64>::read_from_bytes(&bytes, 2);
+        assert!(res.is_err(), "count beyond backing bytes must error, got {res:?}");
+        // usize::MAX elements overflows the byte-length product.
+        let res = PlainColumnData::<u64>::read_from_bytes(&bytes, usize::MAX);
+        assert!(res.is_err(), "overflowing count must error, got {res:?}");
+        // Exact fit still works and stays readable.
+        let col = PlainColumnData::<u64>::read_from_bytes(&bytes, 1)
+            .expect("one element fits");
+        assert_eq!(col.len(), 1);
+        assert_eq!(
+            col.get(0).expect("in-bounds element"),
+            u64::from_le_bytes(bytes)
+        );
+        // Empty column over empty (or any) bytes is fine.
+        let col = PlainColumnData::<u64>::read_from_bytes(&bytes, 0).expect("zero rows fit");
+        assert!(col.is_empty());
     }
 
     #[test]

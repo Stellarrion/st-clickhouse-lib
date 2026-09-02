@@ -14,9 +14,10 @@ pub struct Blocking;
 
 /// Unified ClickHouse client builder.
 ///
-/// Use [`Client::builder`](crate::Client::builder) for the async Tokio-backed
-/// client or [`SyncClient::builder`](crate::sync::SyncClient::builder) for the
-/// blocking client.
+/// Use `Client::builder()` for the async Tokio-backed client (requires the
+/// `tokio` feature, enabled by default) or
+/// [`SyncClient::builder`](crate::sync::SyncClient::builder) for the blocking
+/// client.
 #[derive(Debug, Clone)]
 pub struct ClientBuilder<M = Async> {
     opts: BuilderOptions,
@@ -199,6 +200,9 @@ impl<M> ClientBuilder<M> {
         )
     }
 
+    /// Set the connect timeout for each per-address connection attempt
+    /// (TCP + TLS + native handshake + ping). Also accepted as the URL option
+    /// `?connect_timeout=`. `Duration::ZERO` is rejected at connect time.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.opts.connect_timeout = Some(timeout);
         self

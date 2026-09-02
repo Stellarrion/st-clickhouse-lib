@@ -62,7 +62,22 @@ impl Client {
         self
     }
 
-    /// Set connect timeout.
+    /// Set the connect timeout for every new pooled connection.
+    ///
+    /// Each per-address connect attempt — TCP establishment, TLS handshake,
+    /// native handshake, addendum, and the connect-time Ping — must complete
+    /// within `t`; expiry returns
+    /// [`Error::Timeout`](crate::error::Error::Timeout) naming the address and
+    /// the budget, and the address is recorded as failed for failover and the
+    /// circuit breaker exactly like any other connect error. New connections
+    /// and reconnects read the current value at connect time; existing healthy
+    /// connections are not dropped. DNS resolution is not bounded by `t`.
+    ///
+    /// `Duration::ZERO` is rejected with
+    /// [`Error::Config`](crate::error::Error::Config) at connect time. This
+    /// timeout is independent of
+    /// [`with_acquire_timeout`](Self::with_acquire_timeout), which bounds only
+    /// the wait for a free pool slot.
     pub fn with_connect_timeout(mut self, t: Duration) -> Self {
         self.connect_timeout = t;
         self.pool.set_connect_timeout(t);
@@ -114,6 +129,33 @@ impl Client {
     /// are bounded separately by [`Client::with_send_timeout`].
     pub fn with_query_timeout(mut self, t: Duration) -> Self {
         self.query_timeout = Some(t);
+        self
+    }
+
+    /// Set the cumulative response-size budget for accumulating query APIs.
+    ///
+    /// The budget is measured in **decoded block payload bytes**: the sum of
+    /// [`Block::payload_bytes`] over every result block the API retains (for
+    /// raw capture, the summed [`RawBlock::payload_bytes`]). It applies to
+    /// `query(..).blocks()`, `.all()`, `.raw()`, `fetch::<Block>()` /
+    /// `fetch::<RawBlocks>()` / `fetch::<Vec<T>>()`, and each result set of
+    /// `batch()`. A response whose cumulative decoded payload passes the
+    /// limit fails with
+    /// [`Error::ResponseTooLarge`](crate::error::Error::ResponseTooLarge)
+    /// naming the limit; the mid-response socket is discarded and the pool
+    /// reconnects transparently for the next query.
+    ///
+    /// Default: 256 MiB. This bounds client memory when an honest server
+    /// streams a huge result into an accumulating API. Streaming APIs —
+    /// `query(..).rows()` ([`RowCursor`](crate::cursor::RowCursor)) and
+    /// [`BlockStream`](crate::connection::BlockStream) — hand out one block
+    /// at a time and are deliberately **not** budgeted. Pass `usize::MAX` to
+    /// disable the limit.
+    ///
+    /// [`Block::payload_bytes`]: crate::protocol::block::Block::payload_bytes
+    /// [`RawBlock::payload_bytes`]: crate::protocol::block::RawBlock::payload_bytes
+    pub fn with_max_response_size(mut self, size: usize) -> Self {
+        self.max_response_size = size;
         self
     }
 

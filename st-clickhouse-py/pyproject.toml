@@ -3,11 +3,18 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
+# Metadata mirrors st-clickhouse-py/Cargo.toml (name/version/license/description).
+# `version` must stay literal here: .github/workflows/ci.yml (version-check job)
+# parses it with sed and gates releases on Cargo.toml/pyproject.toml agreement.
+# description uses the exact Cargo.toml string to prevent wording drift.
 name = "st-clickhouse-py"
-version = "0.2.0"
-description = "ClickHouse native protocol client — Python bindings"
+version = "0.3.0"
+description = "Python bindings for st-clickhouse — fast, memory-safe ClickHouse native-protocol client"
 readme = "README.md"
-requires-python = ">=3.12,<3.15"
+# abi3-py312 wheels are forward compatible with all future CPython 3.x
+# (including free-threaded 3.14t+ via the separate cp3XXt wheels), so there is
+# no upper bound.
+requires-python = ">=3.12"
 license = "Apache-2.0"
 keywords = ["clickhouse", "database", "native-protocol"]
 classifiers = [
@@ -19,6 +26,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    # Free-threading tier 3 = the officially supported free-threaded build
+    # (CPython 3.14t+); we ship dedicated cp3XXt wheels for it.
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Database :: Front-Ends",
 ]
 

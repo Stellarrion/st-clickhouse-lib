@@ -125,12 +125,10 @@ impl QueryMetricGuard {
 
 impl Drop for QueryMetricGuard {
     fn drop(&mut self) {
-        if self.failed {
-            if let Some(metrics) = self.metrics {
-                metrics
-                    .queries_errors
-                    .fetch_add(self.count, Ordering::Relaxed);
-            }
+        if let Some(metrics) = self.failed.then_some(self.metrics).flatten() {
+            metrics
+                .queries_errors
+                .fetch_add(self.count, Ordering::Relaxed);
         }
     }
 }

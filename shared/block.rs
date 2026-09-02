@@ -13,6 +13,16 @@ pub struct RawBlock {
     pub data: bytes::Bytes,
 }
 
+impl RawBlock {
+    /// Decoded payload bytes of this raw block (the native block body
+    /// length). The unit of the cumulative response budget for raw-capture
+    /// APIs (`query_raw` / `fetch::<RawBlocks>()`), mirroring
+    /// [`Block::payload_bytes`].
+    pub fn payload_bytes(&self) -> usize {
+        self.data.len()
+    }
+}
+
 /// Minimal decoded block structure.
 ///
 /// The actual column data is stored in `columns` and accessed
@@ -217,6 +227,21 @@ impl Block {
         } else {
             &info.data
         }
+    }
+
+    /// Decoded payload bytes of this block: the sum of every column's data
+    /// buffer length plus any pre-materialized LowCardinality buffer.
+    ///
+    /// This is the unit of the client's cumulative response budget
+    /// (`max_response_size`): accumulating query APIs add each retained
+    /// block's `payload_bytes()` to the budget and fail with a
+    /// response-too-large error once it passes the configured limit.
+    /// Streaming APIs do not budget blocks.
+    pub fn payload_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|c| c.data.len() + c.lc_materialized.len())
+            .sum()
     }
 
     /// Convert the block to fully owned data (copies column buffers).

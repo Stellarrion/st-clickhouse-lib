@@ -1,11 +1,12 @@
 use crate::compression::CompressionMethod;
 use crate::connection::io::{compression_flag, ping_stream};
-use crate::connection::query_packet::{build_query_packet_from_cached_or_revision, next_query_id};
+use crate::connection::query_packet::build_query_packet_from_cached_or_revision;
 use crate::connection::response_wait::{drain_response, read_table_structure};
 use crate::connection::tcp::Client;
 use crate::error::Result;
 use crate::metrics::QueryMetricGuard;
 use crate::protocol::block::Block;
+use crate::query_id::next_query_id;
 use crate::runtime::io::AsyncWriteExt;
 use crate::schema::{TableSchema, quote_identifier_path};
 use std::time::Duration;
@@ -46,18 +47,27 @@ impl Client {
             true,
             &[],
         );
-        let stream = guard.stream_mut();
-        if self.ping_before_query {
-            ping_stream(stream).await?;
-        }
-        stream.write_packet(&pkt).await?;
-        stream.flush().await?;
         let response_compressed = compression_flag(self.compression) == 1;
         let deadline = self
             .query_timeout
             .map(|t| crate::runtime::time::Instant::now() + t);
-        let block =
-            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await?;
+        // Mark in-flight before the first packet that can leave a response
+        // pending (the optional pre-query Ping; otherwise the INSERT write): a
+        // future dropped between here and the session's terminal packet must
+        // not hand a mid-response socket back to the pool. Once the session
+        // exists, its `active` flag governs; PoolGuard::drop covers the gap.
+        guard.mark_response_in_flight();
+        let block_result = {
+            let stream = guard.stream_mut();
+            if self.ping_before_query {
+                ping_stream(stream).await?;
+            }
+            stream.write_packet(&pkt).await?;
+            stream.flush().await?;
+            read_table_structure(stream, self.recv_timeout, response_compressed, deadline).await
+        };
+        guard.finish_response(&block_result);
+        let block = block_result?;
         metric_guard.succeed();
         Ok(InsertSession {
             guard,
@@ -69,6 +79,17 @@ impl Client {
             table_name: table.to_owned(),
             schema,
         })
+    }
+}
+
+impl Drop for InsertSession<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            // Async cleanup is impossible in Drop. Closing the socket aborts
+            // the unfinished INSERT and prevents its pending protocol state
+            // from being handed to the next pool user.
+            let _ = self.guard.take_stream();
+        }
     }
 }
 
@@ -101,7 +122,6 @@ impl InsertSession<'_> {
     }
 
     pub async fn end(mut self) -> Result<()> {
-        self.active = false;
         use crate::protocol::block_writer;
         let stream = self.guard.stream_mut();
         let empty = Block {
@@ -119,12 +139,17 @@ impl InsertSession<'_> {
         }
         stream.write_packet(&buf).await?;
         stream.flush().await?;
-        drain_response(
+        let result = drain_response(
             stream,
             self.recv_timeout,
             compression_flag(self.compression) == 1,
             self.deadline,
         )
-        .await
+        .await;
+        if result.is_ok() {
+            self.active = false;
+        }
+        self.guard.finish_response(&result);
+        result
     }
 }

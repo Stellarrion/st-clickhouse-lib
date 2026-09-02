@@ -79,10 +79,12 @@ impl AsyncRead for StreamWrapper {
         }
 
         loop {
-            if this.chunk_pos < this.chunk.len() {
-                let n = buf
-                    .remaining()
-                    .min(this.chunk.len().saturating_sub(this.chunk_pos));
+            // Serve unconsumed *received* payload bytes. Only `chunk_fill`
+            // bytes are real: after `resize(len, 0)` but before the payload
+            // read completes, the tail of `chunk` is still zero-fill and must
+            // never be handed to the protocol parsers.
+            if this.chunk_pos < this.chunk_fill {
+                let n = buf.remaining().min(this.chunk_fill - this.chunk_pos);
                 if n == 0 {
                     return std::task::Poll::Ready(Ok(()));
                 }
@@ -91,37 +93,57 @@ impl AsyncRead for StreamWrapper {
                 return std::task::Poll::Ready(Ok(()));
             }
 
-            this.chunk.clear();
-            this.chunk_pos = 0;
-            this.chunk_fill = 0;
+            // A chunk is in progress while `chunk.len() > 0`: either fully
+            // received and consumed (prepare the next one) or partially
+            // received (fall through and resume the payload read — the 4-byte
+            // length was already consumed and must not be re-read).
+            if !this.chunk.is_empty() && this.chunk_fill == this.chunk.len() {
+                this.chunk.clear();
+                this.chunk_pos = 0;
+                this.chunk_fill = 0;
+            }
 
-            while this.len_pos < this.len_buf.len() {
-                let before = this.len_buf.len() - this.len_pos;
-                let mut len_read = ReadBuf::new(&mut this.len_buf[this.len_pos..]);
-                match poll_inner_read(&mut this.inner, cx, &mut len_read) {
-                    std::task::Poll::Ready(Ok(())) => {
-                        let n = before - len_read.remaining();
-                        if n == 0 {
-                            return std::task::Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF while reading chunk length",
-                            )));
-                        }
-                        this.record_bytes(n);
-                        this.len_pos += n;
-                    },
-                    std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                    std::task::Poll::Pending => return std::task::Poll::Pending,
+            if this.chunk.is_empty() {
+                while this.len_pos < this.len_buf.len() {
+                    let before = this.len_buf.len() - this.len_pos;
+                    let mut len_read = ReadBuf::new(&mut this.len_buf[this.len_pos..]);
+                    match poll_inner_read(&mut this.inner, cx, &mut len_read) {
+                        std::task::Poll::Ready(Ok(())) => {
+                            let n = before - len_read.remaining();
+                            if n == 0 {
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "unexpected EOF while reading chunk length",
+                                )));
+                            }
+                            this.record_bytes(n);
+                            this.len_pos += n;
+                        },
+                        std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    }
                 }
+
+                let len = u32::from_le_bytes(this.len_buf) as usize;
+                this.len_pos = 0;
+                if len == 0 {
+                    continue;
+                }
+                // The chunk length is server-controlled; validate it before the
+                // resize so a 4-byte header cannot drive a multi-GiB allocation.
+                if len > crate::limits::MAX_CHUNK_LEN {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "chunked transport chunk length {len} exceeds maximum {}",
+                            crate::limits::MAX_CHUNK_LEN
+                        ),
+                    )));
+                }
+
+                this.chunk.resize(len, 0);
             }
 
-            let len = u32::from_le_bytes(this.len_buf) as usize;
-            this.len_pos = 0;
-            if len == 0 {
-                continue;
-            }
-
-            this.chunk.resize(len, 0);
             while this.chunk_fill < this.chunk.len() {
                 let before = this.chunk.len() - this.chunk_fill;
                 let mut chunk_read = ReadBuf::new(&mut this.chunk[this.chunk_fill..]);
@@ -163,6 +185,24 @@ fn read_buffered(
     this: &mut StreamWrapper, cx: &mut std::task::Context<'_>,
     buf: &mut crate::runtime::io::ReadBuf<'_>,
 ) -> std::task::Poll<std::io::Result<()>> {
+    // Large-read fast path: when the caller wants at least a full window and
+    // no prefetched bytes are pending, read straight into the caller's buffer
+    // instead of bouncing through the 8 KiB window (mirrors std BufReader).
+    // Chunked receive never reaches this function — poll_read routes it to
+    // its own frame-serving loop above.
+    if this.rd_pos == this.rd_fill && buf.remaining() >= this.rd_buf.len() {
+        let before = buf.remaining();
+        return match poll_inner_read(&mut this.inner, cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let n = before - buf.remaining();
+                if n > 0 {
+                    this.record_bytes(n);
+                }
+                std::task::Poll::Ready(Ok(()))
+            },
+            other => other,
+        };
+    }
     loop {
         if this.rd_pos < this.rd_fill {
             let n = buf.remaining().min(this.rd_fill - this.rd_pos);
@@ -332,6 +372,15 @@ impl StreamWrapper {
             StreamInner::Tls(s) => Some(s.get_ref().0),
         }
     }
+
+    /// Whether writing a single raw `Cancel` byte straight to the socket would
+    /// be wire-correct: plain TCP transport with chunked sending disabled.
+    /// TLS-wrapped streams need TLS records and chunked transports need
+    /// length framing — a synchronous `Drop` can provide neither, so those
+    /// connections must simply be closed instead.
+    pub(crate) fn can_raw_cancel(&self) -> bool {
+        !self.use_chunked_send && matches!(self.inner, StreamInner::Tcp(_))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +398,13 @@ pub(crate) struct Connection {
     pub(crate) last_used_at: crate::runtime::time::Instant,
     /// Pool configuration generation this connection was opened with.
     config_generation: u64,
+    /// A query response is pending: the query packet was written but no
+    /// terminal packet (EndOfStream or the end of an Exception chain) has
+    /// been read yet. Only the task holding the pool guard touches this flag,
+    /// so a plain `bool` needs no synchronization: when that task's future is
+    /// dropped mid-response, `PoolGuard::drop` discards the socket instead of
+    /// returning a stream parked mid-response to the pool.
+    response_in_flight: bool,
 }
 
 struct RawConnectConfig<'a> {
@@ -357,6 +413,10 @@ struct RawConnectConfig<'a> {
     password: &'a str,
     database: &'a str,
     quota_key: &'a str,
+    /// Budget for the whole per-address connect: TCP + TLS + native
+    /// handshake + addendum + ping. `None` = unbounded (OS defaults).
+    /// DNS resolution is not covered — addresses arrive pre-resolved.
+    connect_timeout: Option<std::time::Duration>,
     send_timeout: Option<std::time::Duration>,
     ssh_signer: Option<&'a handshake::SshSigner>,
     #[cfg(feature = "tokio-tls")]
@@ -366,8 +426,31 @@ struct RawConnectConfig<'a> {
 }
 
 /// Create a new connection: TCP connect → handshake → addendum → ping.
+///
+/// The whole per-address future is bounded by `config.connect_timeout` (when
+/// set): expiry cancels the in-flight setup and returns
+/// [`Error::Timeout`](crate::error::Error::Timeout) naming the address and the
+/// budget, so a server that accepts TCP and never sends Hello cannot hang the
+/// pool. `None` keeps the unbounded OS default. The caller
+/// (`SimplePool::connect_round_robin`) rejects a zero timeout up front.
 #[tracing::instrument(level = "debug", skip_all, fields(addr = %config.addr), name = "clickhouse.connect")]
 async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
+    let addr = config.addr;
+    match config.connect_timeout {
+        Some(budget) => {
+            match crate::runtime::time::timeout(budget, connect_raw_inner(config)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(crate::error::Error::Timeout(format!(
+                    "connect to {addr} (TCP + TLS + handshake + ping) timed out after {budget:?}"
+                ))),
+            }
+        },
+        None => connect_raw_inner(config).await,
+    }
+}
+
+/// Unbounded per-address connect: TCP connect → TLS → handshake → addendum → ping.
+async fn connect_raw_inner(config: RawConnectConfig<'_>) -> Result<Connection> {
     let addr = config.addr;
     let raw = crate::runtime::net::TcpStream::connect(addr).await?;
     configure_tcp(&raw);
@@ -451,6 +534,7 @@ async fn connect_raw(config: RawConnectConfig<'_>) -> Result<Connection> {
         created_at: crate::runtime::time::Instant::now(),
         last_used_at: crate::runtime::time::Instant::now(),
         config_generation: 0,
+        response_in_flight: false,
     })
 }
 
@@ -689,7 +773,14 @@ impl SimplePool {
         }
     }
 
-    /// Set connect timeout.
+    /// Set the connect timeout applied to each per-address connect attempt
+    /// (TCP + TLS + native handshake + addendum + ping) in
+    /// [`SimplePool::get`](Self::get). New connections and reconnects read the
+    /// current value at connect time. DNS resolution is not bounded by it.
+    ///
+    /// [`Duration::ZERO`] is invalid and rejected at connect time with
+    /// [`Error::Config`](crate::error::Error::Config) — it cannot mean "no
+    /// deadline". Use `None` (the default) for the unbounded OS behaviour.
     pub(crate) fn set_connect_timeout(&mut self, t: Duration) {
         self.connect_timeout = Some(t);
     }
@@ -767,6 +858,16 @@ impl SimplePool {
                 "no addresses configured".into(),
             ));
         }
+        // A zero budget is deterministic misconfiguration: fail before any
+        // address is tried so it is never retried or recorded as a dead
+        // address by the circuit breaker.
+        if let Some(t) = self.connect_timeout
+            && t.is_zero()
+        {
+            return Err(crate::error::Error::Config(
+                "connect_timeout must be greater than zero; Duration::ZERO would remove the connect deadline".into(),
+            ));
+        }
         // Periodically re-resolve DNS to discover new cluster nodes
         self.refresh_dns().await;
 
@@ -799,6 +900,7 @@ impl SimplePool {
                 password: &self.password,
                 database: &self.database,
                 quota_key: &self.quota_key,
+                connect_timeout: self.connect_timeout,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
                 tls_config: self.tls_config.clone(),
@@ -812,6 +914,7 @@ impl SimplePool {
                 password: &self.password,
                 database: &self.database,
                 quota_key: &self.quota_key,
+                connect_timeout: self.connect_timeout,
                 send_timeout: self.send_timeout,
                 ssh_signer: self.ssh_signer.as_ref(),
             })
@@ -858,21 +961,44 @@ impl SimplePool {
     /// Acquire a connection slot. Waits if all slots are busy.
     #[tracing::instrument(level = "debug", skip_all, fields(slots = self.slots.len()), name = "clickhouse.pool.acquire")]
     pub(crate) async fn get(&self) -> Result<PoolGuard<'_>> {
+        // Entry timestamp for acquire_timeout: the budget is measured across
+        // the try-lock sweep below and the final slot wait.
+        let entered = Instant::now();
         // Round-robin slot selection
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        let mut slot_guard = match self.acquire_timeout {
-            Some(t) => match crate::runtime::time::timeout(t, self.slots[idx].lock()).await {
-                Ok(g) => g,
-                Err(_) => {
-                    if let Some(m) = self.metrics {
-                        m.connection_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Err(crate::error::Error::PoolTimeout(format!(
-                        "no connection slot available within {t:?}"
-                    )));
-                },
+        // Try-lock sweep from the assigned slot: a busy assigned slot no longer
+        // head-of-line blocks the acquire when other slots are free — take the
+        // first free one instead. When the pool is idle the sweep takes exactly
+        // the assigned slot, so round-robin fairness is unchanged. Locked slots
+        // are skipped: they are busy with live queries.
+        let swept = (0..self.slots.len())
+            .map(|i| (idx + i) % self.slots.len())
+            .find_map(|i| self.slots[i].try_lock().ok());
+        let mut slot_guard = match swept {
+            Some(guard) => guard,
+            None => {
+                // All slots busy — await the originally assigned slot. The
+                // acquire timeout keeps its original meaning: it is measured
+                // from get() entry, across the sweep and this wait.
+                match self.acquire_timeout {
+                    Some(t) => {
+                        let remaining = t.saturating_sub(entered.elapsed());
+                        match crate::runtime::time::timeout(remaining, self.slots[idx].lock()).await
+                        {
+                            Ok(g) => g,
+                            Err(_) => {
+                                if let Some(m) = self.metrics {
+                                    m.connection_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                                return Err(crate::error::Error::PoolTimeout(format!(
+                                    "no connection slot available within {t:?}"
+                                )));
+                            },
+                        }
+                    },
+                    None => self.slots[idx].lock().await,
+                }
             },
-            None => self.slots[idx].lock().await,
         };
         if slot_guard.is_none() {
             *slot_guard = Some(self.connect_round_robin().await?);
@@ -937,14 +1063,16 @@ impl Drop for SimplePool {
         // Best-effort shutdown: acquire each slot and close the stream.
         // If a slot is locked, skip it (non-blocking shutdown).
         for slot in &self.slots {
-            if let Ok(guard) = slot.try_lock() {
-                if let Some(ref conn) = *guard {
-                    // Send Cancel packet to gracefully close server-side query
-                    if let Some(tcp) = conn.stream.raw_tcp() {
-                        let _: std::io::Result<usize> =
-                            tcp.try_write(&[ClientPacket::Cancel as u8]);
-                    }
-                }
+            if let Ok(guard) = slot.try_lock()
+                // Send Cancel only when a single raw byte is exactly what the
+                // wire expects: plain TCP with chunked sending off. A raw byte
+                // through TLS or chunked framing would be protocol garbage, so
+                // those sockets are just closed (dropped) instead.
+                && let Some(ref conn) = *guard
+                && conn.stream.can_raw_cancel()
+                && let Some(tcp) = conn.stream.raw_tcp()
+            {
+                let _: std::io::Result<usize> = tcp.try_write(&[ClientPacket::Cancel as u8]);
             }
         }
         self.user.zeroize();
@@ -1023,12 +1151,63 @@ impl<'a> PoolGuard<'a> {
             let _ = self.take_stream();
         }
     }
+
+    /// Mark that a query response is now in flight. Call before the first
+    /// response-triggering packet write (the query packet); if the owning
+    /// future is then dropped before its terminal packet is read,
+    /// [`PoolGuard::drop`] discards the socket.
+    pub(crate) fn mark_response_in_flight(&mut self) {
+        if let Some(conn) = self._guard.as_mut() {
+            conn.response_in_flight = true;
+        }
+    }
+
+    /// Whether a query response is still pending on this connection.
+    pub(crate) fn response_in_flight(&self) -> bool {
+        self._guard
+            .as_ref()
+            .is_some_and(|conn| conn.response_in_flight)
+    }
+
+    /// Clear the in-flight mark without discarding the connection. Call once
+    /// the owning future has resolved its response cycle (a terminal packet —
+    /// EndOfStream or the end of an Exception chain — was read, or the cycle
+    /// ended with a non-fatal error such as a server exception).
+    pub(crate) fn clear_response_in_flight(&mut self) {
+        if let Some(conn) = self._guard.as_mut() {
+            conn.response_in_flight = false;
+        }
+    }
+
+    /// Finish a response cycle: clear the in-flight mark, then discard the
+    /// socket when the result is connection-fatal. Call exactly once, after
+    /// the future that reads the response has resolved.
+    pub(crate) fn finish_response<T>(&mut self, result: &crate::error::Result<T>) {
+        self.clear_response_in_flight();
+        self.invalidate_on_err(result);
+    }
 }
 
 impl Drop for PoolGuard<'_> {
     fn drop(&mut self) {
         if let Some(metrics) = self.metrics {
             metrics.pool_in_use.fetch_sub(1, Ordering::Relaxed);
+        }
+        // A still-marked connection never saw its terminal packet: the owning
+        // future was dropped mid-response (cancellation at an await point).
+        // Discard the socket — the slot becomes `None` and the next `get()`
+        // reconnects — instead of handing the next pool user a stream parked
+        // mid-response, which would surface as a bogus Protocol error and
+        // poison the slot until an idle Ping eventually failed.
+        //
+        // Race analysis: the flag is owned exclusively by the task holding
+        // this guard, so no other task can flip it concurrently. The window
+        // between reading the terminal packet and `finish_response` clearing
+        // the mark can, at worst, cause a needless discard of an already
+        // clean connection (one extra reconnect) — never a poisoned reuse.
+        if self.response_in_flight() {
+            let _ = self.take_stream();
+            return;
         }
         // Record when this connection went back to idle so the next acquire
         // can decide whether a liveness Ping is warranted.
@@ -1103,6 +1282,17 @@ mod tests {
         assert_eq!(pool.send_timeout, Some(Duration::from_secs(10)));
         pool.set_send_timeout(None);
         assert!(pool.send_timeout.is_none());
+    }
+
+    #[test]
+    fn test_set_connect_timeout() {
+        let addr = "127.0.0.1:9000"
+            .parse::<std::net::SocketAddr>()
+            .expect("test operation failed");
+        let mut pool = SimplePool::new(vec![addr], 1);
+        assert!(pool.connect_timeout.is_none(), "default is unbounded");
+        pool.set_connect_timeout(Duration::from_secs(2));
+        assert_eq!(pool.connect_timeout, Some(Duration::from_secs(2)));
     }
 
     #[test]
@@ -1262,6 +1452,200 @@ mod tests {
         assert_eq!(pool.slot_count(), 5);
     }
 
+    /// Bind a local listener that accepts connections and then stays silent —
+    /// a server that never sends its Hello.
+    async fn silent_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        crate::runtime::spawn(async move {
+            // Accept and hold every connection open without writing anything.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    fn refused_addr() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind refused-port probe");
+        let addr = listener.local_addr().expect("refused-port address");
+        drop(listener);
+        addr
+    }
+
+    /// A silent server must trip the connect timeout — covering TCP accept,
+    /// handshake, addendum, and ping — long before anything else could save
+    /// it, leaving the slot `None` and the address recorded as failed.
+    #[tokio::test]
+    async fn test_connect_timeout_bounds_silent_server() {
+        let addr = silent_listener().await;
+        let mut pool = SimplePool::new(vec![addr], 1);
+        pool.set_connect_timeout(Duration::from_millis(200));
+
+        let start = Instant::now();
+        let err = match pool.get().await {
+            Ok(_) => unreachable!("silent server must not yield a connection"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+
+        match &err {
+            crate::error::Error::Timeout(msg) => {
+                assert!(
+                    msg.contains(&addr.to_string()),
+                    "message must name the address: {msg}"
+                );
+                assert!(msg.contains("200ms"), "message must name the budget: {msg}");
+            },
+            other => unreachable!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "connect timeout must fire in ~200ms, took {elapsed:?}"
+        );
+        // Slot stays empty: the next acquire starts from scratch.
+        assert!(
+            pool.slots[0].try_lock().expect("slot lockable").is_none(),
+            "failed connect must leave the slot None"
+        );
+        // The circuit breaker saw the failure.
+        assert_eq!(pool.failure_counts.lock().get(&addr), Some(&1));
+        assert!(pool.dead_addrs.lock().contains_key(&addr));
+    }
+
+    /// Fast network errors (connection refused) keep their I/O identity — the
+    /// connect timeout must not convert them into Timeout — and failover moves
+    /// on to the next address.
+    #[tokio::test]
+    async fn test_connect_timeout_failover_keeps_io_error_identity() {
+        let refused = refused_addr();
+        let silent = silent_listener().await;
+        let mut pool = SimplePool::new(vec![refused, silent], 1);
+        pool.set_connect_timeout(Duration::from_millis(200));
+
+        let err = match pool.get().await {
+            Ok(_) => unreachable!("no address here can complete a handshake"),
+            Err(e) => e,
+        };
+        // The final error is the silent address timing out, not the refusal.
+        match &err {
+            crate::error::Error::Timeout(msg) => {
+                assert!(
+                    msg.contains(&silent.to_string()),
+                    "message must name the address: {msg}"
+                );
+            },
+            other => unreachable!("expected Timeout from the silent address, got {other:?}"),
+        }
+        // Both attempts were recorded by the circuit breaker.
+        assert_eq!(pool.failure_counts.lock().get(&refused), Some(&1));
+        assert_eq!(pool.failure_counts.lock().get(&silent), Some(&1));
+        assert!(pool.dead_addrs.lock().contains_key(&refused));
+        assert!(pool.dead_addrs.lock().contains_key(&silent));
+    }
+
+    /// `Duration::ZERO` is deterministic misconfiguration: rejected as Config
+    /// before any address is tried, never retried, never marked dead.
+    #[tokio::test]
+    async fn test_connect_timeout_zero_rejected_as_config() {
+        let addr = silent_listener().await;
+        let mut pool = SimplePool::new(vec![addr], 1);
+        pool.set_connect_timeout(Duration::ZERO);
+
+        let err = match pool.get().await {
+            Ok(_) => unreachable!("zero connect_timeout must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::error::Error::Config(ref msg) if msg.contains("connect_timeout")),
+            "expected Config error, got {err:?}"
+        );
+        assert!(
+            pool.failure_counts.lock().is_empty(),
+            "config errors are not failures"
+        );
+        assert!(
+            pool.dead_addrs.lock().is_empty(),
+            "config errors must not mark addresses dead"
+        );
+    }
+
+    /// Server-free proof that a hostile `u32::MAX` chunk header is rejected by
+    /// the inbound chunk cap before any buffer is sized: the read must fail
+    /// with `InvalidData` naming the chunk length, never attempt a 4 GiB
+    /// resize (the old behaviour).
+    #[tokio::test]
+    async fn test_chunked_recv_rejects_oversized_chunk_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept client");
+            use tokio::io::AsyncWriteExt as _;
+            sock.write_all(&u32::MAX.to_le_bytes())
+                .await
+                .expect("send hostile chunk header");
+            // Keep the socket open so the client sees data, not EOF.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to test listener");
+        let mut wrapper = StreamWrapper::tcp(stream);
+        wrapper.set_chunked(false, true);
+
+        let mut buf = [0u8; 16];
+        let err = wrapper
+            .read(&mut buf)
+            .await
+            .expect_err("oversized chunk header must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("chunk length"),
+            "expected chunk length error, got: {err}"
+        );
+        server.abort();
+    }
+
+    /// The chunk cap keeps the happy path intact: a small well-formed chunk
+    /// still decodes through the chunked receive mode.
+    #[tokio::test]
+    async fn test_chunked_recv_still_reads_small_chunk() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept client");
+            use tokio::io::AsyncWriteExt as _;
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&3u32.to_le_bytes());
+            wire.extend_from_slice(b"abc");
+            wire.extend_from_slice(&0u32.to_le_bytes());
+            sock.write_all(&wire).await.expect("send chunk");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to test listener");
+        let mut wrapper = StreamWrapper::tcp(stream);
+        wrapper.set_chunked(false, true);
+
+        let mut buf = [0u8; 8];
+        let n = wrapper
+            .read(&mut buf)
+            .await
+            .expect("small chunk must decode");
+        assert_eq!(&buf[..n], b"abc");
+        server.abort();
+    }
+
     /// Server-free proof that `get()` honours `acquire_timeout`: hold the only
     /// slot from the test, so `get()` cannot acquire it and must time out.
     /// The outer probe bound makes RED fail fast instead of hanging.
@@ -1279,6 +1663,170 @@ mod tests {
         assert!(
             matches!(res, Ok(Err(crate::error::Error::PoolTimeout(_)))),
             "expected PoolTimeout, got Ok(connection), other error, or probe elapsed"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // In-flight (drop-mid-response) pool safety
+    // -----------------------------------------------------------------
+
+    /// A connection for server-free guard tests: real socket (held open by the
+    /// silent listener), placeholder server info.
+    async fn test_connection() -> Connection {
+        let addr = silent_listener().await;
+        let stream = crate::runtime::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to silent listener");
+        Connection {
+            stream: StreamWrapper::tcp(stream),
+            server_info: handshake::ServerInfo {
+                name: "test".into(),
+                version_major: 26,
+                version_minor: 7,
+                version_patch: 1,
+                revision: 54471,
+                negotiated_revision: 54471,
+                timezone: "UTC".into(),
+                display_name: "test".into(),
+                server_parallel_replicas_protocol_version: 7,
+                proto_send_chunked_srv: String::new(),
+                proto_recv_chunked_srv: String::new(),
+                password_complexity_rules: Vec::new(),
+                interserver_secret_nonce: None,
+                server_query_plan_serialization_version: None,
+                worker_cluster_function_protocol_version: 0,
+                chunked_send: String::new(),
+                chunked_recv: String::new(),
+            },
+            created_at: crate::runtime::time::Instant::now(),
+            last_used_at: crate::runtime::time::Instant::now(),
+            config_generation: 0,
+            response_in_flight: false,
+        }
+    }
+
+    /// Server-free proof of the drop-mid-response contract: a guard dropped
+    /// while its connection is marked in-flight must empty the slot (the next
+    /// `get()` reconnects), while a clean guard returns the connection.
+    #[tokio::test]
+    async fn guard_drop_discards_marked_in_flight_connection() {
+        let slot = AsyncMutex::new(Some(test_connection().await));
+        {
+            let guard = slot.lock().await;
+            let mut guard = PoolGuard {
+                _guard: guard,
+                metrics: None,
+            };
+            guard.mark_response_in_flight();
+            assert!(
+                guard.response_in_flight(),
+                "mark must set the in-flight flag"
+            );
+        }
+        assert!(
+            slot.try_lock().expect("slot lockable").is_none(),
+            "dropping an in-flight guard must discard the mid-response connection"
+        );
+
+        // Clean counterpart: no mark, no discard — the connection is reused.
+        let slot = AsyncMutex::new(Some(test_connection().await));
+        {
+            let guard = slot.lock().await;
+            let guard = PoolGuard {
+                _guard: guard,
+                metrics: None,
+            };
+            assert!(!guard.response_in_flight());
+        }
+        assert!(
+            slot.try_lock().expect("slot lockable").is_some(),
+            "a clean guard drop must keep the connection for reuse"
+        );
+    }
+
+    /// `finish_response` clears the mark (a resolved response cycle can never
+    /// trigger the discard) and still discards only on connection-fatal
+    /// errors: a server exception is terminal, so that socket stays pooled.
+    #[tokio::test]
+    async fn finish_response_clears_mark_and_keeps_terminal_connections() {
+        // Ok result: mark cleared, connection kept.
+        let slot = AsyncMutex::new(Some(test_connection().await));
+        {
+            let guard = slot.lock().await;
+            let mut guard = PoolGuard {
+                _guard: guard,
+                metrics: None,
+            };
+            guard.mark_response_in_flight();
+            guard.finish_response(&Ok::<(), crate::error::Error>(()));
+            assert!(!guard.response_in_flight());
+        }
+        assert!(slot.try_lock().expect("slot lockable").is_some());
+
+        // Server exception: terminal packet read — mark cleared, kept.
+        let slot = AsyncMutex::new(Some(test_connection().await));
+        {
+            let guard = slot.lock().await;
+            let mut guard = PoolGuard {
+                _guard: guard,
+                metrics: None,
+            };
+            guard.mark_response_in_flight();
+            guard.finish_response(&Err::<(), _>(crate::error::Error::ServerError {
+                code: 159,
+                name: "DB::Exception".into(),
+                message: "cancelled".into(),
+            }));
+            assert!(!guard.response_in_flight());
+        }
+        assert!(
+            slot.try_lock().expect("slot lockable").is_some(),
+            "a terminal server exception must keep the connection pooled"
+        );
+
+        // I/O failure: broken connection — discarded.
+        let slot = AsyncMutex::new(Some(test_connection().await));
+        {
+            let guard = slot.lock().await;
+            let mut guard = PoolGuard {
+                _guard: guard,
+                metrics: None,
+            };
+            guard.mark_response_in_flight();
+            guard.finish_response(&Err::<(), _>(crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            ))));
+        }
+        assert!(
+            slot.try_lock().expect("slot lockable").is_none(),
+            "a connection-fatal result must discard the socket"
+        );
+    }
+
+    /// `can_raw_cancel` gates the pool-drop Cancel byte on the only transport
+    /// where a single raw byte is wire-correct: plain TCP, chunked send off.
+    /// (Chunked recv only affects inbound framing and must not matter.)
+    #[tokio::test]
+    async fn can_raw_cancel_only_for_plain_non_chunked_send() {
+        let addr = silent_listener().await;
+        let stream = crate::runtime::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to silent listener");
+        let mut wrapper = StreamWrapper::tcp(stream);
+        assert!(
+            wrapper.can_raw_cancel(),
+            "plain non-chunked TCP accepts a raw Cancel byte"
+        );
+        wrapper.set_chunked(true, true);
+        assert!(
+            !wrapper.can_raw_cancel(),
+            "chunked send framing must not take a raw Cancel byte"
+        );
+        wrapper.set_chunked(false, true);
+        assert!(
+            wrapper.can_raw_cancel(),
+            "chunked recv must not affect outbound framing"
         );
     }
 }

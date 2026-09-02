@@ -91,6 +91,9 @@ ignore = [
 allow = [
     "MIT",
     "Apache-2.0",
+    # target-lexicon (pyo3 build dep) uses the LLVM exception; permissive,
+    # OSI-recognized, same family as Apache-2.0.
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "CDLA-Permissive-2.0",
     "ISC",

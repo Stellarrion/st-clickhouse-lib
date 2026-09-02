@@ -14,14 +14,21 @@ impl Client {
         let mut guard = self.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
         let pkt = crate::protocol::table_status::build_tables_status_request(tables, rev)?;
-        let stream = guard.stream_mut();
-        stream.write_packet(&pkt).await?;
-        stream.flush().await?;
+        // Mark in-flight before the write that triggers the response: a future
+        // dropped before the terminal packet must not hand a mid-response
+        // socket back to the pool.
+        guard.mark_response_in_flight();
+        let result = async {
+            let stream = guard.stream_mut();
+            stream.write_packet(&pkt).await?;
+            stream.flush().await?;
 
-        loop {
-            let typ =
-                match crate::runtime::time::timeout(self.recv_timeout, read_varint_async(stream))
-                    .await
+            loop {
+                let typ = match crate::runtime::time::timeout(
+                    self.recv_timeout,
+                    read_varint_async(stream),
+                )
+                .await
                 {
                     Ok(result) => result?,
                     Err(_) => {
@@ -31,13 +38,17 @@ impl Client {
                         )));
                     },
                 };
-            match typ {
-                2 => return Err(read_exception(stream).await?),
-                4 => continue,
-                9 => return read_tables_status_response(stream, rev).await,
-                _ => return Err(unsupported_server_packet(stream, typ).await?),
+                match typ {
+                    2 => return Err(read_exception(stream).await?),
+                    4 => continue,
+                    9 => return read_tables_status_response(stream, rev).await,
+                    _ => return Err(unsupported_server_packet(stream, typ).await?),
+                }
             }
         }
+        .await;
+        guard.finish_response(&result);
+        result
     }
 
     /// Request status for one table. Missing tables return `Ok(None)`.

@@ -31,7 +31,7 @@ fn time<F: FnMut()>(label: &str, mut f: F) {
 
 fn main() -> st_clickhouse::Result<()> {
     let buf: Vec<u8> = (0u64..COUNT as u64).flat_map(|v| v.to_le_bytes()).collect();
-    let aligned = (buf.as_ptr() as usize) % 8 == 0;
+    let aligned = (buf.as_ptr() as usize).is_multiple_of(8);
 
     // Decode once: read_column is a zero-copy slice borrow.
     let mut ctx = ReadColumnContext::new(COUNT, &buf);
@@ -40,7 +40,9 @@ fn main() -> st_clickhouse::Result<()> {
     let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u64, COUNT) };
     // AnyColumnData::UInt64 — what `read_all`/cursor pre-extracts; `to_typed` is
     // the per-row accessor the row-materialization fast path actually calls.
-    let any = AnyColumnData::UInt64(PlainColumnData::<u64>::read_from_bytes(&buf, COUNT));
+    let any = AnyColumnData::UInt64(
+        PlainColumnData::<u64>::read_from_bytes(&buf, COUNT).expect("bench buffer sized for COUNT"),
+    );
 
     println!(
         "uint64: {COUNT} elems ({}B), buf 8-aligned={aligned}. Column decoded once; access-only below.\n",

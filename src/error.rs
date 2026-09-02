@@ -28,6 +28,22 @@ pub enum Error {
     Config(String),
     /// A pool slot could not be acquired within `acquire_timeout`.
     PoolTimeout(String),
+    /// An accumulating query result exceeded the configured response-size
+    /// budget (`max_response_size`).
+    ///
+    /// The cumulative decoded payload bytes of the result blocks passed the
+    /// limit set by `Client::with_max_response_size` (async engine; the sync
+    /// engine reads it from `ClientConfig::max_response_size`). The read stops
+    /// at a block boundary and the mid-response socket is discarded; the next
+    /// query on the pool reconnects. Raise the limit, or switch to a
+    /// streaming API (`Client::query(..).rows()` / `BlockStream`), which is
+    /// not size-budgeted.
+    ResponseTooLarge {
+        /// The configured budget in bytes.
+        limit: usize,
+        /// Decoded payload bytes accumulated when the limit was exceeded.
+        received: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -48,6 +64,12 @@ impl fmt::Display for Error {
             Error::ConnectionClosed(msg) => write!(f, "connection closed: {msg}"),
             Error::Config(msg) => write!(f, "configuration error: {msg}"),
             Error::PoolTimeout(msg) => write!(f, "pool acquire timeout: {msg}"),
+            Error::ResponseTooLarge { limit, received } => write!(
+                f,
+                "response too large: decoded {received} bytes of result blocks exceeds \
+                 max_response_size {limit}; raise Client::with_max_response_size, or use a \
+                 streaming API (rows()/BlockStream) which is not size-budgeted"
+            ),
         }
     }
 }
@@ -90,25 +112,41 @@ impl Error {
         )
     }
 
-    /// Returns `true` if the error means the socket is broken and the
-    /// connection must not be reused (forced close or I/O failure).
+    /// Returns `true` if the socket must not be reused.
     ///
-    /// Excludes query timeouts: a query deadline cancels+drains server-side and
-    /// returns the connection to the pool still usable.
+    /// Query timeouts are connection-fatal too: cancellation is bounded and a
+    /// partially drained response must never return to the pool. A
+    /// response-too-large breach aborts the read mid-response, so that socket
+    /// is discarded as well.
     pub fn is_broken_connection(&self) -> bool {
-        matches!(self, Error::ConnectionClosed(_) | Error::Io(_))
+        matches!(
+            self,
+            Error::ConnectionClosed(_)
+                | Error::Io(_)
+                | Error::Timeout(_)
+                | Error::ResponseTooLarge { .. }
+        )
     }
 
     /// Returns `true` if the error is retryable (connection issues, timeouts).
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Error::Io(_)
-                | Error::Timeout(_)
-                | Error::ConnectionClosed(_)
-                | Error::Protocol(_)
-                | Error::PoolTimeout(_)
+            Error::Io(_) | Error::Timeout(_) | Error::ConnectionClosed(_) | Error::PoolTimeout(_)
         )
+    }
+}
+
+impl Error {
+    /// Build the budget-breach error from an internal
+    /// [`crate::limits::ResponseBudget`] after a failed `charge`, reporting
+    /// the configured limit and the decoded total at breach.
+    #[cfg_attr(not(feature = "tokio"), expect(dead_code))]
+    pub(crate) fn response_budget_exceeded(budget: &crate::limits::ResponseBudget) -> Self {
+        Error::ResponseTooLarge {
+            limit: budget.limit(),
+            received: budget.used(),
+        }
     }
 }
 
@@ -130,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn broken_connection_is_io_or_closed_not_timeout() {
+    fn broken_connection_includes_timeouts() {
         assert!(
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
@@ -139,8 +177,51 @@ mod tests {
             .is_broken_connection()
         );
         assert!(Error::ConnectionClosed("server closed".into()).is_broken_connection());
-        // A query timeout cancels+drains and leaves the connection usable.
-        assert!(!Error::Timeout("query exceeded deadline".into()).is_broken_connection());
+        assert!(Error::Timeout("query exceeded deadline".into()).is_broken_connection());
+        assert!(
+            Error::ResponseTooLarge {
+                limit: 16,
+                received: 17
+            }
+            .is_broken_connection(),
+            "a mid-response budget breach must discard the socket"
+        );
+    }
+
+    #[test]
+    fn response_too_large_is_not_retried_and_names_the_limit() {
+        let e = Error::ResponseTooLarge {
+            limit: 1024,
+            received: 2048,
+        };
+        assert!(
+            !e.is_retryable(),
+            "a deterministic budget breach must not be retried"
+        );
+        assert!(!e.is_timeout());
+        assert!(
+            e.to_string().contains("max_response_size 1024"),
+            "error must name the limit: {e}"
+        );
+        assert!(
+            e.to_string().contains("with_max_response_size"),
+            "error must say how to raise the limit: {e}"
+        );
+    }
+
+    #[test]
+    fn response_budget_exceeded_reports_limit_and_decoded_total() {
+        let mut budget = crate::limits::ResponseBudget::new(1024);
+        budget.charge(600).expect("within budget");
+        budget.charge(600).expect_err("breach");
+        let e = Error::response_budget_exceeded(&budget);
+        match e {
+            Error::ResponseTooLarge { limit, received } => {
+                assert_eq!(limit, 1024);
+                assert_eq!(received, 1200);
+            },
+            other => unreachable!("expected ResponseTooLarge, got {other:?}"),
+        }
     }
 
     #[test]
@@ -148,6 +229,11 @@ mod tests {
         let e = Error::PoolTimeout("no slot".into());
         assert!(e.is_retryable(), "PoolTimeout must stay retryable");
         assert!(!e.is_timeout(), "PoolTimeout must NOT match is_timeout");
+    }
+
+    #[test]
+    fn protocol_errors_are_not_retried() {
+        assert!(!Error::Protocol("deterministic decode failure".into()).is_retryable());
     }
 
     #[test]

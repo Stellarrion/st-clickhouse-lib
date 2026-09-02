@@ -1,22 +1,14 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use st_clickhouse::protocol::wire;
+use st_clickhouse::fuzz_hooks::parse_exception_chain;
 
 fuzz_target!(|data: &[u8]| {
-    // Exception chain: code(varint) + name(string) + message(string) + stack_trace(string)
-    // + has_nested(varint) + nested_exception...
-    let mut c = std::io::Cursor::new(data);
-    for _ in 0..5 {
-        // code
-        if wire::read_varint(&mut c).is_err() { break; }
-        // name
-        if wire::read_string(&mut c).is_err() { break; }
-        // message
-        if wire::read_string(&mut c).is_err() { break; }
-        // stack_trace
-        if wire::read_string(&mut c).is_err() { break; }
-        // has_nested
-        if wire::read_varint(&mut c).is_err() { break; }
-    }
+    // Drive the real sync exception-chain parser: per level an i32 LE code,
+    // name/message/stack_trace length-prefixed strings, and a 1-byte
+    // has_nested flag that chains the next level. Any input — truncated,
+    // corrupt, or deeper than the MAX_EXCEPTION_CHAIN_DEPTH cap — must
+    // terminate with a Result, never panic, hang, or over-allocate.
+    let mut pos = 0usize;
+    let _ = parse_exception_chain(data, &mut pos);
 });

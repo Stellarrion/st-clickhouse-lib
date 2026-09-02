@@ -3,7 +3,7 @@ name = "st-clickhouse-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [package.metadata]
 cargo-fuzz = true
@@ -11,7 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.st-clickhouse]
+[dependencies.st-clickhouse-lib]
 path = ".."
 
 [[bin]]
@@ -52,6 +52,20 @@ bench = false
 [[bin]]
 name = "coordinator"
 path = "fuzz_targets/coordinator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "column_bytes"
+path = "fuzz_targets/column_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lc_variant"
+path = "fuzz_targets/lc_variant.rs"
 test = false
 doc = false
 bench = false

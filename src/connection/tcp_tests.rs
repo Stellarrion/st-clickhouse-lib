@@ -3,13 +3,13 @@ use crate::connection::block_reader::read_column_async;
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::query_packet::{
     build_query_packet, build_query_packet_from_template, build_query_packet_template,
-    next_query_id,
 };
 use crate::connection::raw_block_reader::read_column_raw_recorded;
 use crate::connection::tcp::Client;
 use crate::protocol::parameters::QueryParameter;
 use crate::protocol::revision;
 use crate::protocol::wire;
+use crate::query_id::next_query_id;
 use crate::runtime::io::AsyncWriteExt;
 use crate::runtime::sync::RwLock;
 use std::collections::HashMap;
@@ -114,7 +114,8 @@ async fn capture_raw_column(type_name: &str, rows: usize, wire_data: &[u8]) -> V
     drop(writer);
 
     let mut out = Vec::new();
-    read_column_raw_recorded(&mut reader, type_name, rows, &mut out)
+    let mut budget = crate::limits::MAX_COLUMN_BYTES;
+    read_column_raw_recorded(&mut reader, type_name, rows, &mut out, &mut budget)
         .await
         .expect("test operation failed");
     out
@@ -305,7 +306,7 @@ fn test_error_is_retryable_io() {
     );
     assert!(Error::Timeout("timed out".into()).is_retryable());
     assert!(Error::ConnectionClosed("closed".into()).is_retryable());
-    assert!(Error::Protocol("protocol err".into()).is_retryable());
+    assert!(!Error::Protocol("protocol err".into()).is_retryable());
 }
 
 #[test]
@@ -410,6 +411,7 @@ fn test_client() -> Client {
         query_timeout: None,
         schema_cache: Arc::new(RwLock::new(HashMap::new())),
         validate_schema: false,
+        max_response_size: crate::limits::DEFAULT_MAX_RESPONSE_SIZE,
     }
 }
 
@@ -506,4 +508,607 @@ async fn stream_wrapper_propagates_eof() {
         .await
         .expect_err("expected EOF");
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+// ---------------------------------------------------------------------------
+// Fake select-response payloads (deterministic, server-free handler tests)
+// ---------------------------------------------------------------------------
+
+/// Body of one data block (BlockInfo + header + a single `UInt64` column).
+fn u64_block_body(vals: &[u64]) -> Vec<u8> {
+    let mut b = Vec::new();
+    // BlockInfo: field 1 (is_overflows), field 2 (bucket_num), terminator.
+    wire::write_varint_to_vec(&mut b, 1);
+    b.push(0);
+    wire::write_varint_to_vec(&mut b, 2);
+    b.extend_from_slice(&(-1i32).to_le_bytes());
+    wire::write_varint_to_vec(&mut b, 0);
+    wire::write_varint_to_vec(&mut b, 1); // num_columns
+    wire::write_varint_to_vec(&mut b, vals.len() as u64);
+    wire::write_string_to_vec(&mut b, "v");
+    wire::write_string_to_vec(&mut b, "UInt64");
+    b.push(0); // custom serialization = none
+    for val in vals {
+        b.extend_from_slice(&val.to_le_bytes());
+    }
+    b
+}
+
+/// Uncompressed server `Data` packet carrying one UInt64 column.
+fn data_packet(vals: &[u64]) -> Vec<u8> {
+    let mut p = Vec::new();
+    wire::write_varint_to_vec(&mut p, crate::protocol::packet::ServerPacket::Data as u64);
+    wire::write_string_to_vec(&mut p, ""); // table name — never compressed
+    p.extend_from_slice(&u64_block_body(vals));
+    p
+}
+
+/// LZ4/ZSTD-framed server `Data` packet (table name outside the frame).
+#[cfg(any(feature = "lz4", feature = "zstd"))]
+fn compressed_data_packet(vals: &[u64], method: CompressionMethod) -> Vec<u8> {
+    let body = u64_block_body(vals);
+    let frame = crate::compression::encode_frame(&body, method).expect("test operation failed");
+    let mut p = Vec::new();
+    wire::write_varint_to_vec(&mut p, crate::protocol::packet::ServerPacket::Data as u64);
+    wire::write_string_to_vec(&mut p, "");
+    p.extend_from_slice(&frame);
+    p
+}
+
+/// ProfileEvents packet; framed like a Data packet. When response compression
+/// is negotiated the body arrives in a compression frame.
+fn profile_events_packet(vals: &[u64], method: Option<CompressionMethod>) -> Vec<u8> {
+    let mut p = Vec::new();
+    wire::write_varint_to_vec(
+        &mut p,
+        crate::protocol::packet::ServerPacket::ProfileEvents as u64,
+    );
+    wire::write_string_to_vec(&mut p, "");
+    match method {
+        Some(m) => {
+            let body = u64_block_body(vals);
+            let frame = crate::compression::encode_frame(&body, m).expect("test operation failed");
+            p.extend_from_slice(&frame);
+        },
+        None => p.extend_from_slice(&u64_block_body(vals)),
+    }
+    p
+}
+
+fn end_of_stream_packet() -> Vec<u8> {
+    let mut p = Vec::new();
+    wire::write_varint_to_vec(
+        &mut p,
+        crate::protocol::packet::ServerPacket::EndOfStream as u64,
+    );
+    p
+}
+
+async fn fake_stream(payload: Vec<u8>) -> crate::pool::StreamWrapper {
+    let addr = spawn_server(payload, None).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    crate::pool::StreamWrapper::tcp(tcp)
+}
+
+fn block_values(block: &crate::protocol::block::Block) -> Vec<u64> {
+    (0..block.row_count())
+        .map(|i| {
+            block
+                .column::<u64>("v")
+                .expect("test operation failed")
+                .get(i)
+                .expect("test operation failed")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn first_block_handler_errors_on_second_non_empty_block() {
+    use crate::connection::select_response::{FirstBlockHandler, read_select_response};
+    // A second non-empty Data block must be an error — never a silent
+    // truncation. The trailing third block proves the response is still
+    // drained to EndOfStream (the connection stays clean) before failing.
+    let mut payload = data_packet(&[1]);
+    payload.extend_from_slice(&data_packet(&[2, 3]));
+    payload.extend_from_slice(&data_packet(&[4, 5, 6]));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        FirstBlockHandler::new(usize::MAX),
+    )
+    .await;
+    let err = result
+        .err()
+        .expect("second non-empty block must error, not truncate");
+    assert!(
+        err.to_string().contains("multiple non-empty data blocks"),
+        "unexpected error: {err}"
+    );
+    // Everything up to EndOfStream was consumed — the next read hits EOF.
+    assert!(
+        crate::connection::io::read_varint_async(&mut stream)
+            .await
+            .is_err(),
+        "response must be drained before the error is returned"
+    );
+}
+
+#[tokio::test]
+async fn first_block_handler_accepts_single_block_and_skips_empty_ones() {
+    use crate::connection::select_response::{FirstBlockHandler, read_select_response};
+    let mut payload = data_packet(&[]);
+    payload.extend_from_slice(&data_packet(&[7]));
+    payload.extend_from_slice(&data_packet(&[]));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload).await;
+    let block = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        FirstBlockHandler::new(usize::MAX),
+    )
+    .await
+    .expect("single non-empty block must succeed");
+    assert_eq!(block_values(&block), vec![7]);
+}
+
+#[tokio::test]
+async fn blocks_handler_collects_all_blocks_and_preserves_boundaries() {
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    // ProfileEvents blocks are log traffic: read and discarded, never part of
+    // the result — even when they carry rows.
+    let mut payload = data_packet(&[1, 2]);
+    payload.extend_from_slice(&data_packet(&[3]));
+    payload.extend_from_slice(&profile_events_packet(&[99], None));
+    payload.extend_from_slice(&data_packet(&[4, 5, 6]));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload).await;
+    let blocks = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(usize::MAX),
+    )
+    .await
+    .expect("multi-block response must succeed");
+    assert_eq!(
+        blocks.iter().map(|b| b.row_count()).collect::<Vec<_>>(),
+        vec![2, 1, 3],
+        "block boundaries must be preserved"
+    );
+    assert_eq!(block_values(&blocks[0]), vec![1, 2]);
+    assert_eq!(block_values(&blocks[1]), vec![3]);
+    assert_eq!(block_values(&blocks[2]), vec![4, 5, 6]);
+}
+
+// ---------------------------------------------------------------------------
+// Response-size budget (max_response_size) — accumulating handlers only
+// ---------------------------------------------------------------------------
+
+/// One `data_packet(&[a, b])` block decodes to a single UInt64 column of
+/// `2 * 8 = 16` payload bytes — the unit of the response budget.
+fn two_block_payload() -> Vec<u8> {
+    let mut payload = data_packet(&[1, 2]);
+    payload.extend_from_slice(&data_packet(&[3, 4]));
+    payload.extend_from_slice(&end_of_stream_packet());
+    payload
+}
+
+#[tokio::test]
+async fn blocks_handler_tiny_cap_breaches_on_second_block() {
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    // Budget 16 bytes: the first block (16 payload bytes) fits exactly, the
+    // second breaches at a block boundary.
+    let mut stream = fake_stream(two_block_payload()).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(16),
+    )
+    .await;
+    let err = result
+        .err()
+        .expect("second block must breach the 16-byte budget");
+    match &err {
+        crate::error::Error::ResponseTooLarge { limit, received } => {
+            assert_eq!(*limit, 16);
+            assert_eq!(*received, 32, "breach reports the decoded total");
+        },
+        other => unreachable!("expected ResponseTooLarge, got {other:?}"),
+    }
+    assert!(
+        err.to_string().contains("max_response_size 16")
+            && err.to_string().contains("with_max_response_size"),
+        "error must name the limit and the remedy: {err}"
+    );
+    assert!(
+        err.is_broken_connection(),
+        "the mid-response socket must be discarded"
+    );
+}
+
+#[tokio::test]
+async fn blocks_handler_exactly_at_cap_passes() {
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    // Two blocks of 16 payload bytes each: exactly 32 stays within a
+    // 32-byte budget (a strict-greater-than check, never off-by-one).
+    let mut stream = fake_stream(two_block_payload()).await;
+    let blocks = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(32),
+    )
+    .await
+    .expect("cumulative payload exactly at the cap must pass");
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].payload_bytes(), 16);
+    assert_eq!(blocks[1].payload_bytes(), 16);
+}
+
+#[tokio::test]
+async fn all_rows_handler_charges_decoded_block_payload() {
+    use crate::connection::select_response::{AllRowsHandler, read_select_response};
+    // Row-vector APIs charge the same decoded block payload metric: 16-byte
+    // blocks, budget 16 → the second block breaches.
+    let mut stream = fake_stream(two_block_payload()).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        AllRowsHandler::<(u64,)>::new(16),
+    )
+    .await;
+    let err = match result {
+        Err(e) => e,
+        Ok(rows) => unreachable!("row accumulation must respect the budget, got {rows:?} rows"),
+    };
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::ResponseTooLarge {
+                limit: 16,
+                received: 32
+            }
+        ),
+        "expected ResponseTooLarge(16, 32), got {err:?}"
+    );
+
+    // Exactly at cap: all rows materialize.
+    let mut stream = fake_stream(two_block_payload()).await;
+    let rows = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        AllRowsHandler::<(u64,)>::new(32),
+    )
+    .await
+    .expect("exactly-at-cap row read must pass");
+    assert_eq!(rows.as_slice(), &[(1u64,), (2u64,), (3u64,), (4u64,)]);
+}
+
+#[tokio::test]
+async fn first_block_handler_charges_only_the_retained_block() {
+    use crate::connection::select_response::{FirstBlockHandler, read_select_response};
+    // The retained first block (16 payload bytes) is budgeted; later blocks
+    // are discarded un-materialized and never charged.
+    let mut payload = data_packet(&[1, 2]);
+    payload.extend_from_slice(&data_packet(&[]));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload.clone()).await;
+    let block = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        FirstBlockHandler::new(16),
+    )
+    .await
+    .expect("retained block exactly at cap passes");
+    assert_eq!(block_values(&block), vec![1, 2]);
+
+    let mut stream = fake_stream(payload).await;
+    let err = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        FirstBlockHandler::new(15),
+    )
+    .await
+    .err()
+    .expect("a single block larger than the budget must breach");
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::ResponseTooLarge {
+                limit: 15,
+                received: 16
+            }
+        ),
+        "expected ResponseTooLarge(15, 16), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn raw_blocks_handler_budgets_native_payload_bytes() {
+    use crate::connection::select_response::{RawBlocksHandler, read_select_response};
+    // Raw capture charges the native block body length (RawBlock::payload_bytes),
+    // which is larger than the materialized column bytes.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&data_packet(&[1]));
+    payload.extend_from_slice(&end_of_stream_packet());
+    let mut stream = fake_stream(payload).await;
+    let blocks = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        RawBlocksHandler::new(usize::MAX),
+    )
+    .await
+    .expect("unbudgeted raw read must pass");
+    let raw_len = blocks[0].payload_bytes();
+    assert!(raw_len > 8, "raw body includes framing beyond column bytes");
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&data_packet(&[1]));
+    payload.extend_from_slice(&data_packet(&[2]));
+    payload.extend_from_slice(&end_of_stream_packet());
+    let mut stream = fake_stream(payload).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        RawBlocksHandler::new(raw_len),
+    )
+    .await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => unreachable!("second raw block must breach the per-block-sized budget"),
+    };
+    assert!(
+        matches!(err, crate::error::Error::ResponseTooLarge { limit, received } if limit == raw_len && received == 2 * raw_len),
+        "expected ResponseTooLarge(raw_len, 2*raw_len), got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_reader_is_not_budgeted_while_blocks_would_breach() {
+    // The streaming path (rows()/RowCursor, BlockStream) takes no budget by
+    // design: the same payload that breaches a tiny cap on the accumulating
+    // handler streams through fine.
+    use crate::connection::row_stream_reader::read_query_blocks;
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+
+    let mut payload = Vec::new();
+    for _ in 0..32 {
+        payload.extend_from_slice(&data_packet(&[1, 2]));
+    }
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    // Sanity: the accumulating handler breaches a 16-byte budget on it.
+    let mut stream = fake_stream(payload.clone()).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(16),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(crate::error::Error::ResponseTooLarge { .. })),
+        "accumulating read of the same payload must breach"
+    );
+
+    // The streaming reader carries every block with no cap. Drain the
+    // channel concurrently: the reader's `send` parks once the bounded
+    // channel is full, so awaiting the read before receiving would deadlock.
+    let stream = fake_stream(payload).await;
+    let (tx, mut rx) = crate::runtime::sync::mpsc::channel(4);
+    let reader_tx = tx.clone();
+    let reader = crate::runtime::spawn(async move {
+        read_query_blocks(
+            stream,
+            &reader_tx,
+            &QueryCallbacks::default(),
+            None,
+            Duration::from_secs(5),
+            None,
+            false,
+        )
+        .await
+    });
+    let mut blocks = 0;
+    let mut reader_err: Option<crate::error::Error> = None;
+    loop {
+        match rx.recv().await {
+            Some(Ok(Some(_))) => blocks += 1,
+            Some(Ok(None)) | None => break,
+            Some(Err(e)) => {
+                reader_err = Some(e);
+                break;
+            },
+        }
+    }
+    drop(tx);
+    reader
+        .await
+        .expect("reader task joins")
+        .expect("streaming read must not be budgeted");
+    assert!(
+        reader_err.is_none(),
+        "streaming read failed: {:?}",
+        reader_err
+    );
+    assert_eq!(blocks, 32, "every streamed block must arrive");
+}
+
+#[tokio::test]
+#[cfg(feature = "lz4")]
+async fn blocks_handler_reads_lz4_compressed_blocks() {
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    let mut payload = compressed_data_packet(&[1, 2], CompressionMethod::Lz4);
+    payload.extend_from_slice(&compressed_data_packet(&[3, 4], CompressionMethod::Lz4));
+    // ProfileEvents follow the response-compression flag too.
+    payload.extend_from_slice(&profile_events_packet(&[9], Some(CompressionMethod::Lz4)));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload).await;
+    let blocks = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        true,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(usize::MAX),
+    )
+    .await
+    .expect("compressed multi-block response must succeed");
+    assert_eq!(block_values(&blocks[0]), vec![1, 2]);
+    assert_eq!(block_values(&blocks[1]), vec![3, 4]);
+}
+
+#[tokio::test]
+#[cfg(feature = "lz4")]
+async fn lz4_framed_block_parsed_as_plain_must_fail() {
+    // Guards the compression flag plumbing: LZ4-framed data decoded on the
+    // uncompressed path must fail loudly, not "succeed" with garbage rows.
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    let mut payload = compressed_data_packet(&[1, 2], CompressionMethod::Lz4);
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload).await;
+    let result = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        false,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(usize::MAX),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "incorrectly flagged LZ4 frame must not decode as a plain block"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "zstd")]
+async fn blocks_handler_reads_zstd_compressed_blocks() {
+    use crate::connection::select_response::{BlocksHandler, read_select_response};
+    let mut payload = compressed_data_packet(&[10, 20], CompressionMethod::Zstd);
+    payload.extend_from_slice(&profile_events_packet(&[9], Some(CompressionMethod::Zstd)));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let mut stream = fake_stream(payload).await;
+    let blocks = read_select_response(
+        &mut stream,
+        Duration::from_secs(5),
+        None,
+        true,
+        &QueryCallbacks::default(),
+        BlocksHandler::new(usize::MAX),
+    )
+    .await
+    .expect("zstd multi-block response must succeed");
+    assert_eq!(block_values(&blocks[0]), vec![10, 20]);
+}
+
+#[tokio::test]
+#[cfg(feature = "lz4")]
+async fn read_query_blocks_streams_compressed_data_blocks() {
+    // The rows() background reader must honor the negotiated response
+    // compression for Data blocks and ProfileEvents alike.
+    use crate::connection::row_stream_reader::read_query_blocks;
+    let mut payload = compressed_data_packet(&[1, 2], CompressionMethod::Lz4);
+    payload.extend_from_slice(&compressed_data_packet(&[3], CompressionMethod::Lz4));
+    payload.extend_from_slice(&profile_events_packet(&[9], Some(CompressionMethod::Lz4)));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let stream = fake_stream(payload).await;
+    let (tx, mut rx) = crate::runtime::sync::mpsc::channel(4);
+    read_query_blocks(
+        stream,
+        &tx,
+        &QueryCallbacks::default(),
+        None,
+        Duration::from_secs(5),
+        None,
+        true,
+    )
+    .await
+    .expect("compressed stream read must succeed");
+    drop(tx);
+
+    let mut rows = Vec::new();
+    while let Some(msg) = rx.recv().await {
+        match msg.expect("streamed block result") {
+            Some(block) => rows.extend(block_values(&block)),
+            None => break,
+        }
+    }
+    assert_eq!(rows, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn read_query_blocks_streams_plain_data_blocks() {
+    use crate::connection::row_stream_reader::read_query_blocks;
+    let mut payload = data_packet(&[5, 6]);
+    payload.extend_from_slice(&profile_events_packet(&[9], None));
+    payload.extend_from_slice(&end_of_stream_packet());
+
+    let stream = fake_stream(payload).await;
+    let (tx, mut rx) = crate::runtime::sync::mpsc::channel(4);
+    read_query_blocks(
+        stream,
+        &tx,
+        &QueryCallbacks::default(),
+        None,
+        Duration::from_secs(5),
+        None,
+        false,
+    )
+    .await
+    .expect("plain stream read must succeed");
+    drop(tx);
+
+    let mut rows = Vec::new();
+    while let Some(msg) = rx.recv().await {
+        match msg.expect("streamed block result") {
+            Some(block) => rows.extend(block_values(&block)),
+            None => break,
+        }
+    }
+    assert_eq!(rows, vec![5, 6]);
 }

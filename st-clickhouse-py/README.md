@@ -16,9 +16,11 @@ in Rust with Python bindings via PyO3.
   `UUID` to string, `IPv4/IPv6` to strings
 - **Column-oriented access** - `Block` and `Column` objects for efficient columnar data access
 - **GIL-free I/O** - all blocking operations release the GIL during network reads/writes
-- **Cancellation** - proper `asyncio.CancelledError` handling with cleanup
+- **Cancellation** - cancelling a task aborts its server-side query (the pooled
+  connection is killed and transparently replaced); `cancel()` fails closed
+  with guidance
 - **uvloop compatible** - standard asyncio APIs only
-- **Python 3.12-3.14**, including 3.14t/free-threaded builds. GIL builds use abi3; free-threaded builds use version-specific artifacts.
+- **Python 3.12+** (GIL builds, abi3 wheels) and **free-threaded Python 3.14t+** (version-specific `cp3XXt` wheels). Free threading is supported from 3.14 onward; 3.13 free-threaded builds are not supported (pyo3 0.29 dropped them).
 - **Compression** - LZ4 and ZSTD support
 
 ## Quick Start
@@ -85,7 +87,7 @@ pip install target/wheels/st_clickhouse_py-*.whl
 | `insert_blocks(query, table, blocks)` | INSERT from `Block` objects |
 | `insert_stream(query)` → `InsertStream` | Streaming INSERT session |
 | `ping()` | Health check |
-| `cancel()` | Cancel running query |
+| `cancel()` | Always raises `RuntimeError` — see [Cancellation](#cancellation) |
 | `server_info()` | Server metadata (cached) |
 | `set_setting(name, value)` | Session setting |
 
@@ -103,6 +105,28 @@ client = AsyncClient(
     pool_max_idle_time=300.0,
 )
 ```
+
+### Cancellation
+
+`cancel()` on `Client`, `AsyncClient`, and `AsyncSession` always raises
+`RuntimeError`. A Cancel packet can only be delivered over the connection
+running the query, and that connection is blocked inside the query call;
+sending it anywhere else poisons idle connections. Use the real mechanisms
+instead:
+
+- **Cancel the awaiting task** (`task.cancel()`): the pooled connection
+  running the query is killed immediately — the server aborts the query —
+  and the pool transparently creates a replacement on the next acquire. The
+  task unwinds in O(1) instead of waiting for the query.
+- **Abandon a stream**: `break` out of `query_stream` (sync or async). If
+  the response never reached its terminal packet (EndOfStream or server
+  exception), the connection is killed the same way. The async pool replaces
+  it; the sync `Client` is closed and must be recreated (its single
+  connection was left mid-response).
+- **Query deadline**: `Client(..., query_timeout=...)` bounds every query.
+
+A stream that is fully consumed releases its connection cleanly and keeps
+the client/pool usable.
 
 ### Connection Pool
 

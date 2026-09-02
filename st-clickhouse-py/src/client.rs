@@ -21,9 +21,11 @@
 //!
 //! Wraps `st_clickhouse::sync::client::{SyncClient, QueryStream}`.
 
+use std::collections::HashMap;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -34,6 +36,7 @@ use rustls::pki_types::pem::PemObject;
 use st_clickhouse::sync::client::{QueryStream, SyncClient};
 use st_clickhouse::sync::compression::CompressionMethod;
 use st_clickhouse::sync::config::ClientConfig;
+use st_clickhouse::sync::error::{Error as SyncError, Result as SyncResult};
 use st_clickhouse::sync::protocol::block::Block;
 use st_clickhouse::sync::protocol::parameters::QueryParameter;
 use st_clickhouse::sync::protocol::table_status::QualifiedTableName;
@@ -50,13 +53,70 @@ use crate::errors::to_py_err;
 ///
 /// All I/O-bound methods release the GIL during blocking operations.
 /// Use `Client` (sync) or `AsyncClient` (async, one forwarder thread) from Python.
-#[pyclass(name = "_Client", module = "st_clickhouse._native")]
+///
+/// The class is `frozen`: no PyO3 borrow checking happens on method calls, so
+/// [`PyClient::discard`] can kill the connection from any thread even while
+/// another thread is inside a query. Concurrency is instead serialized by the
+/// `inner` mutex, which mirrors the old `&mut self` borrow semantics.
+///
+/// `discard()` — the sanctioned cancellation primitive — is O(1) and never
+/// waits for an in-flight query: it shuts the duplicated socket handle down,
+/// which aborts the blocking I/O the query performs and makes the server stop
+/// the query (it sees the disconnect).
+#[pyclass(name = "_Client", module = "st_clickhouse._native", frozen)]
 pub struct PyClient {
-    inner: SyncClient,
+    /// The wrapped client. `None` after `discard()`.
+    inner: Mutex<Option<SyncClient>>,
+    /// Duplicated socket fd used by `discard()` to kill the connection
+    /// without locking `inner` (an in-flight query holds that lock).
+    kill: Mutex<Option<TcpStream>>,
+    /// Set by `discard()`; read by `discarded` and post-discard call sites.
+    discarded: AtomicBool,
     addr: String,
     user: String,
     database: String,
     query_timeout: Duration,
+}
+
+/// Error raised for any use of a discarded client.
+fn discarded_err() -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(
+        "client was discarded: the connection is closed and cannot be reused",
+    )
+}
+
+impl PyClient {
+    /// Lock `inner`, recovering from poisoning (a panic in a pymethod is
+    /// converted to a Python exception by PyO3; the client itself may be
+    /// mid-protocol, which the next call surfaces as an I/O or protocol
+    /// error rather than a permanent lock failure).
+    fn lock_inner(&self) -> MutexGuard<'_, Option<SyncClient>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run `f` on the wrapped client with the GIL released.
+    ///
+    /// Blocks (GIL-free) when another query is in flight — the frozen-class
+    /// equivalent of the previous exclusive `&mut self` borrow.
+    fn with_client<T>(
+        &self, py: Python<'_>, f: impl FnOnce(&mut SyncClient) -> SyncResult<T> + Send,
+    ) -> PyResult<T>
+    where
+        T: Send,
+    {
+        py.detach(|| {
+            // A discarded client is unusable even if an in-flight call had
+            // kept `inner` populated: its socket was shut down.
+            if self.discarded.load(Ordering::Acquire) {
+                return Err(discarded_err());
+            }
+            let mut guard = self.lock_inner();
+            match guard.as_mut() {
+                Some(client) => f(client).map_err(to_py_err),
+                None => Err(discarded_err()),
+            }
+        })
+    }
 }
 
 #[pymethods]
@@ -226,8 +286,15 @@ impl PyClient {
             .map_err(to_py_err)?;
 
         let addr_str = addr.to_string();
+        // Duplicate the connected socket so `discard()` can kill the
+        // connection later without locking `inner`. `None` only if the fd
+        // duplication failed (degraded: discard then relies on dropping the
+        // client once the in-flight query releases it).
+        let kill = client.socket_shutdown_handle().ok();
         Ok(PyClient {
-            inner: client,
+            inner: Mutex::new(Some(client)),
+            kill: Mutex::new(kill),
+            discarded: AtomicBool::new(false),
             addr: addr_str,
             user: String::new(),
             database: String::new(),
@@ -237,106 +304,132 @@ impl PyClient {
 
     /// Execute a DDL/DML query (no result rows).
     /// GIL is released during the blocking network call.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn execute(
-        &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        &self, query: &str, params: Option<&Bound<'_, PyDict>>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<()> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
-        py.detach(|| {
-            self.inner.execute_with_params_and_ignored_part_uuids(
+        let settings = py_settings_to_map(settings)?;
+        self.with_client(py, |client| {
+            client.execute_with_params_settings_and_ignored_part_uuids(
                 query,
                 &params,
+                &settings,
                 &ignored_part_uuids,
             )
         })
-        .map_err(to_py_err)
     }
 
     /// Execute a SELECT query. Returns list of row dicts.
     /// GIL is released during network I/O, re-acquired for Python conversion.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query(
-        &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        &self, query: &str, params: Option<&Bound<'_, PyDict>>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
-        let blocks = py
-            .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
-            })
-            .map_err(to_py_err)?;
+        let settings = py_settings_to_map(settings)?;
+        let blocks = self.with_client(py, |client| {
+            client.query_with_params_settings_and_ignored_part_uuids(
+                query,
+                &params,
+                &settings,
+                &ignored_part_uuids,
+            )
+        })?;
         conversion::blocks_to_py_dicts(&blocks, py)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Execute a SELECT query. Returns list of row tuples.
     /// This avoids per-row dict allocation and is faster for large row sets.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query_tuples(
-        &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        &self, query: &str, params: Option<&Bound<'_, PyDict>>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
-        let blocks = py
-            .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
-            })
-            .map_err(to_py_err)?;
+        let settings = py_settings_to_map(settings)?;
+        let blocks = self.with_client(py, |client| {
+            client.query_with_params_settings_and_ignored_part_uuids(
+                query,
+                &params,
+                &settings,
+                &ignored_part_uuids,
+            )
+        })?;
         conversion::blocks_to_py_tuples(&blocks, py)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Execute a SELECT query. Returns `{column_name: list[values]}`.
     /// This is the fastest fully materialized Python representation.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query_columns(
-        &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        &self, query: &str, params: Option<&Bound<'_, PyDict>>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Py<PyAny>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
-        let blocks = py
-            .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
-            })
-            .map_err(to_py_err)?;
+        let settings = py_settings_to_map(settings)?;
+        let blocks = self.with_client(py, |client| {
+            client.query_with_params_settings_and_ignored_part_uuids(
+                query,
+                &params,
+                &settings,
+                &ignored_part_uuids,
+            )
+        })?;
         conversion::blocks_to_py_column_map(&blocks, py)
     }
 
     /// Execute a SELECT query. Returns list of Block objects (column-oriented).
     /// GIL is released during network I/O.
-    #[pyo3(signature = (query, params = None, ignored_part_uuids = None))]
+    ///
+    /// `settings` is a per-query overlay on the connection's session settings:
+    /// it is merged into this query's packet only and never persists on the
+    /// connection.
+    #[pyo3(signature = (query, params = None, ignored_part_uuids = None, *, settings = None))]
     fn query_blocks(
-        &mut self, query: &str, params: Option<&Bound<'_, PyDict>>,
-        ignored_part_uuids: Option<&Bound<'_, PyAny>>, py: Python<'_>,
+        &self, query: &str, params: Option<&Bound<'_, PyDict>>,
+        ignored_part_uuids: Option<&Bound<'_, PyAny>>, settings: Option<&Bound<'_, PyDict>>,
+        py: Python<'_>,
     ) -> PyResult<Vec<PyBlock>> {
         let params = py_params_to_query_parameters(params)?;
         let ignored_part_uuids = py_ignored_part_uuids(ignored_part_uuids)?;
-        let blocks = py
-            .detach(|| {
-                self.inner.query_with_params_and_ignored_part_uuids(
-                    query,
-                    &params,
-                    &ignored_part_uuids,
-                )
-            })
-            .map_err(to_py_err)?;
+        let settings = py_settings_to_map(settings)?;
+        let blocks = self.with_client(py, |client| {
+            client.query_with_params_settings_and_ignored_part_uuids(
+                query,
+                &params,
+                &settings,
+                &ignored_part_uuids,
+            )
+        })?;
         Ok(blocks
             .into_iter()
             .filter(|b| b.row_count() > 0)
@@ -349,17 +442,15 @@ impl PyClient {
     /// Internally spawns a Rust reader thread + bounded channel.
     /// The reader thread holds NO Python objects and releases the GIL.
     /// Blocks pushed to the channel are pure Rust `Block` types.
-    fn query_stream(&mut self, query: &str, py: Python<'_>) -> PyResult<PyQueryStream> {
+    fn query_stream(&self, query: &str, py: Python<'_>) -> PyResult<PyQueryStream> {
         // Send the query packet — GIL released during TCP write
-        let qs = py
-            .detach(|| self.inner.start_stream(query))
-            .map_err(to_py_err)?;
+        let qs = self.with_client(py, |client| client.start_stream(query))?;
         PyQueryStream::start(qs)
     }
 
     /// Insert blocks into a table using the native protocol.
     fn insert(
-        &mut self, query: &str, table_name: &str, blocks: &Bound<'_, PyList>, py: Python<'_>,
+        &self, query: &str, table_name: &str, blocks: &Bound<'_, PyList>, py: Python<'_>,
     ) -> PyResult<()> {
         // Extract blocks to owned Vec<Block> first (GIL held for Python access)
         let inner_blocks: Vec<Block> = blocks
@@ -370,53 +461,44 @@ impl PyClient {
             })
             .collect::<PyResult<Vec<_>>>()?;
 
-        // Send blocks — GIL released during I/O
-        py.detach(|| -> PyResult<()> {
-            self.inner.begin_insert(query).map_err(to_py_err)?;
+        // Send blocks — GIL released during I/O; one lock hold covers the
+        // whole INSERT sequence so no other call interleaves on the socket.
+        self.with_client(py, |client| {
+            client.begin_insert(query)?;
             for block in &inner_blocks {
-                self.inner.send_data(table_name, block).map_err(to_py_err)?;
+                client.send_data(table_name, block)?;
             }
-            self.inner.end_insert().map_err(to_py_err)
+            client.end_insert()
         })
     }
 
     /// Begin an INSERT stream.
-    fn begin_insert_stream(&mut self, query: &str, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.inner.begin_insert(query))
-            .map_err(to_py_err)
+    fn begin_insert_stream(&self, query: &str, py: Python<'_>) -> PyResult<()> {
+        self.with_client(py, |client| client.begin_insert(query))
     }
 
     /// Send a data block in an active INSERT stream.
     fn send_data(
-        &mut self, table_name: &str, block: &Bound<'_, PyBlock>, py: Python<'_>,
+        &self, table_name: &str, block: &Bound<'_, PyBlock>, py: Python<'_>,
     ) -> PyResult<()> {
         let inner = block.borrow().inner.as_ref().clone();
-        py.detach(|| self.inner.send_data(table_name, &inner))
-            .map_err(to_py_err)
+        self.with_client(py, |client| client.send_data(table_name, &inner))
     }
 
     /// End an INSERT stream.
-    fn end_insert_stream(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.inner.end_insert()).map_err(to_py_err)
+    fn end_insert_stream(&self, py: Python<'_>) -> PyResult<()> {
+        self.with_client(py, |client| client.end_insert())
     }
 
     /// Ping the server. Returns True on success.
-    fn ping(&mut self, py: Python<'_>) -> PyResult<bool> {
-        py.detach(|| self.inner.ping().map(|_| true))
-            .map_err(to_py_err)
-    }
-
-    /// Cancel the currently running query.
-    fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.inner.cancel()).map_err(to_py_err)
+    fn ping(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with_client(py, |client| client.ping().map(|_| true))
     }
 
     /// Request replication/read-only status for tables.
-    fn tables_status(&mut self, tables: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn tables_status(&self, tables: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let tables = py_tables_to_qualified_names(tables)?;
-        let response = py
-            .detach(|| self.inner.tables_status(&tables))
-            .map_err(to_py_err)?;
+        let response = self.with_client(py, |client| client.tables_status(&tables))?;
         let out = PyDict::new(py);
         for (name, status) in response.table_states_by_id {
             let key = PyTuple::new(py, [&name.database, &name.table])?;
@@ -430,10 +512,8 @@ impl PyClient {
     }
 
     /// Request status for one table. Returns None for missing tables.
-    fn table_status(&mut self, database: &str, table: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let status = py
-            .detach(|| self.inner.table_status(database, table))
-            .map_err(to_py_err)?;
+    fn table_status(&self, database: &str, table: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let status = self.with_client(py, |client| client.table_status(database, table))?;
         let Some(status) = status else {
             return Ok(py.None());
         };
@@ -445,28 +525,40 @@ impl PyClient {
     }
 
     /// Return cached `DESCRIBE TABLE` metadata.
-    fn schema_for_table(&mut self, table: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let schema = py
-            .detach(|| self.inner.schema_for_table(table))
-            .map_err(to_py_err)?;
+    fn schema_for_table(&self, table: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let schema = self.with_client(py, |client| client.schema_for_table(table))?;
         py_table_schema(py, &schema)
     }
 
     /// Refresh cached `DESCRIBE TABLE` metadata.
-    fn refresh_schema_for_table(&mut self, table: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let schema = py
-            .detach(|| self.inner.refresh_schema_for_table(table))
-            .map_err(to_py_err)?;
+    fn refresh_schema_for_table(&self, table: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let schema = self.with_client(py, |client| client.refresh_schema_for_table(table))?;
         py_table_schema(py, &schema)
     }
 
-    fn clear_schema_cache(&mut self) {
-        self.inner.clear_schema_cache();
+    fn clear_schema_cache(&self, py: Python<'_>) {
+        // Release the GIL while waiting for the lock: a long-running query on
+        // another thread must not stall every other Python thread here.
+        py.detach(|| {
+            if let Some(client) = self.lock_inner().as_mut() {
+                client.clear_schema_cache();
+            }
+        });
     }
 
     /// Get server info as a dict. No I/O — reads cached handshake data.
     fn server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let info = self.inner.get_server_info();
+        if self.discarded.load(Ordering::Acquire) {
+            return Err(discarded_err());
+        }
+        let info = py.detach(|| {
+            self.lock_inner()
+                .as_ref()
+                .map(|c| c.get_server_info().clone())
+        });
+        let Some(info) = info else {
+            return Err(discarded_err());
+        };
         let dict = PyDict::new(py);
         dict.set_item("name", &info.name)?;
         dict.set_item("version_major", info.major)?;
@@ -482,8 +574,53 @@ impl PyClient {
     }
 
     /// Set a ClickHouse session setting at runtime.
-    fn set_setting(&mut self, name: &str, value: &str) {
-        self.inner.set_setting(name, value);
+    fn set_setting<'py>(&self, py: Python<'py>, name: &str, value: &str) {
+        // Same GIL-release discipline as clear_schema_cache.
+        py.detach(|| {
+            if let Some(client) = self.lock_inner().as_mut() {
+                client.set_setting(name, value);
+            }
+        });
+    }
+
+    /// Deterministically kill the connection from any thread. O(1), never
+    /// waits for an in-flight query, and safe to call while another thread
+    /// is inside a query: the duplicated socket handle is shut down, which
+    /// aborts that query's blocking I/O (the server sees the disconnect and
+    /// stops the query) and unblocks streams sharing this socket. Any later
+    /// use of this client raises. Idempotent.
+    ///
+    /// This is the primitive behind task cancellation and stream
+    /// abandonment in `Client` / `AsyncClient`; pooled wrappers destroy the
+    /// slot and transparently create a replacement on the next acquire.
+    fn discard(&self) -> PyResult<()> {
+        self.discarded.store(true, Ordering::Release);
+        // Kill the socket first — lock-free, so a query in flight (holding
+        // `inner`) fails its blocking I/O immediately instead of us waiting
+        // for it to finish.
+        let handle = self
+            .kill
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(sock) = handle {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+        // Then drop the client eagerly when it is idle, closing its fd. If a
+        // query is still winding down (holding `inner`), skip: the socket is
+        // already dead, the query fails its I/O momentarily, and the client
+        // object is dropped once its last reference (the executor call) ends.
+        // `try_lock` keeps `discard()` strictly O(1).
+        if let Ok(mut guard) = self.inner.try_lock() {
+            drop(guard.take());
+        }
+        Ok(())
+    }
+
+    /// Whether [`PyClient::discard`] was called on this client.
+    #[getter]
+    fn discarded(&self) -> bool {
+        self.discarded.load(Ordering::Acquire)
     }
 
     fn address(&self) -> &str {
@@ -508,6 +645,46 @@ fn py_table_schema(
     let out = PyDict::new(py);
     out.set_item("columns", columns)?;
     Ok(out.into())
+}
+
+/// Extract a per-query settings dict into owned strings.
+///
+/// Runs with the GIL held, before `py.detach`, so the overlay map is fully
+/// owned Rust data by the time the query packet is built.
+fn py_settings_to_map(settings: Option<&Bound<'_, PyDict>>) -> PyResult<HashMap<String, String>> {
+    let Some(settings) = settings else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::with_capacity(settings.len());
+    for item in settings.iter() {
+        let key: String = item
+            .0
+            .extract()
+            .map_err(|e| pyo3::exceptions::PyTypeError::new_err(format!("setting key: {e}")))?;
+        // Values coerce like query-parameter values (bool → "0"/"1", numbers
+        // → decimal text, anything else → `str()`), so the per-query dict
+        // stays as permissive as the historical Python helper that
+        // stringified values with `str(v)`.
+        let value = if let Ok(value) = item.1.extract::<String>() {
+            value
+        } else if let Ok(value) = item.1.extract::<bool>() {
+            if value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        } else if let Ok(value) = item.1.extract::<i64>() {
+            value.to_string()
+        } else if let Ok(value) = item.1.extract::<u64>() {
+            value.to_string()
+        } else if let Ok(value) = item.1.extract::<f64>() {
+            value.to_string()
+        } else {
+            item.1.str()?.to_str()?.to_owned()
+        };
+        out.insert(key, value);
+    }
+    Ok(out)
 }
 
 fn py_params_to_query_parameters(
@@ -582,7 +759,7 @@ fn py_tables_to_qualified_names(value: &Bound<'_, PyAny>) -> PyResult<Vec<Qualif
 }
 
 fn py_uuid_to_bytes(value: &Bound<'_, PyAny>) -> PyResult<[u8; 16]> {
-    if let Ok(bytes) = value.downcast::<PyBytes>() {
+    if let Ok(bytes) = value.cast::<PyBytes>() {
         let bytes = bytes.as_bytes();
         if bytes.len() != 16 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -661,7 +838,9 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 /// - `Arc<AtomicBool>` is `Send + Sync` for cancellation
 /// - The mutex is only locked briefly to call `recv()` on the receiver
 ///   (no contention — the receiver is single-consumer)
-#[pyclass(name = "_QueryStream", module = "st_clickhouse._native")]
+/// Frozen like `_Client`: `discard()` must be callable from any thread even
+/// while another thread blocks inside `__next__` waiting for a block.
+#[pyclass(name = "_QueryStream", module = "st_clickhouse._native", frozen)]
 pub struct PyQueryStream {
     /// Channel receiver in `Arc<Mutex<>>` — `Arc` enables cloning for
     /// closure capture inside `py.detach()`, `Mutex` for `Sync`.
@@ -669,6 +848,16 @@ pub struct PyQueryStream {
     rx: Arc<Mutex<Receiver<Result<Option<Block>, String>>>>,
     /// Atomic cancellation flag — set from any thread, checked by reader.
     cancel: Arc<AtomicBool>,
+    /// Set by the reader thread when the response reached a terminal packet
+    /// (EndOfStream or a server exception): the connection is clean and the
+    /// owning client may be reused or recycled into a pool.
+    eos: Arc<AtomicBool>,
+    /// Set by the reader thread when it exits for any reason (terminal
+    /// packet, error, cancel flag, receiver dropped).
+    finished: Arc<AtomicBool>,
+    /// Duplicated socket fd: `shutdown()` unblocks a reader stuck in a
+    /// blocking `recv` and kills the connection shared with the owner.
+    kill: Mutex<Option<TcpStream>>,
 }
 
 impl PyQueryStream {
@@ -684,37 +873,58 @@ impl PyQueryStream {
         ) = sync_channel(32);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
+        let eos = Arc::new(AtomicBool::new(false));
+        let eos_clone = eos.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        // The reader's transport is a duplicate of the owner's socket; a
+        // second duplicate lets this object kill the shared connection (and
+        // so unblock the reader) without touching the reader's state.
+        let kill = qs.shutdown_handle().ok();
 
         // Reader thread — owns QueryStream, holds NO Python objects
         thread::Builder::new()
             .name("ch-query-stream".into())
             .spawn(move || {
-                let mut stream = qs;
-                loop {
-                    // Check cancellation before each blocking TCP read
-                    if cancel_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let item = match stream.read_next_block() {
-                        Ok(Some(block)) if block.row_count() == 0 => continue,
-                        Ok(Some(block)) => Ok(Some(block)),
-                        Ok(None) => {
-                            // End of stream — signal and exit
-                            let _ = tx.send(Ok(None));
+                let run = move || {
+                    let mut stream = qs;
+                    loop {
+                        // Check cancellation before each blocking TCP read
+                        if cancel_clone.load(Ordering::Relaxed) {
                             break;
-                        },
-                        Err(e) => Err(e.to_string()),
-                    };
+                        }
 
-                    // Send to channel (bounded — blocks on full for backpressure)
-                    // If Python consumer is slow, this blocks the reader thread
-                    // which stops reading from TCP, which tells the server to slow down.
-                    if tx.send(item).is_err() {
-                        // Receiver dropped (cancelled or GC'd) — exit
-                        break;
+                        let item = match stream.read_next_block() {
+                            Ok(Some(block)) if block.row_count() == 0 => continue,
+                            Ok(Some(block)) => Ok(Some(block)),
+                            Ok(None) => {
+                                // End of stream — signal and exit
+                                eos_clone.store(true, Ordering::Release);
+                                Ok(None)
+                            },
+                            Err(e) => {
+                                // A server exception is a terminal packet:
+                                // the response is over and the connection
+                                // stays usable. Any other error leaves the
+                                // stream position unknown.
+                                if matches!(e, SyncError::ServerError { .. }) {
+                                    eos_clone.store(true, Ordering::Release);
+                                }
+                                Err(e.to_string())
+                            },
+                        };
+
+                        // Send to channel (bounded — blocks on full for backpressure)
+                        // If Python consumer is slow, this blocks the reader thread
+                        // which stops reading from TCP, which tells the server to slow down.
+                        if tx.send(item).is_err() {
+                            // Receiver dropped (cancelled or GC'd) — exit
+                            break;
+                        }
                     }
-                }
+                };
+                run();
+                finished_clone.store(true, Ordering::Release);
             })
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -725,6 +935,9 @@ impl PyQueryStream {
         Ok(PyQueryStream {
             rx: Arc::new(Mutex::new(rx)),
             cancel,
+            eos,
+            finished,
+            kill: Mutex::new(kill),
         })
     }
 }
@@ -742,9 +955,9 @@ impl PyQueryStream {
     ///
     /// We clone the `Arc<Mutex<Receiver>>` and move the clone into the
     /// `py.detach` closure. Arc<T> is `Send` when T: Send + Sync.
-    fn __next__(slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<PyBlock>> {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyBlock>> {
         // Clone the Arc — owned, Send, can be moved into the closure
-        let rx = slf.rx.clone();
+        let rx = self.rx.clone();
 
         let result = py.detach(move || -> Result<Option<Block>, String> {
             let guard = rx
@@ -767,11 +980,58 @@ impl PyQueryStream {
 
     /// Cancel the stream from Python.
     /// Sets the atomic flag — reader thread exits on next check.
+    ///
+    /// Note this does not unblock a reader stuck in a blocking TCP read; use
+    /// [`PyQueryStream::discard`] (or discard the owning client) for that.
     fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// Whether the response reached a terminal packet (EndOfStream or a
+    /// server exception). Only then is the owning connection clean.
+    #[getter]
+    fn eos(&self) -> bool {
+        self.eos.load(Ordering::Acquire)
+    }
+
+    /// Whether the reader thread exited (end, error, cancel, or drop).
+    #[getter]
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// Kill the stream's connection from any thread. Sets the cancel flag
+    /// and shuts the socket down, so a reader blocked on the network exits
+    /// deterministically and the server stops the query. `eos` stays
+    /// `false`: the response was not fully consumed, so the owning client
+    /// must be discarded, not recycled. Idempotent.
+    fn discard(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let handle = self
+            .kill
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(sock) = handle {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+    }
+
     fn __repr__(&self) -> String {
         "<_QueryStream>".to_string()
+    }
+}
+
+impl Drop for PyQueryStream {
+    fn drop(&mut self) {
+        // A stream dropped mid-response would leave its reader thread
+        // blocked in recv() on a socket the owner still holds, and the owner
+        // desyncs on its next query. If the response never reached a
+        // terminal packet, kill the shared socket: the reader exits
+        // deterministically and the server stops the query. After a
+        // terminal packet the connection is clean and stays untouched.
+        if !self.eos.load(Ordering::Acquire) {
+            self.discard();
+        }
     }
 }

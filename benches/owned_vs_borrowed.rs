@@ -1,8 +1,8 @@
 //! Owned vs borrowed materialization for 1M UInt64 rows.
 //!
 //! Isolates the README "1 UInt64 x 1M rows" gap across the three access paths:
-//!   - query()            -> Vec<Block>           (owned blocks; README "owned")
-//!   - query_all::<(u64,)> -> Vec<(u64,)>          (owned tuples; row materialization)
+//!   - query()            -> `Vec<Block>`         (owned blocks; README "owned")
+//!   - query_all::<(u64,)> -> `Vec<(u64,)>`       (owned tuples; row materialization)
 //!   - query_with_block_view -> BlockView callback  (borrowed; README "borrowed")
 //!
 //! Run: CLICKHOUSE_USER=honne CLICKHOUSE_PASSWORD=honne \

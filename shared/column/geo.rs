@@ -69,12 +69,15 @@ impl ClickHouseColumn for Point {
 
     fn read_column<'a>(ctx: &mut ReadColumnContext<'a>) -> Result<Self::ColumnData<'a>> {
         let count = ctx.rows;
+        let nrows = count
+            .checked_mul(2)
+            .ok_or_else(|| super::super::error::Error::Protocol("Point column size overflow".into()))?;
         let nbytes = count
             .checked_mul(16)
             .ok_or_else(|| super::super::error::Error::Protocol("Point column size overflow".into()))?;
         let bytes = ctx.read_exact(nbytes)?;
         let inner_data =
-            super::super::column::plain::PlainColumnData::<f64>::read_from_bytes(bytes, count * 2);
+            super::super::column::plain::PlainColumnData::<f64>::read_from_bytes(bytes, nrows)?;
         Ok(PointColumnData {
             data: inner_data,
             count,

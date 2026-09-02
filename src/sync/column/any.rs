@@ -89,6 +89,9 @@ impl<'a> AnyColumnData<'a> {
     /// string-like values use `String`.
     pub fn into_owned(&self) -> OwnedColumnData {
         let len = self.len();
+        // `unwrap_or(0)` below is unreachable-by-construction: the loop is
+        // bounded by `len == col.len()`, and `get` only errors on
+        // out-of-bounds indices.
         match self {
             Self::UInt8(col) => {
                 let mut v = Vec::with_capacity(len);
@@ -579,7 +582,7 @@ pub fn read_column_by_type<'a>(
             }))
         },
         LowCardinality(inner) => read_column_by_type(inner, ctx),
-        Date32 => u16::read_column(ctx).map(AnyColumnData::UInt16),
+        Date32 => i32::read_column(ctx).map(AnyColumnData::Int32),
         Nothing => {
             let _ = ctx.read_exact(ctx.rows)?;
             Ok(AnyColumnData::Unknown)

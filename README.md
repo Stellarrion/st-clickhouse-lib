@@ -1,7 +1,7 @@
 # st-clickhouse-lib
 
-> **Zero-copy ClickHouse native protocol client** — Rust + Python.  
-> Native TCP, typed Rust rows, columnar Python output shapes, TLS, compression, pooling, and protocol coverage for ClickHouse 24.x onward.
+> **A fast, memory-safe ClickHouse client speaking the native TCP protocol.**  
+> Zero-copy columnar reads and streaming cursors in Rust; dict / tuple / column / block output shapes and free-threaded-capable bindings in Python. TLS, LZ4/Zstd compression, pooled connections with failover — every server-controlled byte bounded, from handshake to EndOfStream. Works with ClickHouse 24.8 onward.
 
 [![CI](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/Stellarrion/st-clickhouse-lib/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/st-clickhouse-lib.svg)](https://crates.io/crates/st-clickhouse-lib)
@@ -35,59 +35,65 @@
 
 ```toml
 [dependencies]
-st-clickhouse-lib = { version = "0.2", features = ["derive"] }
+st-clickhouse-lib = { version = "0.3", features = ["derive"] }
 ```
 
 ```rust
 use st_clickhouse::Client;
-use st_clickhouse::connection::{QueryResult, RowCount, Scalar};
 
 let client = Client::connect("127.0.0.1:9000").await?;
 
-// Block — zero-copy columnar slices, 60M+ rows/s
-let block = client.query("SELECT number FROM system.numbers LIMIT 100000")
-    .fetch::<st_clickhouse::protocol::block::Block>().await?;
-let nums: &[u64] = block.column::<u64>("number")?;
-
-// Vec — owned rows, ergonomic
+// 1. Rows — anything tuple-shaped works, including derive structs (see below)
 let rows: Vec<(u64, String)> = client
     .query("SELECT number, toString(number) FROM system.numbers LIMIT 10")
-    .fetch().await?;
+    .fetch()
+    .await?;
 
-// One — single row
+// Single row, optional row, single value — all from the same builder
 let one: (u64,) = client.query("SELECT toUInt64(1)").fetch().await?;
+let maybe: Option<(u64,)> = client.query("SELECT toUInt64(1) WHERE 0").fetch().await?;
+let count: u64 = client.query("SELECT count() FROM system.numbers").scalar().await?;
 
-// Optional — 0-or-1 rows
-let maybe: Option<(u64,)> = client
-    .query("SELECT toUInt64(1) WHERE 0")
-    .fetch().await?;
+// 2. Derived rows — name-based column mapping, no positional fragility
+#[derive(Debug, Clone, st_clickhouse::Row)]
+struct Event {
+    ts: u32,
+    value: f64,
+}
+let events: Vec<Event> = client
+    .query("SELECT ts, value FROM events LIMIT 100")
+    .fetch()
+    .await?;
 
-// Scalar — single value, wrapped for type safety
-let count: Scalar<u64> = client
-    .query("SELECT count() FROM system.numbers LIMIT 1000000")
-    .fetch().await?;
-println!("{}", count.into_inner());
-
-// RowCount — scan without materializing columns
-let scanned: RowCount = client
-    .query("SELECT number FROM system.numbers LIMIT 1000000")
-    .fetch().await?;
-println!("{} rows", scanned.get());
-
-// Streaming rows — constant memory, background I/O prefetch
-let mut cursor = client
-    .query("SELECT number FROM system.numbers LIMIT 100")
-    .rows::<(u64,)>().await?;
-while let Some((n,)) = cursor.next().await? {
-    println!("{n}");
+// 3. Blocks — zero-copy columnar payloads when you want the raw columns
+let blocks = client
+    .query("SELECT number FROM system.numbers LIMIT 100000")
+    .blocks()
+    .await?;
+for block in &blocks {
+    let nums = block.column::<u64>("number")?;
+    if let Some(slice) = nums.as_slice() {
+        println!("received {} values", slice.len()); // borrowed, no copy
+    }
 }
 
-// INSERT
-client.execute("CREATE TEMPORARY TABLE events (ts DateTime, value Float64)").await?;
-let mut insert = client.begin_insert("events").await?;
-insert.write(("2024-01-01 00:00:00", 1.0)).await?;
-insert.write(("2024-01-01 00:01:00", 2.0)).await?;
-insert.finish().await?;
+// 4. Streaming — constant memory over any result size
+let mut cursor = client
+    .query("SELECT number FROM system.numbers LIMIT 1000000")
+    .rows::<(u64,)>()
+    .await?;
+while let Some((n,)) = cursor.next().await? {
+    // process n
+}
+
+// 5. INSERT — native block protocol
+client
+    .execute("CREATE TABLE IF NOT EXISTS events (ts DateTime, value Float64) ENGINE = Memory")
+    .await?;
+let mut insert = client.begin_insert("INSERT INTO events (ts, value) VALUES").await?;
+// Build a Block with the table's columns (see API Reference / tests/insert_test.rs)
+insert.send_data(&block).await?;
+insert.end().await?;
 ```
 
 ---
@@ -101,44 +107,44 @@ pip install st-clickhouse-py
 ```python
 from st_clickhouse import Client
 
-client = Client("localhost:9000")
+client = Client("127.0.0.1:9000")
 
-# Row dicts — ergonomic, best for <100K rows
+# 1. Dicts — ergonomic, best for small results
 rows = client.query("SELECT count() AS cnt FROM system.tables")
-print(rows[0]["cnt"])  # 42
+print(rows[0]["cnt"])
 
-# With server-side parameters
+# Parameters and per-query settings are keyword arguments
 rows = client.query(
     "SELECT {id:UInt64} AS val, {name:String} AS label",
     params={"id": 1, "name": "hello"},
 )
+client.query("SELECT * FROM big_table", settings={"max_threads": "8"})
 
-# With per-query settings (temporary, auto-reverted)
-rows = client.query("SELECT * FROM big_table", settings={"max_threads": "8"})
-
-# Tuples — faster than dicts for large results
-rows = client.query_tuples("SELECT number, toString(number) LIMIT 10")
-
-# Columns — columnar access, 41M rows/s
-col_nums, col_strs = client.query_columns(
-    "SELECT number, toString(number) FROM system.numbers LIMIT 100000"
-)
-
-# Blocks — rawest/fastest, 147M rows/s
-blocks = client.query_blocks(
-    "SELECT number FROM system.numbers LIMIT 100000"
-)
+# 2. Tuples / columns / blocks — progressively faster, same queries
+tuples = client.query_tuples("SELECT number, toString(number) FROM system.numbers LIMIT 10")
+cols = client.query_columns("SELECT number FROM system.numbers LIMIT 100000")
+blocks = client.query_blocks("SELECT number FROM system.numbers LIMIT 100000")
 for block in blocks:
-    col = block.column("number")  # list[int]
+    values = block["number"].to_list()   # list[int]
 
-# Streaming — low memory for large results
+# 3. Streaming — constant memory for very large results
 for block in client.query_stream("SELECT number FROM system.numbers"):
     for row in block.rows():
-        print(row)
+        pass  # row is a dict
 
-# INSERT
+# 4. INSERT — list of dicts, types inferred via DESCRIBE
 client.execute("CREATE TABLE IF NOT EXISTS test (x Int32) ENGINE Memory")
 client.insert("INSERT INTO test VALUES", [{"x": 1}, {"x": 2}, {"x": 3}])
+
+# 5. Async client with pooling, cancellation that works, and free-threaded support
+import asyncio
+from st_clickhouse import AsyncClient
+
+async def main():
+    async with AsyncClient("127.0.0.1:9000", pool_min_size=2, pool_max_size=8) as c:
+        rows = await c.query("SELECT count() FROM system.tables")
+
+asyncio.run(main())
 
 # TLS
 client = Client(
@@ -148,7 +154,6 @@ client = Client(
     tls_ca_file="/path/to/ca.crt",
 )
 
-# Cleanup
 client.close()
 ```
 
@@ -160,16 +165,18 @@ client.close()
 
 | Method | Returns | Rows/s (1M rows) | Memory | Best For |
 |--------|---------|-----------------|--------|----------|
-| `.block()` | `Block` | 60M+ | Zero-copy (borrowed) | Columnar analytics, 60M+ rows/s |
+| `.block()` | `Block` | 60M+ | Zero-copy (borrowed) | Results guaranteed to contain exactly one server block |
+| `.blocks()` | `Vec<Block>` | 60M+ | Zero-copy payloads | Multi-block columnar results without dropped rows |
 | `.all::<T>()` | `Vec<T>` | 20M+ | Owned rows | Small results, ergonomic access |
 | `.rows::<T>()` | `RowCursor<T>` | 10M+ | Streaming | Large results, low memory |
-| `.execute(sql)` | `()` | N/A | N/A | DDL, INSERT (no return data) |
+| `.execute(sql)` | `()` | N/A | N/A | DDL/DML with no result rows: `CREATE`, `ALTER`, `DROP`, `INSERT ... VALUES` (for native-block INSERT use `begin_insert()` + `send_data()` + `end()`) |
 
 **Rule of thumb:**
 - **Result < 10K rows** → `.all::<T>()` — ergonomic, no borrow lifetime issues
-- **Result 10K–1M rows** → `.block()` — columnar zero-copy, fastest path
+- **Result 10K–1M rows** → `.blocks()` — all columnar blocks, fastest materialized path
 - **Result > 1M rows** → `.rows::<T>()` — streaming, constant memory
-- **Need column slices** → `.block()` + `block.column::<T>("name")`
+- **Need one known server block** → `.block()` — errors rather than truncating if another block arrives
+- **Need column slices** → iterate `.blocks()` and call `block.column::<T>("name")`
 - **Need owned rows** → `.all::<(u64, String)>()`
 
 ### Python
@@ -178,9 +185,9 @@ client.close()
 |--------|---------|--------|----------|
 | `query()` | `list[dict]` | 7.6M | Ergonomics, small results |
 | `query_tuples()` | `list[tuple]` | 14.1M | Large flat results |
-| `query_columns()` | `list[list]` | 47.4M | Columnar processing |
-| `query_blocks()` | `list[Block]` | 136.7M | Rawest, least allocation |
-| `query_stream()` | `Iterator[Block]` | 349.8M | Very large, streaming |
+| `query_columns()` | `list[list]` | 73.9M | Columnar processing |
+| `query_blocks()` | `list[Block]` | 188.5M | Rawest, least allocation |
+| `query_stream()` | `Iterator[Block]` | 490.2M | Very large, streaming |
 
 **Rule of thumb:**
 - **Result < 10K rows** → `query()` — dicts are convenient
@@ -250,28 +257,50 @@ let block: Block = /* ... */;
 let rows = client
     .query("SELECT * FROM ext WHERE id IN (SELECT id FROM external_table)")
     .with_external_table("external_table", block)
-    .fetch_all::<(u64, String)>()
+    .fetch::<Vec<(u64, String)>>()
     .await?;
 
 // ── Query callbacks ──────────────────────────────────────────
-let rows = client
-    .query("SELECT sleep(2)")
+let block = client
+    .query("SELECT number FROM system.numbers LIMIT 10")
     .with_callbacks(QueryCallbacks {
         on_progress: Some(Box::new(|p| println!("Progress: {p:?}"))),
-        on_log: Some(Box::new(|l| println!("Log: {l}"))),
+        on_log: Some(Box::new(|l| println!("Log: {l:?}"))),
         ..Default::default()
     })
-    .execute()
+    .fetch::<Block>()
     .await?;
 
 // ── Batch queries (single round-trip) ────────────────────────
 let results = client.batch()
-    .append("SELECT 1")
-    .append("SELECT 2")
-    .append("SELECT 3")
+    .query("SELECT 1")
+    .query("SELECT 2")
+    .query("SELECT 3")
     .execute()
     .await?;
 ```
+
+#### Connection timeouts
+
+`connect_timeout` (builder option, URL `?connect_timeout=`, or
+`Client::with_connect_timeout` / sync `ClientConfig::with_connect_timeout`)
+bounds **each per-address connection attempt end to end**: TCP establishment,
+TLS handshake, native protocol handshake, addendum, and (async) the
+connect-time Ping. A server that accepts TCP and then never sends its Hello
+fails with `Error::Timeout` instead of hanging until the query timeout.
+
+- Async: each resolved address gets the full budget; expiry returns
+  `Error::Timeout` naming the address and budget, the pool slot stays empty,
+  and failover/circuit-breaker bookkeeping treats it like any connect failure.
+- Sync: resolved addresses are tried in order, each with one full end-to-end
+  budget shared by TCP and setup. An absolute socket-shutdown watchdog (plus
+  socket I/O timeouts as fallback) defeats byte-drip peers; the normal
+  `query_timeout` read deadline is restored after success.
+- `Duration::ZERO` is rejected with `Error::Config` — it cannot mean "no
+  deadline". Async pools are unbounded when the option is unset; sync
+  `ClientConfig` defaults to 10 seconds.
+- DNS resolution is not bounded by `connect_timeout`. It is independent of
+  `acquire_timeout`, which bounds only the wait for a free pool slot.
 
 ### Python Client
 
@@ -289,12 +318,11 @@ client = Client(
     user="default",
     password="",
     database="default",
-    compression="lz4",         # "lz4", "zstd", or "none"
-    pool_size=4,
-    connect_timeout=30,
-    recv_timeout=300,
-    send_retries=1,
-    ping_before_query=False,
+    settings={"max_threads": "8"},
+    compression="lz4",          # "lz4", "zstd", or None
+    connect_timeout=30,         # bounds TCP + handshake setup
+    query_timeout=300,          # hard deadline per query (server-side cancel)
+    max_response_size=256 * 1024 * 1024,  # response budget in bytes
     tls=True,
     tls_domain="clickhouse.local",
     tls_ca_file="/etc/ssl/certs/ca.crt",
@@ -315,7 +343,7 @@ for block in client.query_stream("SELECT number FROM system.numbers"):
 client.execute("CREATE TABLE test (x Int32) ENGINE Memory")
 client.insert("INSERT INTO test VALUES", [{"x": 1}, {"x": 2}])
 
-# Per-query settings (auto-reverted)
+# Per-query settings (applied to that query only)
 rows = client.query("SELECT * FROM big_table", settings={"max_threads": "8"})
 
 # Parameterized queries
@@ -324,8 +352,8 @@ rows = client.query(
     params={"id": 42},
 )
 
-# Pool metrics
-metrics = client.metrics
+# Pool metrics (AsyncClient only)
+metrics = async_client.metrics
 # => {pool_slots: 4, pool_in_use: 1, connection_errors: 0, ...}
 
 client.close()
@@ -350,7 +378,7 @@ TLS is provided by `rustls` (no OpenSSL dependency). Enable with the `tls` featu
 
 ```toml
 [dependencies]
-st-clickhouse-lib = { version = "0.2", features = ["tls"] }
+st-clickhouse-lib = { version = "0.3", features = ["tls"] }
 ```
 
 ```rust
@@ -453,24 +481,24 @@ Top critical risks addressed in v0.1:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                  st-clickhouse-lib (async)                    │
-│  Client · QueryBuilder · InsertSession · BatchBuilder         │
-│  RowCursor · Pool · Metrics · Callbacks                       │
-│  Tokio async I/O · Connection pool · DNS rotation             │
-│  Circuit breaker · Write timeouts · Query retry               │
+│                  st-clickhouse-lib (async)                   │
+│  Client · QueryBuilder · InsertSession · BatchBuilder        │
+│  RowCursor · Pool · Metrics · Callbacks                      │
+│  Tokio async I/O · Connection pool · DNS rotation            │
+│  Circuit breaker · Write timeouts · Query retry              │
 └───────────────────────┬──────────────────────────────────────┘
                         │ depends on
 ┌───────────────────────▼──────────────────────────────────────┐
-│                st-clickhouse-lib sync core                    │
-│  SyncClient · ClientConfig · Transport (TCP/TLS)              │
-│  Handshake (password + SSH) · Protocol negotiation            │
-│  Wire format (varint · string · checksummed blocks)           │
-│  LZ4/ZSTD compression with CityHash128 integrity              │
+│                st-clickhouse-lib sync core                   │
+│  SyncClient · ClientConfig · Transport (TCP/TLS)             │
+│  Handshake (password + SSH) · Protocol negotiation           │
+│  Wire format (varint · string · checksummed blocks)          │
+│  LZ4/ZSTD compression with CityHash128 integrity             │
 └───────────────────────┬──────────────────────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────────────────┐
-│               st-clickhouse-py (PyO3)                         │
-│  Client · AsyncClient · Block · InsertSession                 │
+│               st-clickhouse-py (PyO3)                        │
+│  Client · AsyncClient · Block · InsertSession                │
 │  Thread-per-query bridge · asyncio integration               │
 │  dict/tuple/column/block output shapes                       │
 └──────────────────────────────────────────────────────────────┘
@@ -478,7 +506,7 @@ Top critical risks addressed in v0.1:
 
 ### Key Design Decisions
 
-- **Sync core + async wrapper** — The protocol engine is 100% sync (`std::net::TcpStream`). Tokio async is layered on top via `tokio::task::spawn_blocking` for the I/O thread. This avoids bridging two async runtimes.
+- **Two engines, one wire format** — The async client speaks native tokio I/O directly (`tokio::net::TcpStream`, pool, cancellation-safe futures). The independent sync core (`std::net::TcpStream`) backs the Python bindings; both share the wire codec and column code in `shared/`.
 - **Lockless pool** — Per-slot `tokio::sync::Mutex`, no blocking mutex in async path. Round-robin via `AtomicUsize`.
 - **Zero-copy columns** — `PlainColumnData<T>` provides `&[T]` directly into the decompression buffer when aligned, falling back to `read_unaligned` when misaligned (Nullable mask before data).
 - **DNS rotation** — `resolve_all()` returns every A/AAAA record. Pool rotates through all IPs round-robin. Periodic DNS refresh (300s default) picks up new cluster nodes.
@@ -488,26 +516,41 @@ Top critical risks addressed in v0.1:
 
 ## Performance
 
-These are local benchmark-harness results, not universal performance guarantees. Both columns run **identical** `numbers(N)` queries against the same local ClickHouse over native TCP (`127.0.0.1:9000`), with `output_format_native_write_json_as_string=1`, `ratio_of_defaults_for_sparse_serialization=0`. (`numbers(N)` is used instead of `system.numbers LIMIT` because `clickhouse-cpp` mishandles that aggregate plan and blocks.) Re-run yourself: `cargo run --release --bin bench_all_workloads` (Rust) and `benches/cpp/st_bench.cpp` built against `clickhouse-cpp -O3` — see `benches/README.md`.
+How these numbers were produced:
 
-Lower latency is better. `vs C++` = `st-clickhouse / clickhouse-cpp`, so values below `1.00x` are faster than C++. Values are the min of ~15-30 runs; the owned-materialization row is cache-sensitive and varies a few %.
+- Both clients run **identical** `numbers(N)` queries against the same local
+  ClickHouse over native TCP. Latencies are the minimum of ~15–30 runs —
+  lower is better.
+- Re-run them yourself: `cargo run --release --bin bench_all_workloads`
+  (Rust) and `benches/cpp/st_bench.cpp` built against `clickhouse-cpp -O3`;
+  see `benches/README.md`.
+- `numbers(N)` is used instead of `system.numbers LIMIT` because
+  `clickhouse-cpp` mishandles that aggregate plan and blocks.
 
 ### Rust vs C++
 
-| Workload | st-clickhouse | clickhouse-cpp `-O3` | vs C++ |
-|----------|---------------|----------------------|--------|
-| `SELECT 1` | 0.400ms | 0.416ms | **0.96x** |
-| `COUNT()` over 1M rows | 0.805ms | 0.796ms | 1.01x |
-| `GROUP BY` 1K groups | 2.664ms | 3.011ms | **0.89x** |
-| `ORDER BY ... LIMIT 100` | 1.255ms | 1.337ms | **0.94x** |
-| JSON materialization (1K) | 0.551ms | 0.526ms | 1.05x |
-| 50 columns × 1K rows | 0.920ms | 0.914ms | 1.01x |
-| 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **0.54x** |
-| 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **0.98x** |
-| INSERT Memory 10K rows | 0.549ms | 0.534ms | 1.03x |
-| ALTER UPDATE 5K/10K rows | 0.525ms | 0.518ms | 1.01x |
+The **C++ / Rust** column is `clickhouse-cpp` latency divided by
+`st-clickhouse` latency — above `1.00x` means Rust is faster, and the
+number reads directly as "how many times faster". These are local
+benchmark-harness results, not universal guarantees; the
+owned-materialization row is cache-sensitive and varies a few percent.
 
-The **UInt64 owned-materialization row** is where st-clickhouse's 0.2.0 PlainColumn bulk-slice fast path (`read_all` / `query_all`) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms (~1.85× faster) — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
+| Workload | st-clickhouse | clickhouse-cpp `-O3` | C++ / Rust |
+|----------|---------------|----------------------|------------|
+| `SELECT 1` | 0.400ms | 0.416ms | **1.04x** |
+| `COUNT()` over 1M rows | 0.805ms | 0.796ms | 0.99x |
+| `GROUP BY` 1K groups | 2.664ms | 3.011ms | **1.13x** |
+| `ORDER BY ... LIMIT 100` | 1.255ms | 1.337ms | **1.07x** |
+| JSON materialization (1K) | 0.551ms | 0.526ms | 0.95x |
+| 50 columns × 1K rows | 0.920ms | 0.914ms | 0.99x |
+| 1 UInt64 × 1M rows (owned) | 5.452ms | 10.071ms | **1.85x** |
+| 1 UInt64 × 1M rows (borrowed) | 1.676ms | 1.713ms | **1.02x** |
+| INSERT Memory 10K rows † | 0.549ms | 0.534ms | 0.97x |
+| ALTER UPDATE 5K/10K rows † | 0.525ms | 0.518ms | 0.99x |
+
+The **UInt64 owned-materialization row** is where st-clickhouse's PlainColumn bulk-slice fast path (`read_all` / `query_all`, since 0.2.0) shows: 5.452ms vs `clickhouse-cpp`'s 10.071ms — **1.85x faster** — its per-value column access can't match a vectorized slice copy. Most other rows are network/server-bound and within ~5% of C++.
+
+† *Server-version drift:* these numbers were measured on ClickHouse **26.4**. On **26.7+** the server itself charges a flat ~60 ms per mutation (raw HTTP inserts that bypass the client cost the same), so both rows track the server's mutation path, not client overhead — the client still adds ~0.3 ms or less. All other rows were re-measured on 26.7 at or better than the values shown.
 
 ### Python Materialization (Multiple Output Shapes)
 
@@ -516,12 +559,12 @@ The **UInt64 owned-materialization row** is where st-clickhouse's 0.2.0 PlainCol
 | `SELECT 1` (row dict) | 0.465ms | 0.569ms | — |
 | 100K rows as dicts | 13.208ms | 12.796ms | 7.6M |
 | 100K rows as **tuples** | 9.485ms | 7.085ms | 14.1M |
-| 100K rows as **columns** | 2.426ms | 2.111ms | 47.4M |
-| 100K rows as **blocks** | 0.679ms | 0.732ms | 147.3M |
-| 1M rows as blocks | 2.391ms | 2.141ms | 467.1M |
-| 32 concurrent `SELECT 1` | N/A | 5.027ms | — |
+| 100K rows as **columns** | 2.426ms | 2.111ms | 73.9M |
+| 100K rows as **blocks** | 0.679ms | 0.732ms | 188.5M |
+| 1M rows as blocks | 2.391ms | 2.141ms | 644.8M |
+| 1M rows streamed | 490.2M rows/s (sync) | 354.5M (async) | — |
 
-Throughput is **stable from 0.1.0 → 0.2.0** (within run-to-run variance): 0.2.0's optimizations live in the Rust materialization core (see *Rust vs C++* above — the UInt64 owned row), which is a small slice of Python end-to-end time, where PyO3 FFI + Python object construction dominate.
+The rows/s figures are medians from the post-0.3 perf pass (`target/bench-results.md`); the millisecond columns are min-of-many from the original harness, so they read slightly faster than the median-derived rows/s. The 32-concurrent row from older READMEs is obsolete — the pool-acquire starvation it exposed was fixed in 0.3.0 and is covered by a dedicated regression test.
 
 ### Python vs Official `clickhouse-connect` (HTTP)
 
@@ -577,6 +620,11 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 - ✅ **Circuit breaker** — per-address exponential backoff on failure
 - ✅ **Query retry** — configurable retries with exponential backoff + jitter
 - ✅ **Write timeouts** — configurable per-operation timeout
+- ✅ **Query deadlines** — `Client::with_query_timeout` / per-query `QueryBuilder::timeout`; expiry cancels the query server-side and discards the connection
+- ✅ **Fail-closed `cancel()`** — async `Client::cancel` and sync `SyncClient::cancel` never cancel anything: they return `Error::Config` with guidance (deadlines and stream teardown are the real mechanisms)
+- ✅ **Pool acquire timeout** — bounded wait for a free pool slot (`Error::PoolTimeout`)
+- ✅ **Response-size budgets** — `max_response_size` caps the bytes retained by accumulating reads; streaming paths stay unbudgeted by design
+- ✅ **Bounded protocol framing** — every server-controlled count/length is validated before it sizes an allocation (hostile-server safe)
 - ✅ **Batch queries** — multiple queries, single round-trip
 - ✅ **Streaming** — `RowCursor` with background I/O prefetch
 - ✅ **INSERT** — native protocol with `FORMAT Native`, streaming insert
@@ -601,8 +649,9 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 - ✅ **Sync + Async** — `Client` (sync) and `AsyncClient` via thread-per-query
 - ✅ **4 output shapes** — `query()` (dicts), `query_tuples()`, `query_columns()`, `query_blocks()`
 - ✅ **Streaming** — `query_stream()` for large results
-- ✅ **TLS** — `tls=True` with CA file, client cert, skip-verify option
-- ✅ **Per-query settings** — temporary settings via `settings={"key": "val"}`
+- ✅ **Cancellation that works** — `cancel()` fails closed with guidance; cancelling the awaiting task or abandoning a stream kills the query's connection and the server aborts the query
+- ✅ **TLS** — `tls=True` with CA file and client certificate
+- ✅ **Per-query settings** — `settings={"key": "val"}` overlaid per query, never leaking onto the connection
 - ✅ **Server-side parameters** — `params={"id": 42}`
 - ✅ **Connection pool** — health checks, idle reaper, metrics
 - ✅ **Error hierarchy** — `ProtocolError`, `ConnectionError`, `AuthenticationError`, `QueryError`, etc.
@@ -612,7 +661,17 @@ perf record -F 997 -g -- target/benchmark/profile_core_workload scan-1m-view 500
 
 ## Compatibility
 
-Tested against ClickHouse **24.8**, **25.8**, and **26.4** in CI.
+Tested against ClickHouse **24.8**, **25.8**, **26.4**, and **`latest`** in CI.
+
+End-to-end coverage spans the native client surface: connection and
+authentication (TCP, TLS, SSH-key), the full type matrix, bidirectional
+LZ4/Zstd compression (including multi-frame blocks above 1 MiB), streaming
+reads and block insertions, batched and parameterized queries, per-query
+settings, progress/log/profile callbacks, connection pooling with failover
+and circuit breaking, connect/query/acquire timeouts, and query cancellation
+— across both Rust engines and the Python bindings. Not covered: external
+tables (API present, e2e test pending), Kerberos/interserver
+authentication, and the HTTP interface (native protocol only by design).
 
 Run locally:
 ```bash
@@ -624,7 +683,7 @@ Run locally:
 Rust users depend on one public crate:
 
 ```toml
-st-clickhouse-lib = { version = "0.2", features = ["derive", "tls", "lz4"] }
+st-clickhouse-lib = { version = "0.3", features = ["derive", "tls", "lz4"] }
 ```
 
 The Rust import path is `st_clickhouse`. The `st-clickhouse-derive` crate is an implementation detail required by Rust's proc-macro model and is pulled in by the `derive` feature.

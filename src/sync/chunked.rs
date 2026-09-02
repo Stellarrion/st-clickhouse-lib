@@ -103,6 +103,21 @@ pub(super) fn write_chunked_packet<W: Write>(writer: &mut W, pkt: &[u8]) -> Resu
     Ok(())
 }
 
+/// Send a bare Cancel packet through a writer, chunked-framed when required.
+///
+/// Used by the response-budget recovery path, which must write through the
+/// SAME buffered reader instance that performed the aborted read (dropping it
+/// would lose its read-ahead buffer and desynchronize the recovery drain).
+pub(super) fn write_cancel_packet<W: Write>(writer: &mut W, chunked_send: bool) -> Result<()> {
+    if chunked_send {
+        write_chunked_packet(writer, &[3])
+    } else {
+        writer.write_all(&[3])?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
 pub(super) struct TransportReader<'a> {
     inner: std::io::BufReader<&'a mut crate::sync::transport::Transport>,
 }
@@ -154,6 +169,17 @@ impl<R: Read> ChunkedReader<R> {
             if len == 0 {
                 continue;
             }
+            // The chunk length is server-controlled; validate it before the
+            // resize so a 4-byte header cannot drive a multi-GiB allocation.
+            if len > crate::limits::MAX_CHUNK_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "chunked transport chunk length {len} exceeds maximum {}",
+                        crate::limits::MAX_CHUNK_LEN
+                    ),
+                ));
+            }
             self.chunk.resize(len, 0);
             self.inner.read_exact(&mut self.chunk)?;
             self.pos = 0;
@@ -184,5 +210,58 @@ impl<R: Write> Write for ChunkedReader<R> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server-supplied `u32::MAX` chunk header must fail the length cap
+    /// before any buffer is sized, not attempt a 4 GiB read/allocation.
+    #[test]
+    fn chunked_reader_rejects_oversized_chunk_header() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut reader = ChunkedReader::new(std::io::Cursor::new(wire));
+        let mut out = [0u8; 8];
+        let err = reader
+            .read(&mut out)
+            .expect_err("oversized chunk header must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("chunk length"),
+            "expected chunk length error, got: {err}"
+        );
+    }
+
+    /// The cap boundary itself stays readable: a small well-formed chunk
+    /// still round-trips through the reader after the check was added.
+    #[test]
+    fn chunked_reader_still_reads_small_chunk() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&3u32.to_le_bytes());
+        wire.extend_from_slice(b"abc");
+        let mut reader = ChunkedReader::new(std::io::Cursor::new(wire));
+        let mut out = [0u8; 8];
+        let n = reader.read(&mut out).expect("small chunk must decode");
+        assert_eq!(&out[..n], b"abc");
+    }
+
+    /// Outbound framing keeps its checked conversion: a hypothetical chunk
+    /// larger than `u32::MAX` is refused instead of silently truncated.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn chunk_header_writer_refuses_oversized_packet() {
+        let mut sink = Vec::new();
+        // Use a length beyond the u32 wire field without allocating it.
+        let huge = u32::MAX as usize + 1;
+        let err = write_chunk_header(&mut sink, huge)
+            .expect_err("packet larger than the u32 header must be refused");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected too-large error, got: {err}"
+        );
+        assert!(sink.is_empty(), "nothing must be written on refusal");
     }
 }

@@ -8,6 +8,7 @@ pub mod connection;
 #[cfg(feature = "tokio")]
 pub mod cursor;
 pub mod error;
+pub(crate) mod limits;
 #[cfg(feature = "tokio")]
 pub mod metrics;
 #[cfg(feature = "tokio")]
@@ -20,6 +21,13 @@ pub mod row;
 pub mod runtime;
 pub mod schema;
 pub mod sync;
+
+/// Internal parser hooks exercised by the in-tree fuzz targets
+/// (`fuzz/fuzz_targets/*`). Not part of the public API; hidden from docs.
+#[doc(hidden)]
+pub mod fuzz_hooks {
+    pub use crate::sync::protocol::response_packets::parse_exception_chain;
+}
 
 pub mod prelude {
     pub use crate::column::{ClickHouseColumn, ClickHouseColumnData, ClickHouseValue};
@@ -40,6 +48,7 @@ pub mod prelude {
         QualifiedTableName, TableStatus, TablesStatusResponse,
     };
     #[cfg(feature = "tokio")]
+    #[allow(deprecated)] // keep the deprecated shim reachable from the prelude
     pub use crate::query::QueryBuilder;
 
     #[cfg(feature = "derive")]
@@ -69,6 +78,7 @@ pub use protocol::parameters::QueryParameter;
 #[cfg(feature = "tokio")]
 pub use protocol::table_status::{QualifiedTableName, TableStatus, TablesStatusResponse};
 #[cfg(feature = "tokio")]
+#[allow(deprecated)] // keep the deprecated shim importable at the crate root
 pub use query::QueryBuilder;
 
 #[cfg(feature = "derive")]

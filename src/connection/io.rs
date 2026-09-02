@@ -11,8 +11,6 @@ use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
 use crate::runtime::time::Instant;
 use std::collections::HashMap;
 
-const MAX_STRING_BYTES: usize = 0x00FF_FFFF;
-
 #[inline]
 pub(crate) fn compression_flag(compression: Option<CompressionMethod>) -> u64 {
     match compression {
@@ -282,7 +280,11 @@ pub(crate) async fn read_part_uuids_packet<
 >(
     stream: &mut S,
 ) -> Result<Vec<[u8; 16]>> {
-    let count = checked_usize(read_varint_async(stream).await?, "PartUUIDs")?;
+    let count = checked_count(
+        read_varint_async(stream).await?,
+        "PartUUID",
+        crate::limits::MAX_PART_UUIDS,
+    )?;
     let mut uuids = Vec::with_capacity(count);
     for _ in 0..count {
         let mut uuid = [0u8; 16];
@@ -490,6 +492,9 @@ pub(crate) async fn read_varint_async<
         let mut byte = [0u8; 1];
         stream.read_exact(&mut byte).await?;
         let b = byte[0];
+        if shift == 63 && (b & 0x7F) > 1 {
+            return Err(crate::error::Error::Protocol("varint overflow".into()));
+        }
         result |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
             return Ok(result);
@@ -503,7 +508,7 @@ pub(crate) async fn read_string_async<
 >(
     stream: &mut S,
 ) -> Result<String> {
-    let len = checked_string_len(read_varint_async(stream).await?)?;
+    let len = checked_string_len(read_varint_async(stream).await?, "string length")?;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     String::from_utf8(buf).map_err(|e| crate::error::Error::Protocol(format!("utf8: {e}")))
@@ -531,30 +536,111 @@ pub(crate) async fn read_block_header<
             _ => break,
         }
     }
-    let columns = checked_usize(read_varint_async(stream).await?, "columns")?;
-    let rows = checked_usize(read_varint_async(stream).await?, "rows")?;
+    let columns = checked_count(
+        read_varint_async(stream).await?,
+        "block column",
+        crate::limits::MAX_BLOCK_COLUMNS,
+    )?;
+    let rows = checked_count(
+        read_varint_async(stream).await?,
+        "block row",
+        crate::limits::MAX_BLOCK_ROWS,
+    )?;
     Ok((columns, rows))
 }
+
+/// Values at most this size use the merged body read — the value's bytes plus
+/// the next row's first varint byte in ONE `read_exact` — halving the per-row
+/// poll count. Every byte of a merged read is already claimed by this column
+/// (the lookahead byte is the next row's length varint's first byte, which
+/// must exist while rows remain), so the read can never cross the column end
+/// into the next column's stream bytes. Larger values stream straight into
+/// the column buffer's tail, where the transport's large-read path serves
+/// them directly.
+const STRING_COL_MERGED_MAX: usize = 4096;
 
 pub(crate) async fn read_string_column_with_prefixes<
     S: crate::runtime::io::AsyncRead + crate::runtime::io::AsyncWrite + Unpin,
 >(
     stream: &mut S, rows: usize, length_name: &str,
 ) -> Result<Vec<u8>> {
-    let mut data = Vec::with_capacity(rows.saturating_mul(8));
-    for _ in 0..rows {
-        let len = checked_usize(read_varint_async(stream).await?, length_name)?;
+    // Capacity hint only: clamp it so a hostile row count cannot eager-allocate
+    // more than one column's byte budget before any data arrives.
+    let mut data = Vec::with_capacity(rows.saturating_mul(8).min(crate::limits::MAX_COLUMN_BYTES));
+    if rows == 0 {
+        return Ok(data);
+    }
+    let mut total = 0usize;
+    let mut scratch = [0u8; STRING_COL_MERGED_MAX + 1];
+    // First varint byte of the next row when the previous row's merged body
+    // read already pulled it in.
+    let mut pending: Option<u8> = None;
+    for row_idx in 0..rows {
+        // Length varint — same per-byte rules and overflow errors as
+        // read_varint_async, starting from `pending` when available.
+        let first = match pending.take() {
+            Some(b) => b,
+            None => {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                byte[0]
+            },
+        };
+        let value = if first & 0x80 == 0 {
+            u64::from(first)
+        } else {
+            let mut result = u64::from(first & 0x7F);
+            let mut shift = 7u32;
+            loop {
+                if shift >= 64 {
+                    return Err(crate::error::Error::Protocol("varint overflow".into()));
+                }
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                let b = byte[0];
+                if shift == 63 && (b & 0x7F) > 1 {
+                    return Err(crate::error::Error::Protocol("varint overflow".into()));
+                }
+                result |= u64::from(b & 0x7F) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            result
+        };
+        let len = checked_string_len(value, length_name)?;
         let needed = varint_len(len as u64)
             .checked_add(len)
             .ok_or_else(|| crate::error::Error::Protocol("column buffer length overflow".into()))?;
+        // Cumulative per-column cap fires on the claim, before this value's
+        // reserve/resize/read — lying lengths fail without allocating.
+        total = checked_column_bytes(total, needed, length_name)?;
         data.reserve(needed);
         encode_varint(&mut data, len as u64);
-        let start = data.len();
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| crate::error::Error::Protocol("column buffer length overflow".into()))?;
-        data.resize(end, 0);
-        stream.read_exact(&mut data[start..]).await?;
+        let last = row_idx + 1 == rows;
+        if len > STRING_COL_MERGED_MAX {
+            // Large value: one bulk read into the column buffer's tail.
+            let start = data.len();
+            let end = start.checked_add(len).ok_or_else(|| {
+                crate::error::Error::Protocol("column buffer length overflow".into())
+            })?;
+            data.resize(end, 0);
+            stream.read_exact(&mut data[start..]).await?;
+        } else {
+            // Merged read: this value's claimed bytes plus, when another row
+            // follows, exactly one lookahead byte owned by the next row's
+            // length varint. Skipped entirely for the final empty value so no
+            // zero-length read is ever issued.
+            let n = len + usize::from(!last);
+            if n > 0 {
+                stream.read_exact(&mut scratch[..n]).await?;
+                data.extend_from_slice(&scratch[..len]);
+                if !last {
+                    pending = Some(scratch[len]);
+                }
+            }
+        }
     }
     Ok(data)
 }
@@ -566,14 +652,16 @@ pub(crate) async fn read_offsets_column<
 ) -> Result<(Vec<u8>, usize)> {
     // Offsets are `rows` contiguous little-endian u64s on the wire — read them
     // in one shot instead of one read_exact per row, then scan for the max.
-    let nbytes = checked_len(rows, 8)?;
+    let nbytes = checked_column_len(rows, 8, name)?;
     let mut offsets = vec![0u8; nbytes];
     stream.read_exact(&mut offsets).await?;
     let mut total = 0usize;
     for chunk in offsets.chunks_exact(8) {
         let mut b = [0u8; 8];
         b.copy_from_slice(chunk);
-        total = total.max(checked_usize(u64::from_le_bytes(b), name)?);
+        // Cumulative prefix sums must be non-decreasing; the running maximum
+        // (the last offset) is the inner element count, capped at MAX_BLOCK_ROWS.
+        total = checked_monotonic_offset(total, u64::from_le_bytes(b), name)?;
     }
     Ok((offsets, total))
 }
@@ -596,6 +684,37 @@ pub(crate) fn checked_len(rows: usize, width: usize) -> Result<usize> {
 pub(crate) fn checked_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| crate::error::Error::Protocol(format!("{name} count too large")))
+}
+
+/// Validate a server-controlled per-value string length against the shared
+/// 16 MiB wire limit before it sizes any buffer.
+pub(crate) fn checked_string_len(value: u64, what: &str) -> Result<usize> {
+    crate::limits::checked_string_len(value, what).map_err(crate::error::Error::Protocol)
+}
+
+/// Validate a column's running byte total (checked add + 64 MiB cap) before a
+/// value-driven reserve/resize.
+pub(crate) fn checked_column_bytes(acc: usize, add: usize, what: &str) -> Result<usize> {
+    crate::limits::checked_column_bytes(acc, add, what).map_err(crate::error::Error::Protocol)
+}
+
+/// Validate a fixed-width/offset/index buffer byte length (`rows * width`,
+/// checked multiply + 64 MiB cap) before any allocation sized from it.
+pub(crate) fn checked_column_len(rows: usize, width: usize, what: &str) -> Result<usize> {
+    crate::limits::checked_column_len(rows, width, what).map_err(crate::error::Error::Protocol)
+}
+
+/// Validate one Array/Map offset: non-decreasing (cumulative prefix sums) and
+/// capped at MAX_BLOCK_ROWS inner elements.
+pub(crate) fn checked_monotonic_offset(prev: usize, value: u64, what: &str) -> Result<usize> {
+    crate::limits::checked_monotonic_offset(prev, value, what)
+        .map_err(crate::error::Error::Protocol)
+}
+
+/// Validates a server-controlled item count against a [`crate::limits`] cap
+/// before any allocation or loop is sized from it.
+pub(crate) fn checked_count(value: u64, what: &str, max: usize) -> Result<usize> {
+    crate::limits::checked_count(value, what, max).map_err(crate::error::Error::Protocol)
 }
 
 /// Validate a LowCardinality header and derive the per-row index width.
@@ -641,7 +760,14 @@ pub(crate) async fn read_exception<
     let mut root = None;
     let mut messages = Vec::new();
     let mut buf = [0u8; 4];
+    let mut depth = 0usize;
     loop {
+        if depth >= crate::limits::MAX_EXCEPTION_CHAIN_DEPTH {
+            return Err(crate::error::Error::Protocol(format!(
+                "exception nesting too deep: more than {} levels",
+                crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+            )));
+        }
         stream.read_exact(&mut buf).await?;
         let code = i32::from_le_bytes(buf);
         let name = read_string_lossy_async(stream).await?;
@@ -651,6 +777,7 @@ pub(crate) async fn read_exception<
             root = Some((code, name.clone()));
         }
         messages.push(format!("{name} (code {code}): {msg}"));
+        depth += 1;
         stream.read_exact(&mut buf[..1]).await?;
         if buf[0] == 0 {
             break;
@@ -664,23 +791,12 @@ pub(crate) async fn read_exception<
     })
 }
 
-fn checked_string_len(value: u64) -> Result<usize> {
-    let value = usize::try_from(value)
-        .map_err(|_| crate::error::Error::Protocol("string length too large".into()))?;
-    if value > MAX_STRING_BYTES {
-        return Err(crate::error::Error::Protocol(format!(
-            "string length {value} exceeds clickhouse-cpp limit {MAX_STRING_BYTES}"
-        )));
-    }
-    Ok(value)
-}
-
 async fn read_string_lossy_async<
     S: crate::runtime::io::AsyncRead + crate::runtime::io::AsyncWrite + Unpin,
 >(
     stream: &mut S,
 ) -> Result<String> {
-    let len = checked_string_len(read_varint_async(stream).await?)?;
+    let len = checked_string_len(read_varint_async(stream).await?, "string length")?;
     if len > 1_048_576 {
         discard_exact(stream, len).await?;
         return Ok(format!("<large string {}b>", len));
@@ -749,6 +865,83 @@ mod timeout_tests {
 }
 
 #[cfg(test)]
+mod varint_read_tests {
+    use super::read_varint_async;
+    use crate::runtime::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_varint_async_rejects_tenth_byte_overflow() {
+        let (mut tx, mut rx) = tokio::io::duplex(16);
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02];
+        tx.write_all(&bytes).await.expect("write varint");
+        let result = read_varint_async(&mut rx).await;
+        assert!(result.is_err(), "10th-byte overflow must error: {result:?}");
+    }
+}
+
+#[cfg(test)]
+mod exception_chain_depth_tests {
+    use super::{encode_varint, read_exception};
+    use crate::error::Error;
+    use crate::limits::MAX_EXCEPTION_CHAIN_DEPTH;
+    use crate::runtime::io::AsyncWriteExt;
+
+    /// Wire body of an exception chain `levels` deep: per level, i32 LE code
+    /// plus three length-prefixed strings and the 1-byte has_nested flag.
+    fn chain_body(levels: usize) -> Vec<u8> {
+        let mut body = Vec::new();
+        for i in 0..levels {
+            body.extend_from_slice(&46i32.to_le_bytes());
+            for field in ["e", "m", ""] {
+                encode_varint(&mut body, field.len() as u64);
+                body.extend_from_slice(field.as_bytes());
+            }
+            body.push(u8::from(i + 1 < levels));
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn read_exception_accepts_exactly_cap_chain() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let body = chain_body(MAX_EXCEPTION_CHAIN_DEPTH);
+        tokio::spawn(async move {
+            tx.write_all(&body).await.expect("seed chain");
+        });
+        let err = read_exception(&mut rx)
+            .await
+            .expect("chain at cap must parse");
+        let Error::ServerError { code, message, .. } = err else {
+            unreachable!("expected ServerError");
+        };
+        assert_eq!(code, 46);
+        assert_eq!(
+            message.matches(" | nested: ").count(),
+            MAX_EXCEPTION_CHAIN_DEPTH - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn read_exception_rejects_cap_plus_one_chain() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let body = chain_body(MAX_EXCEPTION_CHAIN_DEPTH + 1);
+        tokio::spawn(async move {
+            tx.write_all(&body).await.expect("seed chain");
+        });
+        let err = read_exception(&mut rx)
+            .await
+            .expect_err("chain deeper than cap must be rejected");
+        match err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                format!("exception nesting too deep: more than {MAX_EXCEPTION_CHAIN_DEPTH} levels")
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod offset_read_tests {
     use super::read_offsets_column;
     use crate::runtime::io::AsyncWriteExt;
@@ -756,14 +949,60 @@ mod offset_read_tests {
     #[tokio::test]
     async fn read_offsets_column_reads_all_and_finds_max() {
         let (mut tx, mut rx) = tokio::io::duplex(64);
-        // 3 little-endian u64 offsets: 2, 7, 4 — the max is 7.
-        let bytes: Vec<u8> = [2u64, 7, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        // 3 little-endian u64 offsets: 2, 4, 7 — cumulative, so the last is 7.
+        let bytes: Vec<u8> = [2u64, 4, 7].iter().flat_map(|v| v.to_le_bytes()).collect();
         tx.write_all(&bytes).await.expect("write offsets");
         let (offsets, total) = read_offsets_column(&mut rx, 3, "test")
             .await
             .expect("read offsets");
         assert_eq!(offsets, bytes);
         assert_eq!(total, 7);
+    }
+
+    #[tokio::test]
+    async fn read_offsets_column_rejects_decreasing_offset() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        // Offsets are cumulative prefix sums; 7 followed by 4 is malformed.
+        let bytes: Vec<u8> = [7u64, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        tx.write_all(&bytes).await.expect("write offsets");
+        let err = read_offsets_column(&mut rx, 2, "array offset")
+            .await
+            .expect_err("decreasing offset must be rejected");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg == "array offset decreased from 7 to 4"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_offsets_column_rejects_huge_last_offset_before_inner_read() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        // A single 2^60 last offset must fail before any inner column data is
+        // read — previously it became the inner row count unbounded.
+        let bytes: Vec<u8> = [1u64 << 60].iter().flat_map(|v| v.to_le_bytes()).collect();
+        tx.write_all(&bytes).await.expect("write offsets");
+        let err = read_offsets_column(&mut rx, 1, "array offset")
+            .await
+            .expect_err("2^60 offset must be rejected");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg == "array offset total 1152921504606846976 exceeds limit 10000000"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_offsets_column_rejects_oversized_offset_buffer() {
+        // rows * 8 above the 64 MiB column byte cap must fail before the
+        // offsets buffer is allocated.
+        let (_tx, mut rx) = tokio::io::duplex(64);
+        let rows = crate::limits::MAX_COLUMN_BYTES / 8 + 1;
+        let err = read_offsets_column(&mut rx, rows, "array offset")
+            .await
+            .expect_err("oversized offsets buffer must be rejected");
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(msg) if msg.contains("byte length") && msg.contains("exceeds limit")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -774,5 +1013,220 @@ mod offset_read_tests {
             .expect("read offsets");
         assert!(offsets.is_empty());
         assert_eq!(total, 0);
+    }
+}
+
+#[cfg(test)]
+mod string_column_limit_tests {
+    use super::read_string_column_with_prefixes;
+    use crate::error::Error;
+    use crate::protocol::wire;
+    use crate::runtime::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    fn varint(v: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, v).expect("test write");
+        buf
+    }
+
+    #[tokio::test]
+    async fn string_value_length_u64_max_is_rejected_before_read() {
+        // One row claims a u64::MAX-length value; no payload follows. The
+        // per-value cap must fire on the claim, before any resize or read.
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&varint(u64::MAX))
+            .await
+            .expect("seed lying length");
+        let err = read_string_column_with_prefixes(&mut rx, 1, "string value length")
+            .await
+            .expect_err("u64::MAX string value length must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "string value length 18446744073709551615 exceeds limit 16777215"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn string_value_length_2_pow_40_is_rejected_before_read() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&varint(1u64 << 40))
+            .await
+            .expect("seed lying length");
+        let err = read_string_column_with_prefixes(&mut rx, 1, "JSON string length")
+            .await
+            .expect_err("2^40 string value length must be rejected");
+        assert!(
+            matches!(&err, Error::Protocol(msg) if msg == "JSON string length 1099511627776 exceeds limit 16777215"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn string_column_values_still_parse() {
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&varint(1));
+        wire_bytes.push(b'a');
+        wire_bytes.extend_from_slice(&varint(0));
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&wire_bytes).await.expect("seed values");
+        let data = read_string_column_with_prefixes(&mut rx, 2, "string value length")
+            .await
+            .expect("small values parse");
+        assert_eq!(data, vec![1, b'a', 0]);
+    }
+
+    #[tokio::test]
+    async fn string_column_does_not_read_past_the_column() {
+        // A String column followed by sentinel bytes on the same stream: the
+        // buffered body reader must never consume beyond the column's last
+        // claimed byte, or the next reader on this stream would desync. The
+        // sentinel is written in the same batch so a greedy refill could grab
+        // it; with tx dropped afterwards, any over-read surfaces as EOF here.
+        let mut wire_bytes = Vec::new();
+        for _ in 0..1000 {
+            wire_bytes.extend_from_slice(&varint(3));
+            wire_bytes.extend_from_slice(b"abc");
+        }
+        wire_bytes.extend_from_slice(&[0xABu8; 8]);
+        let (mut tx, mut rx) = tokio::io::duplex(8192);
+        tx.write_all(&wire_bytes)
+            .await
+            .expect("seed column + sentinel");
+        drop(tx);
+        let data = read_string_column_with_prefixes(&mut rx, 1000, "string value length")
+            .await
+            .expect("column must parse");
+        assert_eq!(data.len(), 1000 * 4, "varint + body per row");
+        let mut sentinel = [0u8; 8];
+        rx.read_exact(&mut sentinel)
+            .await
+            .expect("sentinel must still be on the stream");
+        assert_eq!(sentinel, [0xABu8; 8], "sentinel bytes must be untouched");
+    }
+
+    #[tokio::test]
+    async fn string_column_multi_byte_varint_lengths_parse() {
+        // Length 300 needs a two-byte varint on the wire.
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&varint(300));
+        wire_bytes.extend_from_slice(&[b'z'; 300]);
+        wire_bytes.extend_from_slice(&varint(0));
+        let (mut tx, mut rx) = tokio::io::duplex(1024);
+        tx.write_all(&wire_bytes).await.expect("seed values");
+        drop(tx);
+        let data = read_string_column_with_prefixes(&mut rx, 2, "string value length")
+            .await
+            .expect("multi-byte varint lengths must parse");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&varint(300));
+        expected.extend_from_slice(&[b'z'; 300]);
+        expected.extend_from_slice(&varint(0));
+        assert_eq!(data, expected);
+    }
+
+    #[tokio::test]
+    async fn string_column_truncated_body_is_unexpected_eof() {
+        // Claims 1000 bytes but sends 500, then EOF: the bulk body read must
+        // surface the same UnexpectedEof a per-value read_exact would.
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&varint(1000));
+        wire_bytes.extend_from_slice(&[7u8; 500]);
+        let (mut tx, mut rx) = tokio::io::duplex(1024);
+        tx.write_all(&wire_bytes)
+            .await
+            .expect("seed truncated value");
+        drop(tx);
+        let err = read_string_column_with_prefixes(&mut rx, 1, "string value length")
+            .await
+            .expect_err("truncated body must error");
+        assert!(
+            matches!(
+                &err,
+                Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof
+            ),
+            "expected UnexpectedEof, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn string_column_value_larger_than_window_streams_direct() {
+        // A value larger than the merged-read limit bypasses it and streams
+        // into the column buffer's tail. The duplex capacity exceeds the
+        // whole payload and the sender is dropped before the reader runs, so
+        // the test never depends on a concurrent writer task being scheduled
+        // (send-before-drain would otherwise deadlock at 0% CPU).
+        let big_len = 100_000usize;
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&varint(big_len as u64));
+        wire_bytes.extend_from_slice(&(0..big_len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+        let (mut tx, mut rx) = tokio::io::duplex(1 << 18);
+        tx.write_all(&wire_bytes).await.expect("seed large value");
+        drop(tx);
+        let data = read_string_column_with_prefixes(&mut rx, 1, "string value length")
+            .await
+            .expect("large value must parse");
+        assert_eq!(data, wire_bytes);
+    }
+}
+
+#[cfg(test)]
+mod part_uuid_limit_tests {
+    use super::read_part_uuids_packet;
+    use crate::error::Error;
+    use crate::protocol::wire;
+    use crate::runtime::io::AsyncWriteExt as _;
+
+    fn uuid_packet(count: u64, uuid_bytes: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, count).expect("test write");
+        buf.extend_from_slice(uuid_bytes);
+        buf
+    }
+
+    #[tokio::test]
+    async fn part_uuid_count_u64_max_is_protocol_error() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&uuid_packet(u64::MAX, &[]))
+            .await
+            .expect("seed packet");
+        let err = read_part_uuids_packet(&mut rx)
+            .await
+            .expect_err("u64::MAX PartUUID count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "PartUUID count 18446744073709551615 exceeds limit 1048576"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn part_uuid_count_cap_plus_one_is_protocol_error() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&uuid_packet(1_048_577, &[]))
+            .await
+            .expect("seed packet");
+        let err = read_part_uuids_packet(&mut rx)
+            .await
+            .expect_err("cap + 1 PartUUID count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn part_uuids_within_cap_parse() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&uuid_packet(2, &[0x11; 32]))
+            .await
+            .expect("seed packet");
+        let uuids = read_part_uuids_packet(&mut rx)
+            .await
+            .expect("count within cap parses");
+        assert_eq!(uuids.len(), 2);
+        assert_eq!(uuids[0], [0x11; 16]);
+        assert_eq!(uuids[1], [0x11; 16]);
     }
 }

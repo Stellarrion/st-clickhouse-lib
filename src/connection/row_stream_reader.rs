@@ -1,4 +1,4 @@
-use crate::connection::block_reader::read_data_block;
+use crate::connection::block_reader::{read_data_block, read_data_block_maybe_compressed};
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::io::{
     read_exception, read_profile_info_packet, read_progress_packet, read_varint_async,
@@ -15,22 +15,28 @@ use crate::runtime::sync::mpsc;
 
 /// Read packets from the stream, sending Data blocks via the channel.
 /// The stream is owned exclusively by this task, so no mutex is needed.
+///
+/// `response_compressed` mirrors the compression negotiated in the query
+/// packet: Data (and ProfileEvents) blocks are read with the same
+/// packet-specific compressed/uncompressed rules as `read_select_response`;
+/// Log blocks are protocol-defined uncompressed.
 pub(super) async fn read_query_blocks(
     mut stream: crate::pool::StreamWrapper, block_tx: &mpsc::Sender<Result<Option<Block>>>,
     callbacks: &QueryCallbacks, cancel: Option<&std::sync::atomic::AtomicBool>,
     recv_timeout: std::time::Duration, deadline: Option<crate::runtime::time::Instant>,
+    response_compressed: bool,
 ) -> Result<()> {
     use crate::connection::io::packet_read_timeout;
     loop {
-        if let Some(c) = cancel {
-            if c.load(std::sync::atomic::Ordering::Relaxed) {
-                stream
-                    .write_packet(&[ClientPacket::Cancel as u8])
-                    .await
-                    .ok();
-                stream.flush().await.ok();
-                return Ok(());
-            }
+        if let Some(c) = cancel
+            && c.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            stream
+                .write_packet(&[ClientPacket::Cancel as u8])
+                .await
+                .ok();
+            stream.flush().await.ok();
+            return Ok(());
         }
         let packet_type = match packet_read_timeout(recv_timeout, deadline) {
             Some(per_read) => {
@@ -56,7 +62,9 @@ pub(super) async fn read_query_blocks(
                             return Ok(());
                         }
                         let _ = block_tx
-                            .send(Err(crate::error::Error::Protocol("timeout".into())))
+                            .send(Err(crate::error::Error::Timeout(
+                                "receive timeout while streaming query response".into(),
+                            )))
                             .await;
                         return Ok(());
                     },
@@ -78,7 +86,8 @@ pub(super) async fn read_query_blocks(
         };
         match packet_type {
             1 => {
-                let block = read_data_block(&mut stream).await?;
+                let block =
+                    read_data_block_maybe_compressed(&mut stream, response_compressed).await?;
                 if block.row_count() > 0 && block_tx.send(Ok(Some(block))).await.is_err() {
                     return Ok(());
                 }
@@ -102,8 +111,13 @@ pub(super) async fn read_query_blocks(
             6 => {
                 let _ = read_profile_info_packet(&mut stream).await?;
             },
-            10 | 14 => {
+            10 => {
+                // Log blocks are always sent uncompressed.
                 let _ = read_data_block(&mut stream).await?;
+            },
+            14 => {
+                // ProfileEvents follow the response compression flag.
+                let _ = read_data_block_maybe_compressed(&mut stream, response_compressed).await?;
             },
             17 => {
                 read_timezone_update(&mut stream, callbacks).await?;

@@ -1,7 +1,9 @@
 use crate::sync::error::{Error, Result};
 use crate::sync::protocol::response::{parse_block_body_shared, parse_block_shared};
 use crate::sync::protocol::revision;
-use crate::sync::protocol::wire::{parse_bytes, parse_i32, parse_string, parse_varint};
+use crate::sync::protocol::wire::{
+    parse_bytes, parse_i32, parse_string, parse_string_bytes, parse_varint,
+};
 
 /// Parse a full response buffer into blocks.
 ///
@@ -30,8 +32,12 @@ pub fn parse_response_with_revision(
                 blocks.push(block);
             },
             2 => {
-                let msg = parse_exception_chain(buf, &mut pos)?;
-                return Err(Error::Protocol(format!("server error: {msg}")));
+                let (code, name, message) = parse_exception_chain(buf, &mut pos)?;
+                return Err(Error::ServerError {
+                    code,
+                    name,
+                    message,
+                });
             },
             3 => skip_progress(buf, &mut pos, protocol_revision)?,
             4 => {},
@@ -70,20 +76,41 @@ pub fn parse_response_with_revision(
     Ok(blocks)
 }
 
-fn parse_exception_chain(buf: &[u8], pos: &mut usize) -> Result<String> {
+/// Parse an Exception packet body.
+///
+/// Returns the root exception's `(code, name)` plus the whole nested chain
+/// joined into one message. A truncated or otherwise unparsable body returns
+/// `Err(Error::Protocol(_))` so a malformed packet is never mistaken for a
+/// terminal server exception. The chain depth is capped at 1,000 levels (the
+/// internal `MAX_EXCEPTION_CHAIN_DEPTH` limit); a deeper chain is a protocol
+/// error naming the cap.
+pub fn parse_exception_chain(buf: &[u8], pos: &mut usize) -> Result<(i32, String, String)> {
     let mut parts = Vec::new();
+    let mut root: Option<(i32, String)> = None;
+    let mut depth = 0usize;
     loop {
+        if depth >= crate::limits::MAX_EXCEPTION_CHAIN_DEPTH {
+            return Err(Error::Protocol(format!(
+                "exception nesting too deep: more than {} levels",
+                crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+            )));
+        }
         let code = parse_i32(buf, pos)?;
-        let name = parse_string(buf, pos)?;
-        let msg = parse_string(buf, pos)?;
-        let _stack = parse_string(buf, pos)?;
-        parts.push(format!("{name} (code {code}): {msg}"));
+        let name = String::from_utf8_lossy(parse_string_bytes(buf, pos)?).into_owned();
+        let message = String::from_utf8_lossy(parse_string_bytes(buf, pos)?).into_owned();
+        let _stack = parse_string_bytes(buf, pos)?;
+        parts.push(format!("{name} (code {code}): {message}"));
+        if root.is_none() {
+            root = Some((code, name));
+        }
+        depth += 1;
         let flag = parse_bytes(buf, pos, 1)?;
         if flag.first().copied().unwrap_or(0) == 0 {
             break;
         }
     }
-    Ok(parts.join(" | nested: "))
+    let (code, name) = root.unwrap_or((0, "unknown".to_string()));
+    Ok((code, name, parts.join(" | nested: ")))
 }
 
 fn skip_progress(buf: &[u8], pos: &mut usize, protocol_revision: u64) -> Result<()> {
@@ -118,7 +145,12 @@ fn skip_profile_info(buf: &[u8], pos: &mut usize, protocol_revision: u64) -> Res
 }
 
 fn skip_part_uuids(buf: &[u8], pos: &mut usize) -> Result<()> {
-    let count = checked_usize(parse_varint(buf, pos)?, "PartUUIDs")?;
+    let count = crate::limits::checked_count(
+        parse_varint(buf, pos)?,
+        "PartUUID",
+        crate::limits::MAX_PART_UUIDS,
+    )
+    .map_err(Error::Protocol)?;
     advance(buf, pos, checked_len(count, 16)?)
 }
 
@@ -212,4 +244,234 @@ fn advance(buf: &[u8], pos: &mut usize, len: usize) -> Result<()> {
     }
     *pos = end;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::protocol::wire;
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        wire::write_varint(buf, s.len() as u64).expect("test operation failed");
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// Wire bytes for an Exception packet (type 2) and optional nested chain.
+    fn exception_packet(entries: &[(i32, &str, &str, bool)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, 2).expect("test operation failed");
+        for (code, name, msg, nested) in entries {
+            buf.extend_from_slice(&code.to_le_bytes());
+            put_string(&mut buf, name);
+            put_string(&mut buf, msg);
+            put_string(&mut buf, ""); // stack trace
+            buf.push(u8::from(*nested));
+        }
+        buf
+    }
+
+    // ── Server-controlled count cap tests ────────────────────────────────
+
+    fn part_uuids_packet(count: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wire::write_varint(&mut buf, 12).expect("test write"); // PartUUIDs
+        wire::write_varint(&mut buf, count).expect("test write");
+        buf
+    }
+
+    #[test]
+    fn part_uuid_count_u64_max_is_protocol_error() {
+        let err = parse_response(
+            part_uuids_packet(u64::MAX),
+            revision::DEFAULT_PROTOCOL_REVISION,
+        )
+        .err()
+        .expect("u64::MAX PartUUID count must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                "PartUUID count 18446744073709551615 exceeds limit 1048576"
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn part_uuid_count_cap_plus_one_is_protocol_error() {
+        let err = parse_response(
+            part_uuids_packet(1_048_577),
+            revision::DEFAULT_PROTOCOL_REVISION,
+        )
+        .err()
+        .expect("cap + 1 PartUUID count must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn exception_packet_yields_structured_server_error() {
+        let arena = exception_packet(&[(60, "DB::Exception", "unknown function xyz", false)]);
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("server exception must be Err");
+        match &err {
+            Error::ServerError {
+                code,
+                name,
+                message,
+            } => {
+                assert_eq!(*code, 60);
+                assert_eq!(name, "DB::Exception");
+                assert_eq!(message, "DB::Exception (code 60): unknown function xyz");
+            },
+            _other => unreachable!("expected ServerError, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn exception_packet_lossily_decodes_non_utf8_text() {
+        let mut arena = Vec::new();
+        wire::write_varint(&mut arena, 2).expect("test operation failed");
+        arena.extend_from_slice(&46i32.to_le_bytes());
+        wire::write_varint(&mut arena, 3).expect("test operation failed");
+        arena.extend_from_slice(b"DB\xff");
+        wire::write_varint(&mut arena, 4).expect("test operation failed");
+        arena.extend_from_slice(b"bad\xfe");
+        put_string(&mut arena, "");
+        arena.push(0);
+
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("server exception must be Err");
+        let Error::ServerError { name, message, .. } = err else {
+            unreachable!("expected ServerError");
+        };
+        assert!(name.contains('�'));
+        assert!(message.contains('�'));
+    }
+
+    // ── Exception-chain nesting-depth cap tests ──────────────────────────
+
+    fn nested_chain_entries(levels: usize) -> Vec<(i32, &'static str, &'static str, bool)> {
+        (0..levels)
+            .map(|i| (60, "DB::Exception", "nested frame", i + 1 < levels))
+            .collect()
+    }
+
+    #[test]
+    fn exception_chain_exactly_cap_depth_parses() {
+        let arena = exception_packet(&nested_chain_entries(
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH,
+        ));
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("chain exactly at the cap must still parse");
+        let Error::ServerError { code, message, .. } = err else {
+            unreachable!("expected ServerError, got {err:?}");
+        };
+        assert_eq!(code, 60);
+        assert_eq!(
+            message.matches(" | nested: ").count(),
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH - 1,
+            "every level up to the cap must be joined into the message"
+        );
+    }
+
+    #[test]
+    fn exception_chain_cap_plus_one_is_protocol_error() {
+        let arena = exception_packet(&nested_chain_entries(
+            crate::limits::MAX_EXCEPTION_CHAIN_DEPTH + 1,
+        ));
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("chain deeper than the cap must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                &format!(
+                    "exception nesting too deep: more than {} levels",
+                    crate::limits::MAX_EXCEPTION_CHAIN_DEPTH
+                )
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    /// Raw chain body (no packet-type prefix) as consumed directly by
+    /// [`parse_exception_chain`] — the same entry point the fuzz target
+    /// exercises via `st_clickhouse::fuzz_hooks`.
+    fn chain_body(entries: &[(i32, &'static str, &'static str, bool)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (code, name, msg, nested) in entries {
+            body.extend_from_slice(&code.to_le_bytes());
+            put_string(&mut body, name);
+            put_string(&mut body, msg);
+            put_string(&mut body, "");
+            body.push(u8::from(*nested));
+        }
+        body
+    }
+
+    #[test]
+    fn parse_exception_chain_direct_cap_boundary() {
+        let cap = crate::limits::MAX_EXCEPTION_CHAIN_DEPTH;
+
+        // Exactly-cap chain parses and keeps the joined message.
+        let mut pos = 0;
+        let (code, _, message) =
+            parse_exception_chain(&chain_body(&nested_chain_entries(cap)), &mut pos)
+                .expect("exactly-cap chain must parse");
+        assert_eq!(code, 60);
+        assert_eq!(message.matches(" | nested: ").count(), cap - 1);
+
+        // One extra nested level (cap + 1) is rejected with the cap named.
+        let mut pos = 0;
+        let err = parse_exception_chain(&chain_body(&nested_chain_entries(cap + 1)), &mut pos)
+            .expect_err("cap + 1 chain must be rejected");
+        match &err {
+            Error::Protocol(msg) => assert_eq!(
+                msg,
+                &format!("exception nesting too deep: more than {cap} levels")
+            ),
+            other => unreachable!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_exception_chain_reports_root_and_full_chain() {
+        let arena = exception_packet(&[
+            (1000, "DB::Exception", "outer failure", true),
+            (48, "DB::Exception", "inner cause", false),
+        ]);
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("nested exception must be Err");
+        match &err {
+            Error::ServerError {
+                code,
+                name,
+                message,
+            } => {
+                assert_eq!(*code, 1000, "root code must be reported");
+                assert_eq!(name, "DB::Exception");
+                assert!(
+                    message.contains("outer failure") && message.contains("inner cause"),
+                    "message must carry the whole chain: {message}"
+                );
+            },
+            _other => unreachable!("expected ServerError, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_exception_packet_is_a_protocol_error() {
+        let mut arena = exception_packet(&[(60, "DB::Exception", "unknown function xyz", false)]);
+        arena.truncate(arena.len() - 3); // cut into the has_nested flag
+        let err = parse_response(arena, revision::DEFAULT_PROTOCOL_REVISION)
+            .err()
+            .expect("truncated packet must be Err");
+        assert!(
+            matches!(err, Error::Protocol(_)),
+            "malformed packet must stay a protocol error, got {err:?}"
+        );
+    }
 }

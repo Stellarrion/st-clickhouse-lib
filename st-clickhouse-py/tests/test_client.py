@@ -142,6 +142,55 @@ class TestConnection:
         with pytest.raises(AuthenticationError):
             connect(docker_ch, user=CLICKHOUSE_USER, password="wrong_password")
 
+    def test_connect_timeout_silent_server_raises_timeout_error(self):
+        """A server that accepts TCP but never answers must raise
+        st_clickhouse.TimeoutError (and the builtin TimeoutError) within the
+        configured connect_timeout — not hang until query_timeout."""
+        import socket
+        import threading
+        import time
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        held: list[socket.socket] = []
+
+        def accept_and_stay_silent() -> None:
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                held.append(conn)  # accept, never write, never close
+
+        acceptor = threading.Thread(target=accept_and_stay_silent, daemon=True)
+        acceptor.start()
+
+        start = time.monotonic()
+        with pytest.raises(ch.TimeoutError) as excinfo:
+            connect(
+                f"127.0.0.1:{port}",
+                connect_timeout=0.5,
+                query_timeout=60.0,
+            )
+        elapsed = time.monotonic() - start
+
+        # High-level error is the specific st_clickhouse.TimeoutError, not a
+        # generic ClickHouseError (the native layer raised the builtin
+        # TimeoutError; map_error must translate it).
+        assert type(excinfo.value) is ch.TimeoutError, type(excinfo.value)
+        assert "did not complete" in str(excinfo.value)
+        # Generous upper bound: far below the 60 s query timeout.
+        assert elapsed < 30.0, f"connect timeout fired too late: {elapsed:.1f}s"
+        listener.close()
+
+    def test_connect_timeout_zero_is_config_error(self):
+        """Duration.ZERO cannot mean "no deadline" — it must be rejected."""
+        with pytest.raises(ch.ConfigError):
+            connect("127.0.0.1:9000", connect_timeout=0.0)
+
     def test_context_manager(self, docker_ch: str):
         """Client works as a context manager."""
         with connect(docker_ch, user=CLICKHOUSE_USER, password=CLICKHOUSE_PASS) as c:
@@ -176,6 +225,38 @@ class TestConnection:
         )
         assert c.ping()
         c.close()
+
+
+class TestErrorMapping:
+    """Native-to-Python error translation for the new timeout/config errors."""
+
+    def test_native_builtin_timeout_maps_to_st_timeout(self):
+        from st_clickhouse._errors import map_error
+
+        native = TimeoutError("ClickHouse timeout: connection setup stalled")
+        mapped = map_error(native)
+        assert type(mapped) is ch.TimeoutError
+        assert isinstance(mapped, ClickHouseError)  # still part of the hierarchy
+
+    def test_native_config_error_maps_to_config_error(self):
+        from st_clickhouse._errors import map_error
+
+        native = ValueError(
+            "ClickHouse configuration error: connect_timeout must be greater than zero"
+        )
+        mapped = map_error(native)
+        assert type(mapped) is ch.ConfigError
+
+    def test_builtin_timeout_wins_over_word_heuristics(self):
+        from st_clickhouse._errors import map_error
+
+        # A timeout message containing "connection" must stay a TimeoutError
+        # instead of falling through to the connection-word heuristic.
+        native = TimeoutError(
+            "connect to 127.0.0.1:9000 (TCP + TLS + handshake + ping) timed out"
+        )
+        mapped = map_error(native)
+        assert type(mapped) is ch.TimeoutError
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -377,6 +458,39 @@ class TestTypeConversion:
 # ══════════════════════════════════════════════════════════════════════════
 
 class TestErrors:
+    def test_server_error_mapping_is_query_error(self):
+        """Native ServerError text maps to QueryError, not ProtocolError.
+
+        Server-free unit test for the _native → _errors mapping: the native
+        to_py_err raises ValueError with a "ClickHouse server error (code=..."
+        prefix; map_error must classify it as QueryError even when the server
+        message itself contains words like "protocol" or "compression".
+        """
+        from st_clickhouse._errors import QueryError, map_error
+
+        exc = ValueError(
+            "ClickHouse server error (code=60, name=DB::Exception): "
+            "unknown function protocol_compression_xyz"
+        )
+        mapped = map_error(exc)
+        assert isinstance(mapped, QueryError)
+        assert isinstance(mapped, ClickHouseError)
+
+        auth_flavored = map_error(
+            ValueError(
+                "ClickHouse server error (code=516, name=DB::Exception): "
+                "Authentication failed"
+            )
+        )
+        assert isinstance(auth_flavored, QueryError)
+
+    def test_protocol_error_mapping_unchanged(self):
+        """Plain protocol ValueError still maps to ProtocolError."""
+        from st_clickhouse._errors import ProtocolError, map_error
+
+        mapped = map_error(ValueError("ClickHouse protocol error: unknown packet type: 99"))
+        assert isinstance(mapped, ProtocolError)
+
     def test_query_error(self, client: Client):
         """Invalid SQL raises ClickHouseError."""
         with pytest.raises(ClickHouseError):
@@ -945,3 +1059,195 @@ def test_query_timeout_aborts_slow_query():
         assert rows[0]["x"] == 1
     finally:
         client2.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Per-query settings overlay
+#
+# Regression tests for the `with_per_query_settings` bug: the helper used to
+# mutate the native client's session settings per query and its restore loop
+# was a no-op, so per-query settings leaked onto the connection forever.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestPerQuerySettings:
+    """Sync per-query settings: visible inside the query, never persistent."""
+
+    Q = "SELECT value FROM system.settings WHERE name = '{}'"
+
+    def _get(self, client: Client, name: str = "max_threads") -> str:
+        rows = client.query(self.Q.format(name))
+        assert rows, f"server did not report setting {name!r}"
+        return rows[0]["value"]
+
+    def test_settings_visible_within_query_and_not_after(self, client: Client):
+        """Overlay applies to its own query; later queries see the baseline."""
+        baseline = self._get(client)
+        rows = client.query(self.Q.format("max_threads"), settings={"max_threads": "3"})
+        assert rows[0]["value"] == "3"
+        # The old bug leaked "3" onto the connection forever.
+        assert self._get(client) == baseline
+
+    def test_overlay_overrides_constructor_setting_then_restores(self, docker_ch: str):
+        """Constructor baseline is overridden for one query, then restored."""
+        c = connect(
+            docker_ch,
+            user=CLICKHOUSE_USER,
+            password=CLICKHOUSE_PASS,
+            settings={"max_threads": "7"},
+        )
+        try:
+            assert self._get(c) == "7"
+            rows = c.query(self.Q.format("max_threads"), settings={"max_threads": "3"})
+            assert rows[0]["value"] == "3"  # overlay wins over constructor baseline
+            assert self._get(c) == "7"  # baseline structurally intact afterwards
+        finally:
+            c.close()
+
+    def test_overlay_error_leaves_baseline_unchanged(self, client: Client):
+        """A failing overlay query must not disturb the connection baseline."""
+        baseline = self._get(client)
+        with pytest.raises(ClickHouseError):
+            client.query("SELECT no_such_function_xyz()", settings={"max_threads": "3"})
+        assert self._get(client) == baseline
+
+    def test_no_baseline_key_returns_server_default_afterwards(self, client: Client):
+        """Keys absent from the baseline revert to the server default."""
+        key = "max_insert_block_size"
+        default = self._get(client, key)
+        rows = client.query(self.Q.format(key), settings={key: "123457"})
+        assert rows[0]["value"] == "123457"
+        assert self._get(client, key) == default
+
+    def test_all_materialized_variants_apply_overlay(self, client: Client):
+        """query_tuples/query_columns/query_blocks/execute route the overlay."""
+        q = self.Q.format("max_threads")
+        assert client.query_tuples(q, settings={"max_threads": "3"})[0][0] == "3"
+        assert client.query_columns(q, settings={"max_threads": "3"})["value"][0] == "3"
+        blocks = client.query_blocks(q, settings={"max_threads": "3"})
+        assert ch.blocks_to_dicts(blocks)[0]["value"] == "3"
+        client.execute(q, settings={"max_threads": "3"})  # rows dropped, must not error
+        assert self._get(client) != "3"  # nothing leaked
+
+    def test_params_and_settings_route_independently(self, client: Client):
+        """Server-side parameters keep working alongside an overlay."""
+        rows = client.query(
+            "SELECT {v:UInt8} AS x, value AS mt FROM system.settings "
+            "WHERE name = 'max_threads'",
+            params={"v": 42},
+            settings={"max_threads": "3"},
+        )
+        assert rows[0]["x"] == 42
+        assert rows[0]["mt"] == "3"
+
+    def test_non_string_setting_values_are_coerced(self, client: Client):
+        """Int/bool values keep working (the old helper stringified them)."""
+        rows = client.query(self.Q.format("max_threads"), settings={"max_threads": 3})
+        assert rows[0]["value"] == "3"
+
+    def test_invalid_settings_shape_preserves_type_error(self, client: Client):
+        """Python argument errors must not be flattened into ClickHouseError."""
+        bad_shape: Any = 0
+        bad_key: Any = {1: "2"}
+        with pytest.raises(TypeError):
+            client.query("SELECT 1", settings=bad_shape)
+        with pytest.raises(TypeError):
+            client.query("SELECT 1", settings=bad_key)
+
+    def test_native_client_settings_keyword(self, docker_ch: str):
+        """Native _Client accepts keyword-only settings and never persists them."""
+        from st_clickhouse._native import _Client as _NativeClient
+
+        native = _NativeClient(
+            docker_ch,
+            user=CLICKHOUSE_USER,
+            password=CLICKHOUSE_PASS,
+            settings={"max_threads": "7"},
+        )
+        try:
+            rows = native.query(self.Q.format("max_threads"), settings={"max_threads": "3"})
+            assert rows[0]["value"] == "3"
+            rows = native.query(self.Q.format("max_threads"))
+            assert rows[0]["value"] == "7"
+        finally:
+            del native
+
+
+class TestAsyncPerQuerySettings:
+    """Async per-query settings: overlay on pool connections, not parameters."""
+
+    Q = "SELECT value FROM system.settings WHERE name = '{}'"
+
+    async def _get(self, client: AsyncClient, name: str = "max_threads") -> str:
+        rows = await client.query(self.Q.format(name))
+        assert rows, f"server did not report setting {name!r}"
+        return rows[0]["value"]
+
+    @pytest.mark.asyncio
+    async def test_settings_visible_within_query_and_not_after(self, docker_ch: str):
+        """Overlay applies to its own query; later pool queries see baseline."""
+        async with connect_async(
+            docker_ch, user=CLICKHOUSE_USER, password=CLICKHOUSE_PASS, pool_min_size=1
+        ) as c:
+            baseline = await self._get(c)
+            rows = await c.query(
+                self.Q.format("max_threads"), settings={"max_threads": "3"}
+            )
+            assert rows[0]["value"] == "3"
+            assert await self._get(c) == baseline
+
+    @pytest.mark.asyncio
+    async def test_explicit_settings_are_not_query_params(self, docker_ch: str):
+        """settings= must not be swallowed by **kwargs as a query parameter."""
+        async with connect_async(
+            docker_ch, user=CLICKHOUSE_USER, password=CLICKHOUSE_PASS
+        ) as c:
+            rows = await c.query("SELECT 1 AS x", settings={"max_threads": "3"})
+            assert rows == [{"x": 1}]
+            # Both routed at once: placeholders still bind, overlay still applies.
+            rows = await c.query(
+                "SELECT {v:UInt8} AS x",
+                params={"v": 7},
+                settings={"max_threads": "3"},
+            )
+            assert rows == [{"x": 7}]
+
+    @pytest.mark.asyncio
+    async def test_session_overlays_apply_and_do_not_leak(self, docker_ch: str):
+        """Pinned AsyncSession routes settings separately from query params."""
+        async with connect_async(
+            docker_ch, user=CLICKHOUSE_USER, password=CLICKHOUSE_PASS
+        ) as c:
+            async with c.session() as session:
+                baseline = (await session.query(self.Q.format("max_threads")))[0]["value"]
+                rows = await session.query(
+                    self.Q.format("max_threads"), settings={"max_threads": "3"}
+                )
+                assert rows[0]["value"] == "3"
+                blocks = await session.query_blocks(
+                    self.Q.format("max_threads"), settings={"max_threads": "5"}
+                )
+                assert ch.blocks_to_dicts(blocks)[0]["value"] == "5"
+                await session.execute("SELECT 1", settings={"max_threads": "7"})
+                assert (await session.query(self.Q.format("max_threads")))[0]["value"] == baseline
+
+    @pytest.mark.asyncio
+    async def test_concurrent_overlays_do_not_cross_contaminate(self, docker_ch: str):
+        """Concurrent queries with different overlays keep their own values."""
+        async with connect_async(
+            docker_ch,
+            user=CLICKHOUSE_USER,
+            password=CLICKHOUSE_PASS,
+            pool_min_size=2,
+            pool_max_size=4,
+        ) as c:
+
+            async def one(value: str) -> str:
+                rows = await c.query(
+                    self.Q.format("max_threads"), settings={"max_threads": value}
+                )
+                return rows[0]["value"]
+
+            values = ["2", "3", "5", "7"]
+            results = await asyncio.gather(*[one(v) for v in values])
+            assert results == values

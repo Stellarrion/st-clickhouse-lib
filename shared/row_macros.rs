@@ -2,22 +2,26 @@ macro_rules! define_row_read_all {
     ($error:path) => {
         /// Read all rows from a block.
         ///
-        /// **Fast path** (tuples): pre-extracts all columns once via `AnyColumnData`,
-        /// then iterates rows using `from_columns`. Column dispatch + buffer parse
-        /// happens once per column, not once per row. ~50% faster for large results.
+        /// **Fast path**: pre-extracts all columns once via `AnyColumnData`,
+        /// then iterates rows using `from_columns`. Column dispatch + buffer
+        /// parse happens once per column, not once per row. ~50% faster for
+        /// large results.
+        ///
+        /// Rows whose `from_columns` maps fields by name (derive: default)
+        /// only take the fast path when the block's column order matches
+        /// `COLUMN_NAMES`; a different SELECT order is reordered once per
+        /// block, and a missing column falls back to name-based `from_row`.
+        /// Purely positional rows (tuples) always take the fast path.
         pub fn read_all<T: Row>(block: &Block) -> Result<Vec<T>> {
             if T::COLUMN_COUNT > 0 && T::COLUMN_COUNT <= 8 {
                 let n = block.row_count();
+                let Some(indices) = fast_path_indices::<T>(block) else {
+                    return rows_from_row::<T>(block, n);
+                };
                 let mut columns: Vec<AnyColumnData<'_>> = Vec::with_capacity(T::COLUMN_COUNT);
-                for i in 0..T::COLUMN_COUNT {
+                for &i in indices.iter().take(T::COLUMN_COUNT) {
                     let Ok(column) = block.read_column_by_index(i) else {
-                        let mut rows = Vec::with_capacity(n);
-                        for row in 0..n {
-                            rows.push(T::from_row(block, row).map_err(|e| {
-                                <$error>::Protocol(format!("decode row {row}: {e}"))
-                            })?);
-                        }
-                        return Ok(rows);
+                        return rows_from_row::<T>(block, n);
                     };
                     columns.push(column);
                 }
@@ -26,26 +30,58 @@ macro_rules! define_row_read_all {
                 // (overridden per-tuple); fall back to per-row on any failure.
                 match T::from_columns_collect(&col_refs, n) {
                     Ok(rows) => Ok(rows),
-                    Err(_) => {
-                        let mut rows = Vec::with_capacity(n);
-                        for row in 0..n {
-                            rows.push(T::from_row(block, row).map_err(|e| {
-                                <$error>::Protocol(format!("decode row {row}: {e}"))
-                            })?);
-                        }
-                        Ok(rows)
-                    },
+                    Err(_) => rows_from_row::<T>(block, n),
                 }
             } else {
-                let mut rows = Vec::with_capacity(block.row_count());
-                for i in 0..block.row_count() {
-                    rows.push(
-                        T::from_row(block, i)
-                            .map_err(|e| <$error>::Protocol(format!("decode row {i}: {e}")))?,
-                    );
-                }
-                Ok(rows)
+                rows_from_row::<T>(block, block.row_count())
             }
+        }
+
+        /// Block column indices (in `T::COLUMN_NAMES` order) backing the
+        /// fast path, or `None` when the block cannot satisfy `T` by name
+        /// and `from_row` must be used instead.
+        fn fast_path_indices<T: Row>(block: &Block) -> Option<[usize; 8]> {
+            let mut indices = [0usize; 8];
+            if !T::from_columns_by_name() {
+                // Tuple rows are purely positional: leading columns, in order.
+                for (index, slot) in indices.iter_mut().take(T::COLUMN_COUNT).enumerate() {
+                    *slot = index;
+                }
+                return Some(indices);
+            }
+
+            // Keep the common matching-order path allocation-free and O(fields).
+            let mut ordered = true;
+            for (index, slot) in indices.iter_mut().take(T::COLUMN_COUNT).enumerate() {
+                let name = T::COLUMN_NAMES.get(index)?;
+                if block.columns.get(index).is_none_or(|column| column.name != *name) {
+                    ordered = false;
+                    break;
+                }
+                *slot = index;
+            }
+            if ordered {
+                return Some(indices);
+            }
+
+            // A real reorder is still stack-only because this fast path is
+            // limited to at most eight columns.
+            for (index, slot) in indices.iter_mut().take(T::COLUMN_COUNT).enumerate() {
+                let name = T::COLUMN_NAMES.get(index)?;
+                *slot = block.columns.iter().position(|column| column.name == *name)?;
+            }
+            Some(indices)
+        }
+
+        /// Name-based fallback: one `from_row` call per row.
+        fn rows_from_row<T: Row>(block: &Block, n: usize) -> Result<Vec<T>> {
+            let mut rows = Vec::with_capacity(n);
+            for row in 0..n {
+                rows.push(T::from_row(block, row).map_err(|e| {
+                    <$error>::Protocol(format!("decode row {row}: {e}"))
+                })?);
+            }
+            Ok(rows)
         }
     };
 }
@@ -58,6 +94,12 @@ macro_rules! impl_tuple_row {
         {
             const COLUMN_NAMES: &'static [&'static str] = &[$(stringify!($T)),+];
             const COLUMN_COUNT: usize = $n;
+
+            // Tuples map fields purely positionally: the fast path must not
+            // try to match block columns by (placeholder) name.
+            fn from_columns_by_name() -> bool {
+                false
+            }
 
             #[allow(non_snake_case, unused_assignments)]
             fn from_row(block: &Block, row_index: usize) -> Result<Self> {

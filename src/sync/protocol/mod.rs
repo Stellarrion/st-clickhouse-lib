@@ -8,6 +8,7 @@ pub mod response;
 pub(crate) mod response_packets;
 pub mod revision;
 pub mod settings;
+pub(crate) mod skip_column;
 pub mod table_status;
 pub mod type_parser;
 pub mod wire;

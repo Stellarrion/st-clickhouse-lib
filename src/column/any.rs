@@ -208,34 +208,34 @@ impl<'a> AnyColumnData<'a> {
             Int256 => Int256,
         );
 
-        if tid == TypeId::of::<i8>() {
-            if let Self::Enum(col) = self {
-                let value = *col.values.get(row_index).ok_or_else(|| {
-                    crate::error::Error::Protocol(format!(
-                        "Enum: index {row_index} out of bounds (len {})",
-                        col.values.len()
-                    ))
-                })?;
-                let value = i8::try_from(value).map_err(|_| {
-                    crate::error::Error::Protocol(format!("Enum value {value} does not fit i8"))
-                })?;
-                return unsafe { copy_value_checked::<T, i8>(value) };
-            }
+        if tid == TypeId::of::<i8>()
+            && let Self::Enum(col) = self
+        {
+            let value = *col.values.get(row_index).ok_or_else(|| {
+                crate::error::Error::Protocol(format!(
+                    "Enum: index {row_index} out of bounds (len {})",
+                    col.values.len()
+                ))
+            })?;
+            let value = i8::try_from(value).map_err(|_| {
+                crate::error::Error::Protocol(format!("Enum value {value} does not fit i8"))
+            })?;
+            return unsafe { copy_value_checked::<T, i8>(value) };
         }
 
-        if tid == TypeId::of::<i16>() {
-            if let Self::Enum(col) = self {
-                let value = *col.values.get(row_index).ok_or_else(|| {
-                    crate::error::Error::Protocol(format!(
-                        "Enum: index {row_index} out of bounds (len {})",
-                        col.values.len()
-                    ))
-                })?;
-                let value = i16::try_from(value).map_err(|_| {
-                    crate::error::Error::Protocol(format!("Enum value {value} does not fit i16"))
-                })?;
-                return unsafe { copy_value_checked::<T, i16>(value) };
-            }
+        if tid == TypeId::of::<i16>()
+            && let Self::Enum(col) = self
+        {
+            let value = *col.values.get(row_index).ok_or_else(|| {
+                crate::error::Error::Protocol(format!(
+                    "Enum: index {row_index} out of bounds (len {})",
+                    col.values.len()
+                ))
+            })?;
+            let value = i16::try_from(value).map_err(|_| {
+                crate::error::Error::Protocol(format!("Enum value {value} does not fit i16"))
+            })?;
+            return unsafe { copy_value_checked::<T, i16>(value) };
         }
 
         try_any_typed_columns!(
@@ -397,7 +397,7 @@ pub fn read_column_by_type<'a>(
             }))
         },
         LowCardinality(inner) => read_column_by_type(inner, ctx),
-        Date32 => u16::read_column(ctx).map(AnyColumnData::UInt16),
+        Date32 => i32::read_column(ctx).map(AnyColumnData::Int32),
         Nothing => {
             let _ = ctx.read_exact(ctx.rows)?;
             Ok(AnyColumnData::Unknown)
@@ -497,6 +497,28 @@ mod tests {
         assert_eq!(col.len(), 2);
         assert!(!col.is_empty());
         assert_eq!(col.type_name(), "UInt64");
+    }
+
+    #[test]
+    fn test_any_column_data_date32_uses_four_signed_bytes_per_row() {
+        let buf = (-1i32)
+            .to_le_bytes()
+            .into_iter()
+            .chain(100_000i32.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut ctx = ReadColumnContext {
+            rows: 2,
+            pos: 0,
+            buf: &buf,
+        };
+        let col = read_column_by_type(&ColumnType::Date32, &mut ctx)
+            .expect("Date32 column should decode");
+        let AnyColumnData::Int32(values) = col else {
+            unreachable!("Date32 must decode as signed 32-bit days");
+        };
+        assert_eq!(values.get(0).expect("row 0"), -1);
+        assert_eq!(values.get(1).expect("row 1"), 100_000);
+        assert_eq!(ctx.pos, 8, "Date32 must consume four bytes per row");
     }
 
     #[test]

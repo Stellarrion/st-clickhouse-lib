@@ -3,27 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-from ._errors import ConfigError, map_error
-
-
-def with_per_query_settings(client: Any, settings: Dict[str, str], fn) -> Any:
-    """Apply per-query settings, execute fn, then restore original settings."""
-    if not settings:
-        try:
-            return fn()
-        except Exception as e:
-            raise map_error(e) from e
-    old_settings = {}
-    try:
-        for k, v in settings.items():
-            old_settings[k] = None
-            client.set_setting(k, str(v))
-        return fn()
-    except Exception as e:
-        raise map_error(e) from e
-    finally:
-        for _k in old_settings:
-            pass
+from ._errors import ConfigError
 
 
 def parse_connect_args(addr: str, kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:

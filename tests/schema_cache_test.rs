@@ -42,14 +42,21 @@ async fn schema_cache_fetches_refreshes_and_validates_inserts() {
         }],
         rows: 1,
     };
-    let err = client
+    let mut session = client
         .begin_insert("st_schema_cache_test")
         .await
-        .expect("insert should start")
+        .expect("insert should start");
+    let err = session
         .send_data(&block)
         .await
         .expect_err("schema validation should reject wrong column type");
     assert!(format!("{err:?}").contains("expected 'UInt64'"));
+    // The rejected block was never sent, but the server is still waiting for
+    // the INSERT to finish: end the session so the pooled connection is not
+    // left mid-INSERT (otherwise the next Query draws "Unexpected packet
+    // Query received from client", which execute() now reports instead of
+    // swallowing it).
+    session.end().await.expect("insert session should end");
 
     client
         .execute("DROP TABLE IF EXISTS st_schema_cache_test")

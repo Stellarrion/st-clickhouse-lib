@@ -1,7 +1,7 @@
-use crate::connection::block_reader::read_data_block;
+use crate::connection::block_reader::{read_data_block, read_data_block_maybe_compressed};
 use crate::connection::callbacks::QueryCallbacks;
 use crate::connection::io::{
-    packet_read_timeout, ping_stream, read_exception, read_profile_info_packet,
+    compression_flag, packet_read_timeout, ping_stream, read_exception, read_profile_info_packet,
     read_progress_packet, read_varint_async,
 };
 use crate::connection::query_packet::{build_query_packet_from_cached_or_revision, query_id_bytes};
@@ -31,6 +31,10 @@ pub struct BlockStream<'a> {
     recv_timeout: Duration,
     deadline: Option<crate::runtime::time::Instant>,
     callbacks: QueryCallbacks,
+    /// Compression negotiated in the query packet: Data and ProfileEvents
+    /// blocks are read with it, Log blocks stay protocol-defined uncompressed,
+    /// and the cancellation drain skips block bodies accordingly.
+    response_compressed: bool,
 }
 
 impl Client {
@@ -51,18 +55,25 @@ impl Client {
         let metric_guard = QueryMetricGuard::new(self.metrics(), 1);
         let mut guard = self.pool.get().await?;
         let rev = guard.server_info().negotiated_revision;
+        let mut query_id_buf = [0u8; 22];
+        let query_id = query_id_bytes(None, &mut query_id_buf);
+        let pkt = build_query_packet_from_cached_or_revision(
+            &self.query_template,
+            &self.settings,
+            rev,
+            query,
+            query_id,
+            true,
+            &[],
+        );
+        // Mark in-flight before the first packet that can leave a response
+        // pending (the optional pre-query Ping; otherwise the query write).
+        // The BlockStream clears the mark at its clean terminal points
+        // (EndOfStream / server exception); everything else already discards
+        // the socket, so a dropped future in between cannot return a
+        // mid-response stream.
+        guard.mark_response_in_flight();
         {
-            let mut query_id_buf = [0u8; 22];
-            let query_id = query_id_bytes(None, &mut query_id_buf);
-            let pkt = build_query_packet_from_cached_or_revision(
-                &self.query_template,
-                &self.settings,
-                rev,
-                query,
-                query_id,
-                true,
-                &[],
-            );
             let stream = guard.stream_mut();
             if self.ping_before_query {
                 ping_stream(stream).await?;
@@ -81,6 +92,7 @@ impl Client {
             recv_timeout: self.recv_timeout,
             deadline,
             callbacks: QueryCallbacks::default(),
+            response_compressed: compression_flag(self.compression) == 1,
         })
     }
 }
@@ -105,23 +117,36 @@ impl BlockStream<'_> {
                         Ok(Ok(t)) => t,
                         Ok(Err(e)) => {
                             self.done = true;
+                            let _ = self.guard.take_stream();
                             return Err(e);
                         },
                         Err(_) => {
                             if self.deadline.is_some() {
                                 self.done = true;
-                                cancel_and_drain(stream, self.recv_timeout, false).await?;
+                                let _ = cancel_and_drain(
+                                    stream,
+                                    self.recv_timeout,
+                                    self.response_compressed,
+                                )
+                                .await;
+                                let _ = self.guard.take_stream();
                                 return Err(crate::error::Error::Timeout(
                                     "query exceeded deadline".into(),
                                 ));
                             }
-                            return Ok(None); // recv_timeout floor: unchanged
+                            self.done = true;
+                            let _ = self.guard.take_stream();
+                            return Err(crate::error::Error::Timeout(
+                                "receive timeout while reading query response".into(),
+                            ));
                         },
                     }
                 },
                 None => {
                     self.done = true;
-                    cancel_and_drain(stream, self.recv_timeout, false).await?;
+                    let _ =
+                        cancel_and_drain(stream, self.recv_timeout, self.response_compressed).await;
+                    let _ = self.guard.take_stream();
                     return Err(crate::error::Error::Timeout(
                         "query exceeded deadline".into(),
                     ));
@@ -129,14 +154,18 @@ impl BlockStream<'_> {
             };
             match packet_type {
                 1 => {
-                    let block = read_data_block(stream).await?;
+                    let block =
+                        read_data_block_maybe_compressed(stream, self.response_compressed).await?;
                     if block.row_count() > 0 {
                         return Ok(Some(block));
                     }
                 },
                 2 => {
                     let err = read_exception(stream).await?;
+                    // A server exception terminates the response: the
+                    // connection stays clean and reusable.
                     self.done = true;
+                    self.guard.clear_response_in_flight();
                     return Err(err);
                 },
                 3 => {
@@ -145,13 +174,28 @@ impl BlockStream<'_> {
                 4 => {},
                 5 => {
                     self.done = true;
+                    // EndOfStream: the response cycle is complete, so the
+                    // pooled connection stays reusable after the stream drops.
+                    self.guard.clear_response_in_flight();
                     return Ok(None);
                 },
                 6 => {
                     let _ = read_profile_info_packet(stream).await?;
                 },
-                10 | 14 => {
+                10 => {
+                    // Log blocks are always sent uncompressed.
                     let log_block = read_data_block(stream).await?;
+                    if let Some(ref cb) = self.callbacks.on_log {
+                        cb(&log_block);
+                    }
+                    if let Some(ref cb) = self.callbacks.on_profile_events {
+                        cb(&log_block);
+                    }
+                },
+                14 => {
+                    // ProfileEvents follow the response compression flag.
+                    let log_block =
+                        read_data_block_maybe_compressed(stream, self.response_compressed).await?;
                     if let Some(ref cb) = self.callbacks.on_log {
                         cb(&log_block);
                     }
@@ -175,24 +219,37 @@ impl BlockStream<'_> {
         }
     }
 
-    /// Cancel the running query and drain the response.
+    /// Cancel the running query and close its connection.
     ///
-    /// Sends `Cancel`, drains to `EndOfStream`/`Exception`, and leaves the
-    /// connection usable for the next query.
+    /// Sends a best-effort framed `Cancel`, then discards the socket instead of
+    /// waiting behind an arbitrarily large response body. The pool reconnects
+    /// lazily on its next acquire, so cancellation stays bounded and no partial
+    /// response can poison a reused connection.
     pub async fn cancel(&mut self) -> Result<()> {
         if self.done {
             return Ok(());
         }
         self.done = true;
-        let stream = self.guard.stream_mut();
-        cancel_and_drain(stream, self.recv_timeout, false).await
+        let send_budget = self.recv_timeout.min(Duration::from_secs(1));
+        let _ = crate::runtime::time::timeout(send_budget, async {
+            let stream = self.guard.stream_mut();
+            stream.write_packet(&[ClientPacket::Cancel as u8]).await?;
+            stream.flush().await?;
+            Ok::<(), crate::error::Error>(())
+        })
+        .await;
+        let _ = self.guard.take_stream();
+        Ok(())
     }
 }
 
 impl Drop for BlockStream<'_> {
     fn drop(&mut self) {
-        if let Some(tcp) = self.guard.stream_mut().raw_tcp() {
-            let _ = tcp.try_write(&[ClientPacket::Cancel as u8]);
+        if !self.done {
+            // Async draining is impossible in Drop. Discard the socket rather
+            // than inject a raw Cancel byte (which bypasses TLS/chunk framing)
+            // or return a partial response to the pool.
+            let _ = self.guard.take_stream();
         }
     }
 }
