@@ -409,7 +409,7 @@ jobs:
             exit 1
           fi
           echo "Waiting for st-clickhouse-derive $DERIVE_VERSION in the crates.io index"
-          for i in $(seq 1 30); do
+          for i in $(seq 1 90); do
             if cargo search st-clickhouse-derive --limit 1 | grep -q "^st-clickhouse-derive = \"$DERIVE_VERSION\""; then
               echo "st-clickhouse-derive $DERIVE_VERSION is available in the crates.io index"
               exit 0
