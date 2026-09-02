@@ -3,6 +3,16 @@
 All notable changes to st-clickhouse are documented here.
 
 ## [Unreleased]
+### Changed (CI)
+- **Merging to `main` now publishes the release**: the crates.io and PyPI
+  publish jobs run on main pushes (idempotent — versions already on the
+  registries are skipped), and an annotated `vX.Y.Z` tag is created as a
+  provenance bookmark afterwards. Pushing a `v*` tag still publishes too.
+- **Version bump gate on PRs**: a PR into `main` fails unless its manifests
+  carry a version strictly greater than the one published on crates.io and
+  `CHANGELOG.md` already contains that version's section. Strategy documented
+  in `docs/versioning.md`; mark the `version-bump-check` job required in
+  branch protection.
 
 ## [0.3.0] — 2026-08-27
 

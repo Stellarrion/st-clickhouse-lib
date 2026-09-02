@@ -298,10 +298,61 @@ jobs:
           fi
           echo "All crate versions agree: $LIB_VERSION"
 
+  # ── Version bump gate (PRs) ──────────────────────────────────
+  # Enforces docs/versioning.md: the PR's own manifests (the merge-ref
+  # checkout) must carry a version strictly greater than the one currently
+  # published on crates.io, and CHANGELOG.md must already contain the
+  # section header for that version. Mark this check required in branch
+  # protection so unbumped PRs cannot merge.
+  version-bump-check:
+    name: Version bump required
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare PR version against crates.io
+        run: |
+          PR_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$PR_VERSION" ]; then
+            echo "Failed to parse version from Cargo.toml"
+            exit 1
+          fi
+          echo "PR version: $PR_VERSION"
+          REGISTRY_VERSION="$(curl -sf -A "st-clickhouse-ci" \
+            https://crates.io/api/v1/crates/st-clickhouse-lib \
+            | jq -r '.crate.max_version // empty')"
+          if [ -z "$REGISTRY_VERSION" ]; then
+            echo "No published st-clickhouse-lib found on crates.io; any version is acceptable."
+            exit 0
+          fi
+          echo "Published on crates.io: $REGISTRY_VERSION"
+          HIGHER="$(printf '%s\n%s\n' "$REGISTRY_VERSION" "$PR_VERSION" \
+            | sort -V | tail -n 1)"
+          if [ "$PR_VERSION" = "$REGISTRY_VERSION" ] || [ "$HIGHER" = "$REGISTRY_VERSION" ]; then
+            echo "::error::This PR does not bump the version (PR: $PR_VERSION, published: $REGISTRY_VERSION)."
+            echo "::error::Merging to main IS the release (docs/versioning.md): bump the version in"
+            echo "::error::Cargo.toml, derive/Cargo.toml, st-clickhouse-py/Cargo.toml and pyproject.toml,"
+            echo "::error::and add a '## [$PR_VERSION] — YYYY-MM-DD' section to CHANGELOG.md."
+            exit 1
+          fi
+      - name: Require a CHANGELOG section for the version
+        run: |
+          PR_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if ! grep -q "^## \[$PR_VERSION\] — " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$PR_VERSION] — YYYY-MM-DD' section."
+            echo "::error::Every released version must be documented (docs/versioning.md)."
+            exit 1
+          fi
+          echo "CHANGELOG section for $PR_VERSION present."
+
   # ── Release (crates.io) ──────────────────────────────────────
   publish-crates:
     name: Release (crates.io)
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Release on merge to main (idempotent: skips versions already on
+    # crates.io) and on v* tags for manual/back-compat releases.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
     needs: [fmt, clippy, build, test, python, audit, msrv, version-check]
     runs-on: ubuntu-latest
     environment:
@@ -389,7 +440,10 @@ jobs:
   # ── Release (PyPI) ──────────────────────────────────────────
   build-wheels:
     name: Build wheels (${{ matrix.os }}${{ matrix.freethreaded && ', free-threaded' || '' }})
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Same release trigger as publish-crates: merge to main or v* tag.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
     needs: [fmt, clippy, build, test, python, audit, msrv, version-check]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -426,7 +480,10 @@ jobs:
 
   publish-pypi:
     name: Release (PyPI)
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Same release trigger as publish-crates: merge to main or v* tag.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
     needs: [build-wheels]
     runs-on: ubuntu-latest
     environment:
@@ -444,3 +501,35 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
+
+  # ── Release bookmark ─────────────────────────────────────────
+  # After a merge-triggered release publishes, tag the commit that produced
+  # it. The tag is a provenance bookmark (git ref for the exact published
+  # tree); it is NOT the publish trigger — pushes made with GITHUB_TOKEN
+  # cannot start new workflow runs, and publishing already happened on the
+  # merge itself.
+  tag-release:
+    name: Tag released version
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [publish-crates, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release tag if it does not exist
+        run: |
+          VERSION="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "v" ]; then
+            echo "Failed to parse version from Cargo.toml"
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/$VERSION" | grep -q .; then
+            echo "Tag $VERSION already exists; nothing to do"
+            exit 0
+          fi
+          git config user.name "release-bot"
+          git config user.email "noreply@github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+          echo "Tagged $VERSION at $GITHUB_SHA"
