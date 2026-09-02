@@ -358,6 +358,22 @@ async fn array_round_trip_table_compressed_and_plain() {
 #[cfg(feature = "lz4")]
 async fn nested_json_array_compressed_matches_plain() {
     let client = common::connect_client().await;
+    // Skip on servers without native JSON support (24.8: "Cannot create column")
+    let version: Vec<(String,)> = client
+        .query("SELECT version()")
+        .all()
+        .await
+        .expect("read version");
+    let major: u32 = version[0]
+        .0
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    if major < 25 {
+        eprintln!("server lacks native JSON type (major {major}); skipping");
+        return;
+    }
     let sql = "SELECT [cast('{\"a\":1}','JSON')] AS j";
     let expected: Vec<(Vec<String>,)> = client.query(sql).all().await.expect("plain nested JSON");
     let compressed = client
